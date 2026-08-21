@@ -1,0 +1,32 @@
+{
+    "name": "selfcraft",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "bin": {
+        "selfcraft": "src/index.ts"
+    },
+    "scripts": {
+        "start": "bun run src/index.ts",
+        "dev": "SELFCRAFT_ENV=development bun --watch run src/index.ts",
+        "runtime": "bun run src/runtime-entry.ts",
+        "doctor": "bun run src/doctor.ts",
+        "smoke": "bun run scripts/smoke.ts",
+        "smoke:evolution": "bun run scripts/evolution-smoke.ts",
+        "smoke:provider": "bun run scripts/provider-smoke.ts",
+        "test": "bun test",
+        "typecheck": "tsc --noEmit",
+        "check": "bun run typecheck && bun test && bun run doctor"
+    },
+    "dependencies": {
+        "@ai-sdk/anthropic": "4.0.16",
+        "@ai-sdk/openai": "4.0.16",
+        "@ai-sdk/openai-compatible": "3.0.12",
+        "ai": "7.0.31",
+        "zod": "^4.3.6"
+    },
+    "devDependencies": {
+        "@types/bun": "latest",
+        "typescript": "^5.9.0"
+    }
+}

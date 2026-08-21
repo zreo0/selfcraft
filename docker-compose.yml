@@ -1,0 +1,16 @@
+services:
+    selfcraft:
+        build: .
+        image: selfcraft:latest
+        environment:
+            SELFCRAFT_ENV: production
+            SELFCRAFT_HOME: /var/lib/selfcraft
+        stdin_open: true
+        tty: true
+        volumes:
+            - selfcraft-code:/app
+            - selfcraft-data:/var/lib/selfcraft
+
+volumes:
+    selfcraft-code:
+    selfcraft-data:

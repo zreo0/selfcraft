@@ -1,0 +1,38 @@
+services:
+    selfcraft:
+        build: .
+        image: selfcraft:dev
+        init: true
+        working_dir: /app
+        entrypoint:
+            - /bin/sh
+            - -c
+        command:
+            - |
+                if [ ! -d /app/node_modules/ai ]; then
+                    cp -a /opt/selfcraft/node_modules/. /app/node_modules/
+                fi
+                bun install --frozen-lockfile
+                echo "Selfcraft development container is ready"
+                echo "Run: docker compose -f docker-compose.dev.yml exec selfcraft bun run start"
+                exec tail -f /dev/null
+        environment:
+            SELFCRAFT_ENV: development
+            SELFCRAFT_HOME: /var/lib/selfcraft
+            SELFCRAFT_PROJECT_ROOT: /app
+        stdin_open: true
+        tty: true
+        volumes:
+            - type: bind
+              source: .
+              target: /app
+            - type: volume
+              source: selfcraft-dev-modules
+              target: /app/node_modules
+            - type: volume
+              source: selfcraft-dev-data
+              target: /var/lib/selfcraft
+
+volumes:
+    selfcraft-dev-modules:
+    selfcraft-dev-data:
