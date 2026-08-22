@@ -1,13 +1,13 @@
-# Skill authoring
+# 技能编写
 
-Create or improve reusable capabilities as small, readable skill directories.
+以小而清晰的技能目录创建或改进可复用能力。
 
-## Workflow
+## 工作流程
 
-1. Confirm the capability is reusable rather than a one-off task
-2. Create `skills/<name>/SKILL.md` with a short trigger description and executable steps
-3. Put optional scripts or references beside `SKILL.md`
-4. Test the actual commands in the current environment
-5. Record dependencies and required environment variables without embedding credentials
+1. 确认这项能力可以复用，而不是只服务于一次性任务
+2. 创建 `skills/<name>/SKILL.md`，写明简短的触发条件和可执行步骤
+3. 将可选脚本或参考资料放在 `SKILL.md` 同级目录中
+4. 在当前环境中实际测试涉及的命令
+5. 记录依赖项和必需的环境变量，但不要在文件中写入凭证
 
-Keep instructions specific. A skill should explain what to do, when to use it and how to verify success.
+说明应当具体。一个技能需要讲清楚做什么、什么时候使用，以及如何验证是否成功。

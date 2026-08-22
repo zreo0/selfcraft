@@ -1,5 +1,5 @@
-# Memory
+# 记忆
 
-This is a curated memory document shared by the user and agent. Keep only durable facts, decisions, lessons and unfinished commitments here.
+这是由用户与智能体共同维护的记忆文档。这里只保留长期有效的事实、决定、经验，以及尚未完成的承诺。
 
-Structured memories with provenance and confidence live in the Runtime memory store. Raw conversation history remains in the append-only session transcript.
+带有来源和置信度的结构化记忆保存在运行时的记忆存储中。原始对话历史保留在只追加、不覆盖的会话记录中。

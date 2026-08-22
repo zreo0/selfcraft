@@ -1,3 +1,3 @@
-# User and relationship
+# 用户与关系
 
-No durable user preferences or relationship expectations have been recorded yet.
+目前尚未记录长期有效的用户偏好或关系期待。
