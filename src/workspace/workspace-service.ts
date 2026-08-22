@@ -51,24 +51,4 @@ export class WorkspaceService {
             return `<document name="${fileName}">\n${content}\n</document>`;
         }).join('\n\n');
     }
-
-    /**
-     * 保存 onboarding 产生的身份起点
-     *
-     * @param name 用户选择的称呼
-     * @param description 用户描述的关系与期待
-     */
-    public setInitialIdentity (name: string, description: string): void {
-        const identity = name.trim()
-            ? `# Identity\n\n- Name: ${name.trim()}\n- Origin: Chosen during onboarding\n`
-            : '# Identity\n\nNo name or persona has been chosen yet. Do not invent one; allow identity to emerge with the user.\n';
-        fs.writeFileSync(path.join(this.workspacePath, 'IDENTITY.md'), identity, 'utf8');
-        if (description.trim()) {
-            fs.writeFileSync(
-                path.join(this.workspacePath, 'USER.md'),
-                `# User and relationship\n\n${description.trim()}\n`,
-                'utf8',
-            );
-        }
-    }
 }

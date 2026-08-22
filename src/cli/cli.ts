@@ -10,6 +10,7 @@ import { OnboardingCancelledError, type Onboarding } from '../onboarding/onboard
 import type { SkillRegistry } from '../skills/skill-registry';
 
 const RESTART_EXIT_CODE = 75;
+const MODEL_SETUP_RESULT = -2;
 
 /** 当前版本的 CLI 通信入口 */
 export class Cli {
@@ -37,25 +38,25 @@ export class Cli {
      * @returns 进程退出码
      */
     public async start (args: string[]): Promise<number> {
-        const terminal = createInterface({ input: process.stdin, output: process.stdout });
-        try {
-            if (args[0] === 'setup' || !this.dependencies.config.isConfigured()) {
-                if (!process.stdin.isTTY) {
-                    throw new Error('首次配置需要交互式终端，请运行 bun run start setup');
-                }
-                try {
-                    await this.dependencies.onboarding.run(terminal);
-                } catch (error) {
-                    if (error instanceof OnboardingCancelledError) {
-                        console.log('初始化已取消');
-                        return 0;
-                    }
-                    throw error;
-                }
-                if (args[0] === 'setup') {
+        if (args[0] === 'setup' || !this.dependencies.config.isConfigured()) {
+            if (!process.stdin.isTTY) {
+                throw new Error('首次配置需要交互式终端，请运行 bun run start setup');
+            }
+            try {
+                await this.dependencies.onboarding.run();
+            } catch (error) {
+                if (error instanceof OnboardingCancelledError) {
                     return 0;
                 }
+                throw error;
             }
+            if (args[0] === 'setup') {
+                return 0;
+            }
+        }
+
+        let terminal = createInterface({ input: process.stdin, output: process.stdout });
+        try {
             console.log('Selfcraft 已就绪。输入 /help 查看命令。');
             while (true) {
                 const input = (await terminal.question('selfcraft> ')).trim();
@@ -64,9 +65,22 @@ export class Cli {
                 }
                 let commandResult: number | null;
                 try {
-                    commandResult = await this.handleCommand(input, terminal);
+                    commandResult = await this.handleCommand(input);
                 } catch (error) {
                     console.error(`命令失败：${error instanceof Error ? error.message : String(error)}`);
+                    continue;
+                }
+                if (commandResult === MODEL_SETUP_RESULT) {
+                    terminal.close();
+                    try {
+                        await this.dependencies.onboarding.configureModel();
+                    } catch (error) {
+                        if (!(error instanceof OnboardingCancelledError)) {
+                            console.error(`命令失败：${error instanceof Error ? error.message : String(error)}`);
+                        }
+                    } finally {
+                        terminal = createInterface({ input: process.stdin, output: process.stdout });
+                    }
                     continue;
                 }
                 if (commandResult !== null) {
@@ -112,13 +126,9 @@ export class Cli {
      * 处理斜杠命令
      *
      * @param input 完整输入
-     * @param terminal readline 接口
      * @returns null 表示普通对话，负数表示继续，非负数表示退出
      */
-    private async handleCommand (
-        input: string,
-        terminal: ReturnType<typeof createInterface>,
-    ): Promise<number | null> {
+    private async handleCommand (input: string): Promise<number | null> {
         if (!input.startsWith('/')) {
             return null;
         }
@@ -143,8 +153,7 @@ export class Cli {
             return -1;
         }
         if (command === '/model') {
-            await this.handleModelCommand(args, terminal);
-            return -1;
+            return await this.handleModelCommand(args) ? MODEL_SETUP_RESULT : -1;
         }
         if (command === '/skills') {
             const skills = this.dependencies.skills.discover();
@@ -220,16 +229,16 @@ export class Cli {
         return -1;
     }
 
-    /** 处理模型新增、查看和切换 */
-    private async handleModelCommand (
-        args: string[],
-        terminal: ReturnType<typeof createInterface>,
-    ): Promise<void> {
+    /**
+     * 处理模型新增、查看和切换
+     *
+     * @param args 模型命令参数
+     * @returns 是否需要离开 readline 进入模型配置
+     */
+    private async handleModelCommand (args: string[]): Promise<boolean> {
         const action = args[0] || 'list';
         if (action === 'add') {
-            await this.dependencies.onboarding.configureModel(terminal);
-            console.log('模型渠道已保存');
-            return;
+            return true;
         }
         if (action === 'use') {
             const value = args[1] || '';
@@ -242,7 +251,7 @@ export class Cli {
                 modelId: value.slice(separator + 1),
             });
             console.log(`已切换到 ${value}`);
-            return;
+            return false;
         }
         if (action !== 'list') {
             throw new Error('用法: /model list|add|use');
@@ -257,5 +266,6 @@ export class Cli {
             })),
         );
         console.table(rows);
+        return false;
     }
 }

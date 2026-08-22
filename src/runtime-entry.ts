@@ -60,7 +60,7 @@ async function main (): Promise<void> {
     if (config.isConfigured()) {
         reflection.start();
     }
-    const onboarding = new Onboarding(paths, config, workspace);
+    const onboarding = new Onboarding(paths, config);
     const cli = new Cli({
         paths,
         config,
