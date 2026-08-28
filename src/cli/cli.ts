@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import type { AgentRuntime } from '../agent/agent-runtime';
 import type { ConfigStore } from '../config/config-store';
@@ -8,6 +9,7 @@ import type { MemoryStore } from '../memory/memory-store';
 import type { NotificationInbox } from '../notification/notification-inbox';
 import { OnboardingCancelledError, type Onboarding } from '../onboarding/onboarding';
 import type { SkillRegistry } from '../skills/skill-registry';
+import type { ScheduledTaskManager } from '../task/scheduled-task-manager';
 
 const RESTART_EXIT_CODE = 75;
 const MODEL_SETUP_RESULT = -2;
@@ -27,6 +29,7 @@ export class Cli {
         skills: SkillRegistry;
         notifications: NotificationInbox;
         jobs: JobManager;
+        scheduledTasks: ScheduledTaskManager;
         memory: MemoryStore;
         health: HealthChecker;
     }) {}
@@ -144,6 +147,9 @@ export class Cli {
                 '/skills                      查看技能',
                 '/jobs [id]                   查看后台任务或任务日志',
                 '/job cancel|resume <id>      取消或恢复后台任务',
+                '/tasks                       查看一次性定时提醒',
+                '/task cancel <id>            取消尚未触发的提醒',
+                '/topics [query]              查看持续事项',
                 '/memory [query]              查看或检索长期记忆',
                 '/growth                      查看 Reflection 成长候选',
                 '/notifications               查看并清空通知',
@@ -193,10 +199,57 @@ export class Cli {
             console.log(changed ? '任务状态已更新' : '任务不存在或当前状态不支持该操作');
             return -1;
         }
+        if (command === '/tasks') {
+            const tasks = this.dependencies.scheduledTasks.list();
+            console.table(tasks.map(task => ({
+                id: task.id,
+                status: task.status,
+                dueAt: task.dueAt,
+                timezone: task.timezone,
+                title: task.title,
+            })));
+            return -1;
+        }
+        if (command === '/task') {
+            const action = args[0];
+            const id = args[1];
+            if (action !== 'cancel' || !id) {
+                throw new Error('用法: /task cancel <id>');
+            }
+            const runId = randomUUID();
+            const timezone = this.dependencies.config.read().timezone;
+            const source = this.dependencies.memory.recordEvent({
+                actor: 'user',
+                type: 'cli_command',
+                payload: { command: 'task_cancel', taskId: id },
+                runId,
+                taskId: id,
+                timezone,
+                idempotencyKey: `run:${runId}:cli-command`,
+            });
+            const changed = this.dependencies.scheduledTasks.cancel(id, {
+                runId,
+                sourceEventId: source.id,
+                timezone,
+            });
+            console.log(changed ? '提醒已取消' : '提醒不存在或已进入终态');
+            return -1;
+        }
+        if (command === '/topics') {
+            const topics = this.dependencies.memory.searchTopics(args.join(' '), 50);
+            console.log(topics.length > 0
+                ? topics.map(topic => `[${topic.id}] (${topic.kind || 'general'}) ${topic.title}`).join('\n')
+                : '尚无匹配的持续事项');
+            return -1;
+        }
         if (command === '/memory') {
             const memories = this.dependencies.memory.search(args.join(' '), 50);
             console.log(memories.length > 0
-                ? memories.map(item => `[${item.id}] (${item.kind}/${item.status}) ${item.content}`).join('\n')
+                ? memories.map(item => [
+                    `[${item.id}] (${item.kind}/${item.status}) ${item.content}`,
+                    `  valid=${item.validFrom || '?'}..${item.validTo || 'now'} known=${item.knownFrom}..${item.knownTo || 'now'}`,
+                    `  topics=${item.topicIds.join(',') || '-'} sources=${item.sourceEventIds.join(',') || '-'}`,
+                ].join('\n')).join('\n')
                 : '尚无匹配的长期记忆');
             return -1;
         }

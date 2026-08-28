@@ -41,6 +41,8 @@ export interface SelfcraftConfig {
     providers: Record<string, ProviderConfig>;
     /** Agent 单轮最多执行的步骤数 */
     maxSteps: number;
+    /** 解释用户本地时间使用的 IANA 时区 */
+    timezone: string;
 }
 
 /** 新增模型渠道所需参数 */

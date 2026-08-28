@@ -31,6 +31,7 @@ const configSchema = z.object({
     }).nullable(),
     providers: z.record(z.string(), providerSchema),
     maxSteps: z.number().int().min(1).max(100),
+    timezone: z.string().min(1).max(100).refine(isValidTimezone, '时区必须是有效的 IANA 名称'),
 });
 
 const secretsSchema = z.object({
@@ -76,7 +77,13 @@ export class ConfigStore {
      */
     public read (): SelfcraftConfig {
         if (!fs.existsSync(this.configPath)) {
-            return { version: 1, activeModel: null, providers: {}, maxSteps: 32 };
+            return {
+                version: 1,
+                activeModel: null,
+                providers: {},
+                maxSteps: 32,
+                timezone: resolveSystemTimezone(),
+            };
         }
         const parsed = configSchema.parse(JSON.parse(fs.readFileSync(this.configPath, 'utf8')));
         return structuredClone(parsed) as SelfcraftConfig;
@@ -144,6 +151,21 @@ export class ConfigStore {
             throw new Error(`模型不存在: ${selection.providerId}/${selection.modelId}`);
         }
         config.activeModel = selection;
+        this.write(config);
+    }
+
+    /**
+     * 保存解释用户本地时间使用的 IANA 时区
+     *
+     * @param timezone IANA 时区名称
+     */
+    public setTimezone (timezone: string): void {
+        const normalized = timezone.trim();
+        if (!isValidTimezone(normalized)) {
+            throw new Error('时区必须是有效的 IANA 名称');
+        }
+        const config = this.read();
+        config.timezone = normalized;
         this.write(config);
     }
 
@@ -239,5 +261,24 @@ export class ConfigStore {
         if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)) {
             throw new Error('providerId 格式无效');
         }
+    }
+}
+
+/** 返回当前系统时区，无法识别时使用 UTC */
+function resolveSystemTimezone (): string {
+    try {
+        return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    } catch {
+        return 'UTC';
+    }
+}
+
+/** 判断文本是否是有效的 IANA 时区 */
+function isValidTimezone (value: string): boolean {
+    try {
+        new Intl.DateTimeFormat('en-US', { timeZone: value }).format(0);
+        return true;
+    } catch {
+        return false;
     }
 }

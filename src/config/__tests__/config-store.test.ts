@@ -24,6 +24,7 @@ describe('ConfigStore', () => {
         const store = new ConfigStore(createTemporaryDirectory());
 
         expect(store.read().activeModel).toBeNull();
+        expect(store.read().timezone).toBeTruthy();
         expect(store.isConfigured()).toBeFalse();
     });
 
@@ -41,8 +42,10 @@ describe('ConfigStore', () => {
             },
         });
         store.useModel({ providerId: 'local', modelId: 'pro' });
+        store.setTimezone('Asia/Shanghai');
 
         expect(store.getActiveModel().selection.modelId).toBe('pro');
+        expect(store.read().timezone).toBe('Asia/Shanghai');
         expect(fs.readFileSync(path.join(directory, 'config.json'), 'utf8')).not.toContain('test-secret');
         expect(fs.readFileSync(path.join(directory, 'secrets.json'), 'utf8')).toContain('test-secret');
         expect(fs.statSync(path.join(directory, 'secrets.json')).mode & 0o777).toBe(0o600);

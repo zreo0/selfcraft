@@ -16,6 +16,7 @@ import { Onboarding } from './onboarding/onboarding';
 import { SessionStore } from './session/session-store';
 import { SkillRegistry } from './skills/skill-registry';
 import { ReleaseStore } from './supervisor/release-store';
+import { ScheduledTaskManager } from './task/scheduled-task-manager';
 import { createTools } from './tools';
 import { PathGuard } from './tools/path-guard';
 import { WorkspaceService } from './workspace/workspace-service';
@@ -32,6 +33,7 @@ async function main (): Promise<void> {
     const context = new ContextManager();
     const notifications = new NotificationInbox(paths.notifications);
     const memory = new MemoryStore(paths.state);
+    const scheduledTasks = new ScheduledTaskManager(paths.state, notifications, memory);
     const reflection = new ReflectionWorker(memory, () => ModelFactory.create(config), logger);
     const jobs = new JobManager(
         paths.state,
@@ -42,7 +44,15 @@ async function main (): Promise<void> {
     );
     const releases = new ReleaseStore(paths.supervisor, paths.evolution);
     const evolution = new EvolutionService(paths, releases, logger);
-    const tools = createTools(paths.workspace, skills, notifications, evolution, jobs, memory);
+    const tools = createTools(
+        paths.workspace,
+        skills,
+        notifications,
+        evolution,
+        jobs,
+        memory,
+        scheduledTasks,
+    );
     const agent = new AgentRuntime(
         config,
         workspace,
@@ -57,6 +67,7 @@ async function main (): Promise<void> {
     );
     jobs.setAgentExecutor((job, signal, onLog) => agent.runBackground(job, signal, onLog));
     jobs.start();
+    scheduledTasks.start();
     if (config.isConfigured()) {
         reflection.start();
     }
@@ -69,10 +80,16 @@ async function main (): Promise<void> {
         skills,
         notifications,
         jobs,
+        scheduledTasks,
         memory,
         health: new HealthChecker(),
     });
-    process.exitCode = await cli.start(process.argv.slice(2));
+    try {
+        process.exitCode = await cli.start(process.argv.slice(2));
+    } finally {
+        scheduledTasks.stop();
+        reflection.stop();
+    }
 }
 
 main().catch(error => {

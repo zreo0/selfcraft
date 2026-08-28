@@ -31,6 +31,8 @@ export class HealthChecker {
             'src/job/job-manager.ts',
             'src/memory/memory-store.ts',
             'src/memory/reflection-worker.ts',
+            'src/task/scheduled-task-manager.ts',
+            'src/tools/scheduled-task-tools.ts',
             'src/supervisor/supervisor.ts',
             'workspace-template/HANDBOOK.md',
         ];

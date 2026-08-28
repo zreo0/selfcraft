@@ -33,8 +33,36 @@ export class NotificationInbox {
      * @returns 已保存通知
      */
     public push (title: string, message: string): Notification {
+        return this.append(randomUUID(), title, message);
+    }
+
+    /**
+     * 使用稳定标识写入通知，重复调用时返回已有记录
+     *
+     * @param id 稳定通知标识
+     * @param title 标题
+     * @param message 正文
+     * @returns 已存在或新保存的通知
+     */
+    public pushOnce (id: string, title: string, message: string): Notification {
+        const existing = this.list().find(notification => notification.id === id);
+        if (existing) {
+            return existing;
+        }
+        return this.append(id, title, message);
+    }
+
+    /**
+     * 追加一条指定标识的通知
+     *
+     * @param id 通知标识
+     * @param title 标题
+     * @param message 正文
+     * @returns 已保存通知
+     */
+    private append (id: string, title: string, message: string): Notification {
         const notification = {
-            id: randomUUID(),
+            id,
             createdAt: new Date().toISOString(),
             title,
             message,

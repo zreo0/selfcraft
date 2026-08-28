@@ -117,6 +117,7 @@ describe('Onboarding', () => {
         const { onboarding, config } = createOnboarding();
         selectValues.push('openai-compatible');
         textValues.push(
+            'Asia/Shanghai',
             'not-a-url',
             'https://example.com/v1',
             'model-a, model-b',
@@ -133,6 +134,7 @@ describe('Onboarding', () => {
 
         const active = config.getActiveModel();
         const provider = config.read().providers.default;
+        expect(config.read().timezone).toBe('Asia/Shanghai');
         expect(active.selection).toEqual({ providerId: 'default', modelId: 'model-a' });
         expect(provider.baseURL).toBe('https://example.com/v1');
         expect(provider.models['model-a']).toEqual({
@@ -174,6 +176,7 @@ describe('Onboarding', () => {
 
     test('取消时不写入半份配置', async () => {
         const { onboarding, config } = createOnboarding();
+        textValues.push('Asia/Shanghai');
         selectValues.push(CANCELLED);
 
         await expect(onboarding.run()).rejects.toBeInstanceOf(OnboardingCancelledError);

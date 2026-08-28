@@ -45,9 +45,9 @@ Agent 离这些问题最近。它知道哪些工作流反复失败，哪些步�
 
 Selfcraft 当前是一个基于 Bun、TypeScript 和 Vercel AI SDK v7 的实验性内核，以 CLI 作为第一版入口：
 
-- **Remember** — 保留长期会话，从经历中形成有来源的结构化记忆
+- **Remember** — 保存完整事件时间线，按时间、事项与证据重新想起经历
 - **Reflect** — 在对话后异步整理事实、失败和成长候选
-- **Work** — 使用 workspace 工具，并运行可持久化的后台 Agent / Shell 任务
+- **Work** — 使用 workspace 工具，运行后台 Job，并持久化一次性定时提醒
 - **Learn** — 通过可发现、可修改的 `SKILL.md` 扩展能力
 - **Evolve** — 在隔离环境验证候选源码，通过后再更新 Runtime
 - **Recover** — 由独立 Supervisor 观察新版本，并在失败时自动回滚
@@ -65,7 +65,7 @@ bun install
 bun run start
 ```
 
-第一次启动会进入 onboarding，依次配置模型协议、Base URL、API key、Model ID 和上下文参数，也可以选择是否给实例一个初始称呼。
+第一次启动会进入 onboarding，先确认解释本地时间使用的 IANA 时区，再配置模型协议、Base URL、API key、Model ID 和上下文参数。
 
 如果不设置名字，它就保持未命名。Selfcraft 不会根据项目名替自己决定身份。
 
@@ -82,8 +82,8 @@ Supervisor（稳定）
 Runtime（可演化）
   ├─ Agent Loop / CLI
   ├─ 长期会话与上下文
-  ├─ 后台 Job 与通知
-  ├─ 结构化记忆与 Reflection
+  ├─ 后台 Job、定时 Task 与通知
+  ├─ 事件时间线、结构化记忆与 Reflection
   ├─ workspace 工具与技能
   └─ 候选版本提案与验证
 ```
@@ -100,9 +100,9 @@ Supervisor 和 Runtime 的边界是刻意留下的：
 
 ```text
 对话或任务
-  → 记录结果与失败
+  → 记录用户、工具、结果与失败 Event
   → Reflection 提取记忆和成长候选
-  → 筛选后的记忆与候选进入后续上下文
+  → 当前有效且相关的记忆进入后续上下文
   → Agent 检查真实问题
   → 修改技能，或提出 Runtime 候选版本
   → 验证、激活、观察；失败则回滚
@@ -110,18 +110,30 @@ Supervisor 和 Runtime 的边界是刻意留下的：
 
 ### 记忆与 Reflection
 
-Selfcraft 同时保留两类信息：
+Selfcraft 没有单独保存一份不断膨胀的 Episode 摘要。它只保留几种不可互相替代的东西：
 
-- `transcript.jsonl` 记录发生过什么，不因上下文压缩删除
-- SQLite 结构化记忆保存未来仍有用的事实，并记录来源、可信度、重要性和证据数
+```text
+Event ──证据──> Memory
+  │               │
+  └──关联──> Topic ┘  ──按查询重建──> Episode
 
-用户明确要求“记住”时，Agent 使用 `memory_remember`；要求忘记时使用 `memory_forget`。前台对话和后台 Agent Job 结束后还会进入持久 Reflection 队列，由当前模型异步提取：
+Task ──到期──> Notification + Event
+```
 
-- 身份、用户事实、偏好、关系、承诺、方法和经验
+- **Event** 是发生过什么的追加式时间线，区分发生时间与记录时间
+- **Memory** 是未来仍有用的认识，必须能回到来源 Event，并保留纠错或现实变化形成的版本
+- **Topic** 是跨多轮、跨月份甚至跨年份的稳定事项 ID；允许同名，不靠标题强行合并
+- **Episode** 不是另一张表，而是按文本、时间、日历日期或 Topic 临时重建的一段经历
+
+`transcript.jsonl` 仍保存模型会话原文；`context.json` 和会话摘要只是可重建的工作缓存，不是事实来源。
+
+用户明确要求“记住”时，Agent 使用 `memory_remember` 写入 active Memory；普通对话结束后进入持久 Reflection 队列，由当前模型异步提取 candidate：
+
+- 身份、事实、偏好、关系、决定和经验教训
 - 可复用技能的改进候选
 - 可复现 Runtime 缺陷的演化候选
 
-Reflection 采用经过校验的纯文本 JSON 协议，不要求模型渠道支持 structured outputs。它只写入结构化记忆和成长候选，不直接创建技能，也不直接修改 Runtime。
+Reflection 只读取本轮真实 Event，模型不能伪造来源。即使置信度很高，candidate 也不会自动成为 active Memory；只有用户明确确认后，Agent 才会用 `memory_confirm` 激活它，并在需要时补充现实有效时间与 Topic。后台 Job 可以读取 Memory，但不能代替用户确认、修订或删除 active Memory。Reflection 同样不会直接创建技能、修改 Runtime，或把未来提醒混进记忆。
 
 ### 技能与 Runtime 演化
 
@@ -156,9 +168,9 @@ Runtime 修改则必须经过完整候选流程：
 
 文件工具统一限制在 workspace。Shell 同样从 workspace 启动，但保留正常命令能力；生产环境仍应使用独立 VM 或容器作为主要隔离边界。
 
-## 后台任务
+## 后台任务与提醒
 
-短操作由 Agent 在当前轮次直接完成。只有需要较长时间、能够独立推进或不应阻塞对话的工作才进入后台。
+短操作由 Agent 在当前轮次直接完成。需要较长时间、能够独立推进或不应阻塞对话的工作进入 **Job**；“某个时间提醒我”进入独立的 **Task**。两者不是记忆。
 
 Job 默认最多并发执行两个：
 
@@ -166,6 +178,8 @@ Job 默认最多并发执行两个：
 - Runtime 重启后，未完成 Agent Job 根据日志和 workspace 真实状态继续
 - Shell Job 使用独立进程；状态无法确认时标记中断，不盲目重放
 - 完成、失败和中断都会写入持久通知收件箱
+
+定时 Task 第一版只支持一次性绝对时间，不包含 Cron、重复规则或任意延迟动作。Runtime 启动时会补扫已经到期的提醒，通知使用稳定 ID，避免重启后重复投递；创建、触发、完成、取消和失败都会留下时间线 Event。
 
 ## 模型与 CLI
 
@@ -184,6 +198,9 @@ Job 默认最多并发执行两个：
 /skills
 /jobs [id]
 /job cancel|resume <id>
+/tasks
+/task cancel <id>
+/topics [query]
 /memory [query]
 /growth
 /notifications

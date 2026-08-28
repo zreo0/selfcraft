@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, setSystemTime, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -11,11 +11,12 @@ import { ContextManager } from '../../context/context-manager';
 import { EvolutionService } from '../../evolution/evolution-service';
 import { JobManager } from '../../job/job-manager';
 import { Logger } from '../../logging/logger';
-import { MemoryStore } from '../../memory/memory-store';
+import { MemoryStore, type ReflectionInput } from '../../memory/memory-store';
 import { NotificationInbox } from '../../notification/notification-inbox';
 import { SessionStore } from '../../session/session-store';
 import { SkillRegistry } from '../../skills/skill-registry';
 import { ReleaseStore } from '../../supervisor/release-store';
+import { ScheduledTaskManager } from '../../task/scheduled-task-manager';
 import { createTools } from '../../tools';
 import { PathGuard } from '../../tools/path-guard';
 import { WorkspaceService } from '../../workspace/workspace-service';
@@ -38,19 +39,22 @@ function usage () {
 }
 
 afterEach(() => {
+    setSystemTime();
     for (const directory of temporaryDirectories.splice(0)) {
         fs.rmSync(directory, { recursive: true, force: true });
     }
 });
 
 describe('AgentRuntime', () => {
-    test('执行工具循环并把完整消息持久化到长期会话', async () => {
+    test('执行提醒工具循环并持久化完整会话与事件链', async () => {
+        setSystemTime(new Date('2026-08-29T16:30:00.000Z'));
         const root = createTemporaryDirectory();
         const paths = resolvePaths('development', path.join(root, 'home'));
         paths.project = path.resolve(import.meta.dir, '../../..');
         const workspace = new WorkspaceService(paths.workspace, path.join(paths.project, 'workspace-template'));
         workspace.initialize();
         const config = new ConfigStore(paths.config);
+        config.setTimezone('Asia/Shanghai');
         const skills = new SkillRegistry(path.join(paths.workspace, 'skills'));
         const logger = new Logger(paths.logs);
         const evolution = new EvolutionService(
@@ -67,6 +71,7 @@ describe('AgentRuntime', () => {
             notifications,
             logger,
         );
+        const scheduledTasks = new ScheduledTaskManager(paths.state, notifications, memory);
         const model = new MockLanguageModelV4({
             doStream: [
                 {
@@ -75,8 +80,13 @@ describe('AgentRuntime', () => {
                             {
                                 type: 'tool-call',
                                 toolCallId: 'call-1',
-                                toolName: 'write',
-                                input: JSON.stringify({ path: 'files/agent-test.txt', content: 'done' }),
+                                toolName: 'task_schedule',
+                                input: JSON.stringify({
+                                    title: '准备材料',
+                                    message: '整理验收材料',
+                                    dueAt: '2099-09-01T09:00:00+08:00',
+                                    originalExpression: '2099 年 9 月 1 日上午九点',
+                                }),
                             },
                             {
                                 type: 'finish',
@@ -103,6 +113,7 @@ describe('AgentRuntime', () => {
             ],
         });
         const session = new SessionStore(paths.sessions);
+        const reflections: ReflectionInput[] = [];
         const agent = new AgentRuntime(
             config,
             workspace,
@@ -111,8 +122,21 @@ describe('AgentRuntime', () => {
             new ContextManager(),
             evolution,
             memory,
-            { enqueue: () => 'reflection-test' },
-            createTools(paths.workspace, skills, notifications, evolution, jobs, memory),
+            {
+                enqueue: input => {
+                    reflections.push(input);
+                    return 'reflection-test';
+                },
+            },
+            createTools(
+                paths.workspace,
+                skills,
+                notifications,
+                evolution,
+                jobs,
+                memory,
+                scheduledTasks,
+            ),
             logger,
             () => ({
                 model,
@@ -124,17 +148,105 @@ describe('AgentRuntime', () => {
         );
         let response = '';
 
-        await agent.run('创建测试文件', text => {
+        await agent.run('到 2099 年 9 月 1 日上午九点提醒我准备材料', text => {
             response += text;
         });
 
         expect(response).toBe('完成');
-        expect(fs.readFileSync(path.join(paths.workspace, 'files', 'agent-test.txt'), 'utf8')).toBe('done');
+        expect(scheduledTasks.list()).toHaveLength(1);
+        expect(scheduledTasks.list()[0]).toMatchObject({
+            title: '准备材料',
+            status: 'scheduled',
+            timezone: config.read().timezone,
+        });
         expect(session.load().messages.map(message => message.role)).toEqual([
             'user',
             'assistant',
             'tool',
             'assistant',
         ]);
+        expect(reflections).toHaveLength(1);
+        const events = memory.listEventsByRun(reflections[0].runId);
+        expect(events.map(event => event.type)).toEqual([
+            'user_message',
+            'tool_call',
+            'task_created',
+            'tool_result',
+            'assistant_message',
+        ]);
+        expect(events[1].sourceEventId).toBe(events[0].id);
+        expect(events[2].sourceEventId).toBe(events[0].id);
+        expect(events[3].sourceEventId).toBe(events[1].id);
+        expect(events[4].sourceEventId).toBe(events[0].id);
+        expect(events.every(event => event.timezone === 'Asia/Shanghai')).toBe(true);
+        expect(events.every(event => event.localDate === '2026-08-30')).toBe(true);
+        expect(JSON.stringify(model.doStreamCalls[0]?.prompt)).not.toContain(events[0].id);
+        expect(reflections[0]).toEqual({
+            runId: reflections[0].runId,
+            eventIds: events.map(event => event.id),
+            outcome: 'completed',
+        });
+    });
+
+    test('模型失败仍保留用户事件、失败事件和可追溯 Reflection', async () => {
+        setSystemTime(new Date('2026-08-29T16:30:00.000Z'));
+        const root = createTemporaryDirectory();
+        const paths = resolvePaths('development', path.join(root, 'home'));
+        paths.project = path.resolve(import.meta.dir, '../../..');
+        const workspace = new WorkspaceService(paths.workspace, path.join(paths.project, 'workspace-template'));
+        workspace.initialize();
+        const config = new ConfigStore(paths.config);
+        config.setTimezone('Asia/Shanghai');
+        const logger = new Logger(paths.logs);
+        const memory = new MemoryStore(paths.state);
+        const reflections: ReflectionInput[] = [];
+        const model = new MockLanguageModelV4({
+            doStream: async () => {
+                throw new Error('model unavailable');
+            },
+        });
+        const agent = new AgentRuntime(
+            config,
+            workspace,
+            new SkillRegistry(path.join(paths.workspace, 'skills')),
+            new SessionStore(paths.sessions),
+            new ContextManager(),
+            new EvolutionService(
+                paths,
+                new ReleaseStore(paths.supervisor, paths.evolution),
+                logger,
+            ),
+            memory,
+            {
+                enqueue: input => {
+                    reflections.push(input);
+                    return 'reflection-failed';
+                },
+            },
+            {},
+            logger,
+            () => ({
+                model,
+                providerId: 'mock',
+                modelId: 'mock-v4',
+                contextWindow: 128000,
+                maxOutputTokens: 4096,
+            }),
+        );
+
+        await expect(agent.run('不要丢掉这条输入', () => undefined)).rejects.toThrow('model unavailable');
+
+        expect(reflections).toHaveLength(1);
+        const events = memory.listEventsByRun(reflections[0].runId);
+        expect(events.map(event => event.type)).toEqual(['user_message', 'run_failed']);
+        expect(events[1].sourceEventId).toBe(events[0].id);
+        expect(events.every(event => event.timezone === 'Asia/Shanghai')).toBe(true);
+        expect(events.every(event => event.localDate === '2026-08-30')).toBe(true);
+        expect(reflections[0]).toEqual({
+            runId: reflections[0].runId,
+            eventIds: events.map(event => event.id),
+            outcome: 'failed',
+            error: 'model unavailable',
+        });
     });
 });

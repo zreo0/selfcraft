@@ -53,7 +53,14 @@ export class Onboarding {
             `数据    ${this.paths.home}`,
             `工作区  ${this.paths.workspace}`,
         ].join('\n'), '我会住在这里');
+        const timezone = this.unwrap(await text({
+            message: '你通常按哪个时区生活？',
+            defaultValue: this.config.read().timezone,
+            placeholder: '例如 Asia/Shanghai',
+            validate: value => this.validateTimezone(value ?? ''),
+        }));
         await this.configureModel(true);
+        this.config.setTimezone(timezone);
         outro('准备好了。接下来，你想让我做点什么？');
     }
 
@@ -331,6 +338,20 @@ export class Onboarding {
         const number = Number(value);
         if (!Number.isInteger(number) || number <= 0) {
             return '请输入正整数';
+        }
+    }
+
+    /**
+     * 校验用户本地时间使用的 IANA 时区
+     *
+     * @param value 时区名称
+     * @returns 校验错误或 undefined
+     */
+    private validateTimezone (value: string): string | undefined {
+        try {
+            new Intl.DateTimeFormat('en-US', { timeZone: value.trim() }).format(0);
+        } catch {
+            return '请输入有效的 IANA 时区，例如 Asia/Shanghai';
         }
     }
 
