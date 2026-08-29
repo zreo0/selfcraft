@@ -41,6 +41,7 @@ const secretsSchema = z.object({
 
 /** 模型配置与凭证的持久化边界 */
 export class ConfigStore {
+    private readonly configDirectory: string;
     private readonly configPath: string;
     private readonly secretsPath: string;
 
@@ -50,6 +51,7 @@ export class ConfigStore {
      * @param configDirectory 配置目录
      */
     constructor (configDirectory: string) {
+        this.configDirectory = configDirectory;
         this.configPath = path.join(configDirectory, 'config.json');
         this.secretsPath = path.join(configDirectory, 'secrets.json');
         fs.mkdirSync(configDirectory, { recursive: true, mode: 0o700 });
@@ -77,16 +79,54 @@ export class ConfigStore {
      */
     public read (): SelfcraftConfig {
         if (!fs.existsSync(this.configPath)) {
-            return {
-                version: 1,
-                activeModel: null,
-                providers: {},
-                maxSteps: 32,
-                timezone: resolveSystemTimezone(),
-            };
+            return createDefaultConfig();
         }
         const parsed = configSchema.parse(JSON.parse(fs.readFileSync(this.configPath, 'utf8')));
         return structuredClone(parsed) as SelfcraftConfig;
+    }
+
+    /**
+     * 校验现有配置与活动模型凭证是否可以完整读取
+     *
+     * @returns 校验通过后结束
+     */
+    public assertValid (): void {
+        const config = this.read();
+        const credentials = this.readSecrets();
+        if (!config.activeModel) {
+            return;
+        }
+        const provider = config.providers[config.activeModel.providerId];
+        const model = provider?.models[config.activeModel.modelId];
+        if (!provider || !model || !credentials[provider.credentialRef]) {
+            throw new Error('活动模型配置不完整');
+        }
+    }
+
+    /**
+     * 按时间备份非敏感配置，并重置模型与凭证设置
+     *
+     * @returns 旧配置的备份目录；没有旧配置时返回 undefined
+     */
+    public backupAndReset (): string | undefined {
+        let backupDirectory: string | undefined;
+        if (fs.existsSync(this.configPath)) {
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const backupsDirectory = path.join(this.configDirectory, 'backups');
+            backupDirectory = path.join(backupsDirectory, timestamp);
+            fs.mkdirSync(backupDirectory, { recursive: true, mode: 0o700 });
+            fs.chmodSync(backupsDirectory, 0o700);
+            fs.chmodSync(backupDirectory, 0o700);
+            const backupPath = path.join(backupDirectory, 'config.json');
+            fs.copyFileSync(this.configPath, backupPath);
+            fs.chmodSync(backupPath, 0o600);
+        }
+
+        if (fs.existsSync(this.secretsPath)) {
+            this.writeSecrets({});
+        }
+        this.write(createDefaultConfig());
+        return backupDirectory;
     }
 
     /**
@@ -262,6 +302,21 @@ export class ConfigStore {
             throw new Error('providerId 格式无效');
         }
     }
+}
+
+/**
+ * 创建尚未配置模型的默认配置
+ *
+ * @returns 使用当前系统时区的初始配置
+ */
+function createDefaultConfig (): SelfcraftConfig {
+    return {
+        version: 1,
+        activeModel: null,
+        providers: {},
+        maxSteps: 32,
+        timezone: resolveSystemTimezone(),
+    };
 }
 
 /** 返回当前系统时区，无法识别时使用 UTC */

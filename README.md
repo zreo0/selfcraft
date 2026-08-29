@@ -65,11 +65,19 @@ bun install
 bun run start
 ```
 
-第一次启动会进入 onboarding，先确认解释本地时间使用的 IANA 时区，再配置模型协议、Base URL、API key、Model ID 和上下文参数。
+第一次启动会进入 onboarding。Selfcraft 会自动检测本地时区，并提供可以输入城市名筛选的 IANA 时区列表；随后再配置模型协议、Base URL、API key、Model ID 和上下文参数。
 
 如果不设置名字，它就保持未命名。Selfcraft 不会根据项目名替自己决定身份。
 
 API key 只写入权限为 `0600` 的 `config/secrets.json`，不会进入普通配置和日志。
+
+需要从一份新配置重新开始时，可以运行：
+
+```bash
+bun run start reset-config
+```
+
+确认后，旧的非敏感 `config.json` 会备份到 `config/backups/<UTC 时间>/`，再进入 onboarding。API key 不会写入历史备份，会被清空并需要重新输入；记忆、会话、任务、技能和 workspace 均保持不变。
 
 > 不要把真实凭证粘贴进对话或 workspace 文件。对话记录本身是长期数据，不属于凭证存储。
 
@@ -269,6 +277,12 @@ bun run smoke
 ```bash
 docker compose -f docker-compose.dev.yml up -d --build
 docker compose -f docker-compose.dev.yml exec selfcraft bun run start
+```
+
+如果命名卷里保留了旧配置，可以在容器中备份并重新配置：
+
+```bash
+docker compose -f docker-compose.dev.yml exec selfcraft bun run start reset-config
 ```
 
 宿主源码挂载到 `/app`；依赖和实例数据分别保存在 Compose 命名卷。Selfcraft 通过 `docker compose exec` 运行，输出属于当前终端，不会出现在 `docker compose logs`。

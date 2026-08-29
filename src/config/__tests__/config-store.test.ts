@@ -50,4 +50,58 @@ describe('ConfigStore', () => {
         expect(fs.readFileSync(path.join(directory, 'secrets.json'), 'utf8')).toContain('test-secret');
         expect(fs.statSync(path.join(directory, 'secrets.json')).mode & 0o777).toBe(0o600);
     });
+
+    test('无需解析旧文件即可按时间备份配置并清空模型凭证', () => {
+        const directory = createTemporaryDirectory();
+        const store = new ConfigStore(directory);
+        const legacyConfig = '{"version":1,';
+        fs.writeFileSync(path.join(directory, 'config.json'), legacyConfig);
+        fs.writeFileSync(path.join(directory, 'secrets.json'), '{"version":1,');
+        fs.writeFileSync(path.join(directory, 'keep.txt'), 'keep');
+
+        const backupDirectory = store.backupAndReset();
+
+        expect(backupDirectory).toBeDefined();
+        if (!backupDirectory) {
+            throw new Error('预期生成配置备份');
+        }
+        expect(path.basename(backupDirectory)).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/);
+        expect(fs.readFileSync(path.join(backupDirectory, 'config.json'), 'utf8')).toBe(legacyConfig);
+        expect(fs.statSync(backupDirectory).mode & 0o777).toBe(0o700);
+        expect(fs.statSync(path.join(backupDirectory, 'config.json')).mode & 0o777).toBe(0o600);
+        expect(store.read().activeModel).toBeNull();
+        expect(store.read().providers).toEqual({});
+        expect(JSON.parse(fs.readFileSync(path.join(directory, 'secrets.json'), 'utf8')).credentials).toEqual({});
+        expect(fs.readFileSync(path.join(directory, 'keep.txt'), 'utf8')).toBe('keep');
+        expect(fs.existsSync(path.join(backupDirectory, 'secrets.json'))).toBeFalse();
+    });
+
+    test('拒绝损坏或缺失的活动模型凭证', () => {
+        const directory = createTemporaryDirectory();
+        const store = new ConfigStore(directory);
+        store.addProvider({
+            providerId: 'local',
+            type: 'openai-compatible',
+            baseURL: 'http://127.0.0.1:3000/v1',
+            apiKey: 'test-secret',
+            models: {
+                model: { vision: false, contextWindow: 128000, maxOutputTokens: 4096 },
+            },
+        });
+
+        fs.writeFileSync(path.join(directory, 'secrets.json'), '{');
+        expect(() => store.assertValid()).toThrow();
+        fs.unlinkSync(path.join(directory, 'secrets.json'));
+        expect(() => store.assertValid()).toThrow('活动模型配置不完整');
+    });
+
+    test('没有旧配置时直接创建默认配置且不生成空备份', () => {
+        const directory = createTemporaryDirectory();
+        const store = new ConfigStore(directory);
+
+        expect(store.backupAndReset()).toBeUndefined();
+        expect(store.read().activeModel).toBeNull();
+        expect(fs.existsSync(path.join(directory, 'backups'))).toBeFalse();
+        expect(fs.existsSync(path.join(directory, 'secrets.json'))).toBeFalse();
+    });
 });

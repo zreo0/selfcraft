@@ -24,6 +24,16 @@ import { WorkspaceService } from './workspace/workspace-service';
 /** 组装可变 Runtime 并启动当前 CLI 适配器 */
 async function main (): Promise<void> {
     const paths = resolvePaths();
+    const args = process.argv.slice(2);
+    if (args[0] === 'reset-config') {
+        if (!process.stdin.isTTY) {
+            throw new Error('重置配置需要交互式终端，请运行 bun run start reset-config');
+        }
+        const config = new ConfigStore(paths.config);
+        await new Onboarding(paths, config).reset();
+        return;
+    }
+
     const logger = new Logger(paths.logs);
     const workspace = new WorkspaceService(paths.workspace, path.join(paths.project, 'workspace-template'));
     workspace.initialize();
@@ -85,7 +95,7 @@ async function main (): Promise<void> {
         health: new HealthChecker(),
     });
     try {
-        process.exitCode = await cli.start(process.argv.slice(2));
+        process.exitCode = await cli.start(args);
     } finally {
         scheduledTasks.stop();
         reflection.stop();

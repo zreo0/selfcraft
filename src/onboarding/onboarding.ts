@@ -1,4 +1,5 @@
 import {
+    autocomplete,
     cancel,
     confirm,
     intro,
@@ -53,15 +54,52 @@ export class Onboarding {
             `数据    ${this.paths.home}`,
             `工作区  ${this.paths.workspace}`,
         ].join('\n'), '我会住在这里');
-        const timezone = this.unwrap(await text({
+        const detectedTimezone = this.config.read().timezone;
+        const timezone = this.unwrap(await autocomplete({
             message: '你通常按哪个时区生活？',
-            defaultValue: this.config.read().timezone,
-            placeholder: '例如 Asia/Shanghai',
-            validate: value => this.validateTimezone(value ?? ''),
+            options: createTimezoneOptions(detectedTimezone),
+            initialValue: detectedTimezone,
+            placeholder: '输入城市或时区，例如 Shanghai',
+            maxItems: 8,
         }));
         await this.configureModel(true);
         this.config.setTimezone(timezone);
         outro('准备好了。接下来，你想让我做点什么？');
+    }
+
+    /**
+     * 备份并重置现有配置，然后重新进入首次配置流程
+     *
+     * @returns 配置流程完成后结束
+     */
+    public async reset (): Promise<void> {
+        const confirmed = await confirm({
+            message: '备份当前 config.json 并重新配置？API key 不会备份，需要重新输入；记忆、会话、任务和 workspace 不受影响。',
+            active: '备份并重置',
+            inactive: '取消',
+            initialValue: false,
+        });
+        if (isCancel(confirmed) || !confirmed) {
+            cancel('配置保持不变');
+            return;
+        }
+
+        const backupDirectory = this.config.backupAndReset();
+        log.success(backupDirectory
+            ? `旧配置已备份到 ${backupDirectory}`
+            : '没有发现旧配置，已创建一份新配置');
+        try {
+            await this.run();
+        } catch (error) {
+            if (!(error instanceof OnboardingCancelledError)) {
+                throw error;
+            }
+            log.message([
+                '重新配置尚未完成，但刚才的重置已经生效。',
+                backupDirectory ? `旧 config 仍在 ${backupDirectory}。` : '',
+                '下次启动时会继续 onboarding。',
+            ].filter(Boolean).join('\n'));
+        }
     }
 
     /**
@@ -342,20 +380,6 @@ export class Onboarding {
     }
 
     /**
-     * 校验用户本地时间使用的 IANA 时区
-     *
-     * @param value 时区名称
-     * @returns 校验错误或 undefined
-     */
-    private validateTimezone (value: string): string | undefined {
-        try {
-            new Intl.DateTimeFormat('en-US', { timeZone: value.trim() }).format(0);
-        } catch {
-            return '请输入有效的 IANA 时区，例如 Asia/Shanghai';
-        }
-    }
-
-    /**
      * 解析并去重模型标识
      *
      * @param value 逗号分隔的模型标识
@@ -364,4 +388,27 @@ export class Onboarding {
     private parseModelIds (value: string): string[] {
         return [...new Set(value.split(',').map(item => item.trim()).filter(Boolean))];
     }
+}
+
+/**
+ * 构造可搜索的 IANA 时区选项，并把当前检测值放在首位
+ *
+ * @param detectedTimezone 当前系统检测到的时区
+ * @returns 去重后的时区选择项
+ */
+function createTimezoneOptions (detectedTimezone: string): Array<{
+    value: string;
+    label: string;
+    hint?: string;
+}> {
+    const timezones = [...new Set([
+        detectedTimezone,
+        'UTC',
+        ...Intl.supportedValuesOf('timeZone'),
+    ])];
+    return timezones.map(timezone => ({
+        value: timezone,
+        label: timezone,
+        ...(timezone === detectedTimezone && { hint: '自动检测' }),
+    }));
 }

@@ -14,6 +14,7 @@ const temporaryDirectories: string[] = [];
 const textValues: Array<string | symbol> = [];
 const passwordValues: Array<string | symbol> = [];
 const selectValues: Array<string | symbol> = [];
+const autocompleteValues: Array<string | symbol> = [];
 const confirmValues: Array<boolean | symbol> = [];
 const validationErrors: string[] = [];
 
@@ -49,16 +50,22 @@ const introMock = mock(() => {});
 const outroMock = mock(() => {});
 const noteMock = mock(() => {});
 const cancelMock = mock(() => {});
-const logMessageMock = mock(() => {});
-const logSuccessMock = mock(() => {});
+const logMessageMock = mock((_message: string | string[]) => {});
+const logSuccessMock = mock((_message: string) => {});
 const textMock = mock(async (options: { validate?: PromptValidator }) =>
     nextValidatedValue(textValues, options.validate));
 const passwordMock = mock(async (options: { validate?: PromptValidator }) =>
     nextValidatedValue(passwordValues, options.validate));
 const selectMock = mock(async () => nextPromptValue(selectValues));
+const autocompleteMock = mock(async (_options: {
+    initialValue?: string;
+    maxItems?: number;
+    options: Array<{ value: string }>;
+}) => nextPromptValue(autocompleteValues));
 const confirmMock = mock(async () => nextPromptValue(confirmValues));
 
 mock.module('@clack/prompts', () => ({
+    autocomplete: autocompleteMock,
     cancel: cancelMock,
     confirm: confirmMock,
     intro: introMock,
@@ -101,6 +108,7 @@ beforeEach(() => {
     textValues.length = 0;
     passwordValues.length = 0;
     selectValues.length = 0;
+    autocompleteValues.length = 0;
     confirmValues.length = 0;
     validationErrors.length = 0;
     mock.clearAllMocks();
@@ -115,9 +123,10 @@ afterEach(() => {
 describe('Onboarding', () => {
     test('首次配置逐字段重试并保存高级模型能力', async () => {
         const { onboarding, config } = createOnboarding();
+        const detectedTimezone = config.read().timezone;
+        autocompleteValues.push('Asia/Shanghai');
         selectValues.push('openai-compatible');
         textValues.push(
-            'Asia/Shanghai',
             'not-a-url',
             'https://example.com/v1',
             'model-a, model-b',
@@ -152,6 +161,11 @@ describe('Onboarding', () => {
         expect(introMock).toHaveBeenCalledTimes(1);
         expect(noteMock).toHaveBeenCalledTimes(1);
         expect(outroMock).toHaveBeenCalledTimes(1);
+        const timezonePrompt = autocompleteMock.mock.calls[0][0];
+        expect(timezonePrompt.initialValue).toBe(detectedTimezone);
+        expect(timezonePrompt.maxItems).toBe(8);
+        expect(timezonePrompt.options.map(option => option.value)).toContain('Asia/Shanghai');
+        expect(timezonePrompt.options.map(option => option.value)).toContain('UTC');
     });
 
     test('官方渠道可跳过 Base URL 和高级设置', async () => {
@@ -176,13 +190,81 @@ describe('Onboarding', () => {
 
     test('取消时不写入半份配置', async () => {
         const { onboarding, config } = createOnboarding();
-        textValues.push('Asia/Shanghai');
-        selectValues.push(CANCELLED);
+        autocompleteValues.push(CANCELLED);
 
         await expect(onboarding.run()).rejects.toBeInstanceOf(OnboardingCancelledError);
 
         expect(config.isConfigured()).toBeFalse();
         expect(cancelMock).toHaveBeenCalledWith('没有写入新的设置');
         expect(outroMock).not.toHaveBeenCalled();
+    });
+
+    test('拒绝重置时保持现有配置不变', async () => {
+        const { onboarding, config } = createOnboarding();
+        config.addProvider({
+            providerId: 'old',
+            type: 'openai',
+            apiKey: 'old-key',
+            models: {
+                'old-model': { vision: false, contextWindow: 128000, maxOutputTokens: 8192 },
+            },
+        });
+        const before = config.read();
+        confirmValues.push(false);
+
+        await onboarding.reset();
+
+        expect(config.read()).toEqual(before);
+        expect(config.getActiveModel().apiKey).toBe('old-key');
+        expect(cancelMock).toHaveBeenCalledWith('配置保持不变');
+        expect(autocompleteMock).not.toHaveBeenCalled();
+    });
+
+    test('确认重置后备份旧配置并完成一份全新配置', async () => {
+        const { onboarding, config } = createOnboarding();
+        config.addProvider({
+            providerId: 'old',
+            type: 'openai',
+            apiKey: 'old-key',
+            models: {
+                'old-model': { vision: false, contextWindow: 128000, maxOutputTokens: 8192 },
+            },
+        });
+        autocompleteValues.push('Asia/Tokyo');
+        selectValues.push('openai');
+        textValues.push('new-model');
+        passwordValues.push('new-key');
+        confirmValues.push(true, false, false);
+
+        await onboarding.reset();
+
+        expect(config.read().providers).toHaveProperty('default');
+        expect(config.read().providers).not.toHaveProperty('old');
+        expect(config.read().timezone).toBe('Asia/Tokyo');
+        expect(config.getActiveModel()).toMatchObject({
+            selection: { providerId: 'default', modelId: 'new-model' },
+            apiKey: 'new-key',
+        });
+        expect(logSuccessMock.mock.calls.some(call => String(call[0]).includes('旧配置已备份到'))).toBeTrue();
+    });
+
+    test('重置后的 onboarding 取消不会被当成启动失败', async () => {
+        const { onboarding, config } = createOnboarding();
+        config.addProvider({
+            providerId: 'old',
+            type: 'openai',
+            apiKey: 'old-key',
+            models: {
+                'old-model': { vision: false, contextWindow: 128000, maxOutputTokens: 8192 },
+            },
+        });
+        confirmValues.push(true);
+        autocompleteValues.push(CANCELLED);
+
+        await expect(onboarding.reset()).resolves.toBeUndefined();
+
+        expect(config.read().activeModel).toBeNull();
+        expect(config.read().providers).toEqual({});
+        expect(logMessageMock.mock.calls.some(call => String(call[0]).includes('下次启动时会继续 onboarding'))).toBeTrue();
     });
 });

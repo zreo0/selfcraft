@@ -41,6 +41,11 @@ export class Cli {
      * @returns 进程退出码
      */
     public async start (args: string[]): Promise<number> {
+        try {
+            this.dependencies.config.assertValid();
+        } catch {
+            throw new Error('现有配置无效。可运行 bun run start reset-config，先备份旧配置再重新配置');
+        }
         if (args[0] === 'setup' || !this.dependencies.config.isConfigured()) {
             if (!process.stdin.isTTY) {
                 throw new Error('首次配置需要交互式终端，请运行 bun run start setup');
