@@ -16,6 +16,7 @@ import { resetConfig, saveTimezone } from '@/services/runtime';
 import type { ConfigView } from '@/types/api.types';
 import { ModelList } from './ModelList';
 import { ProviderForm } from './ProviderForm';
+import { WebAccessForm } from './WebAccessForm';
 
 /** Selfcraft 的模型、时区与本地配置页面 */
 export function SettingsView ({
@@ -76,6 +77,7 @@ export function SettingsView ({
                         <nav aria-label="设置分区" className="settings-index">
                             <a href="#settings-model">当前模型</a>
                             <a href="#settings-provider">模型渠道</a>
+                            <a href="#settings-web">网络搜索</a>
                             <a href="#settings-timezone">本地时间</a>
                             <a href="#settings-reset">重新初始化</a>
                         </nav>
@@ -107,6 +109,14 @@ export function SettingsView ({
                         <ProviderForm onSaved={onChanged} />
                     </div>
 
+                    <div className="settings-section" id="settings-web">
+                        <div className="settings-section-title">
+                            <h2>网络搜索</h2>
+                            <p>用于查找近期与外部信息，并按需读取原始网页。首版使用 Tavily，底层实现可以替换。</p>
+                        </div>
+                        {config ? <WebAccessForm config={config} onChanged={onChanged} /> : <p className="text-sm text-muted-foreground">配置暂不可用</p>}
+                    </div>
+
                     <div className="settings-section" id="settings-timezone">
                         <div className="settings-section-title">
                             <h2>你的本地时间</h2>
@@ -125,7 +135,7 @@ export function SettingsView ({
                     <div className="settings-section settings-section--danger" id="settings-reset">
                         <div className="settings-section-title">
                             <h2>重新初始化配置</h2>
-                            <p>只重置模型与时区设置。身份、记忆、会话、技能、任务和工作区不会被删除。</p>
+                            <p>只重置模型、网络搜索与时区设置。身份、记忆、会话、技能、任务和工作区不会被删除。</p>
                         </div>
                         <Dialog onOpenChange={setResetOpen} open={resetOpen}>
                             <DialogTrigger asChild>
@@ -133,7 +143,7 @@ export function SettingsView ({
                             </DialogTrigger>
                             <DialogContent>
                                 <DialogHeader>
-                                    <DialogTitle>重新初始化模型配置？</DialogTitle>
+                                    <DialogTitle>重新初始化配置？</DialogTitle>
                                     <DialogDescription>非敏感配置会按时间备份，现有凭证将被清空。长期数据不会受到影响。</DialogDescription>
                                 </DialogHeader>
                                 <DialogFooter>

@@ -24,8 +24,47 @@ describe('ConfigStore', () => {
         const store = new ConfigStore(createTemporaryDirectory());
 
         expect(store.read().activeModel).toBeNull();
+        expect(store.read().webAccess).toBeNull();
         expect(store.read().timezone).toBeTruthy();
         expect(store.isConfigured()).toBeFalse();
+    });
+
+    test('分离保存 Tavily 配置与凭证并支持关闭', () => {
+        const directory = createTemporaryDirectory();
+        const store = new ConfigStore(directory);
+
+        store.configureWebAccess('tvly-test-secret');
+
+        expect(store.read().webAccess).toEqual({
+            provider: 'tavily',
+            credentialRef: 'web:tavily',
+        });
+        expect(store.getWebAccess()).toEqual({
+            provider: 'tavily',
+            apiKey: 'tvly-test-secret',
+        });
+        expect(store.isWebAccessConfigured()).toBeTrue();
+        expect(fs.readFileSync(path.join(directory, 'config.json'), 'utf8')).not.toContain('tvly-test-secret');
+
+        store.disableWebAccess();
+
+        expect(store.read().webAccess).toBeNull();
+        expect(store.isWebAccessConfigured()).toBeFalse();
+        expect(fs.readFileSync(path.join(directory, 'secrets.json'), 'utf8')).not.toContain('tvly-test-secret');
+    });
+
+    test('读取尚无 webAccess 字段的 v1 配置时使用关闭状态', () => {
+        const directory = createTemporaryDirectory();
+        const store = new ConfigStore(directory);
+        fs.writeFileSync(path.join(directory, 'config.json'), JSON.stringify({
+            version: 1,
+            activeModel: null,
+            providers: {},
+            maxSteps: 32,
+            timezone: 'Asia/Shanghai',
+        }));
+
+        expect(store.read().webAccess).toBeNull();
     });
 
     test('分离保存渠道配置与凭证并支持模型切换', () => {

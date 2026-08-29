@@ -31,6 +31,14 @@ export interface ActiveModelConfig {
     modelId: string;
 }
 
+/** 可替换的外部网络访问配置 */
+export interface WebAccessConfig {
+    /** 当前搜索服务实现 */
+    provider: 'tavily';
+    /** secrets.json 中的凭证键 */
+    credentialRef: string;
+}
+
 /** 持久配置文件结构 */
 export interface SelfcraftConfig {
     /** 配置格式版本 */
@@ -39,6 +47,8 @@ export interface SelfcraftConfig {
     activeModel: ActiveModelConfig | null;
     /** 已配置的模型渠道 */
     providers: Record<string, ProviderConfig>;
+    /** 可选的外部搜索与网页读取能力 */
+    webAccess: WebAccessConfig | null;
     /** Agent 单轮最多执行的步骤数 */
     maxSteps: number;
     /** 解释用户本地时间使用的 IANA 时区 */

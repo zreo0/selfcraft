@@ -101,6 +101,7 @@ describe('WebServer', () => {
                 assistant: { vision: false, contextWindow: 128000, maxOutputTokens: 4096 },
             },
         });
+        config.configureWebAccess('tvly-not-a-real-credential');
         memory.recordEvent({
             actor: 'user',
             type: 'user_message',
@@ -119,9 +120,30 @@ describe('WebServer', () => {
         expect(response.status).toBe(200);
         expect(body.config.configured).toBeTrue();
         expect(body.config.providers[0].credentialConfigured).toBeTrue();
+        expect(body.config.webAccess).toEqual({ provider: 'tavily', configured: true });
         expect(body.messages.items.map((item: any) => item.parts[0].text)).toEqual(['前台消息']);
         expect(serialized).not.toContain('not-a-real-credential');
+        expect(serialized).not.toContain('tvly-not-a-real-credential');
         expect(serialized).not.toContain('credentialRef');
+    });
+
+    test('可通过同源 API 启用和关闭网络搜索且不返回凭证', async () => {
+        const { server } = createServer();
+
+        const enabled = await server.fetch(jsonRequest('/api/config/web', 'POST', {
+            apiKey: 'tvly-web-secret',
+        }));
+        const enabledBody = await enabled.json() as any;
+
+        expect(enabled.status).toBe(200);
+        expect(enabledBody.webAccess).toEqual({ provider: 'tavily', configured: true });
+        expect(JSON.stringify(enabledBody)).not.toContain('tvly-web-secret');
+
+        const disabled = await server.fetch(jsonRequest('/api/config/web', 'DELETE', {}));
+        const disabledBody = await disabled.json() as any;
+
+        expect(disabled.status).toBe(200);
+        expect(disabledBody.webAccess).toBeNull();
     });
 
     test('全新实例可只通过 Web 完成初始化并使用 AI SDK 协议流式对话', async () => {
@@ -230,6 +252,11 @@ describe('WebServer', () => {
                 'assistant',
                 'vision',
             ]);
+            expect((await client.configureWebAccess('tvly-cli-secret')).webAccess).toEqual({
+                provider: 'tavily',
+                configured: true,
+            });
+            expect((await client.disableWebAccess()).webAccess).toBeNull();
 
             const deltas: string[] = [];
             const statuses: string[] = [];

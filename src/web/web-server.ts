@@ -62,6 +62,10 @@ const timezoneRequestSchema = z.object({
     timezone: z.string().min(1).max(100),
 });
 
+const webAccessRequestSchema = z.object({
+    apiKey: z.string().trim().min(1).max(8192).refine(value => !/[\r\n]/.test(value), 'API key 必须是单行文本'),
+});
+
 interface WebMessageMetadata {
     /** 时间线序号，用于稳定排序 */
     seq: number;
@@ -225,6 +229,18 @@ export class WebServer {
             this.dependencies.config.setTimezone(input.timezone);
             return jsonResponse(this.buildConfigView());
         }
+        if (request.method === 'POST' && url.pathname === '/api/config/web') {
+            this.assertMutationRequest(request);
+            const input = webAccessRequestSchema.parse(await request.json());
+            this.dependencies.config.configureWebAccess(input.apiKey);
+            return jsonResponse(this.buildConfigView());
+        }
+        if (request.method === 'DELETE' && url.pathname === '/api/config/web') {
+            this.assertMutationRequest(request);
+            await request.json();
+            this.dependencies.config.disableWebAccess();
+            return jsonResponse(this.buildConfigView());
+        }
         if (request.method === 'POST' && url.pathname === '/api/config/reset') {
             this.assertMutationRequest(request);
             const backupDirectory = this.dependencies.config.backupAndReset();
@@ -343,6 +359,10 @@ export class WebServer {
             configured: this.dependencies.config.isConfigured(),
             timezone: config.timezone,
             activeModel: config.activeModel,
+            webAccess: config.webAccess ? {
+                provider: config.webAccess.provider,
+                configured: this.dependencies.config.isWebAccessConfigured(),
+            } : null,
             providers: Object.entries(config.providers).map(([id, provider]) => ({
                 id,
                 type: provider.type,
@@ -481,6 +501,11 @@ interface WebConfigView {
     timezone: string;
     /** 当前活动模型 */
     activeModel: SelfcraftConfig['activeModel'];
+    /** 脱敏后的网络访问配置 */
+    webAccess: {
+        provider: 'tavily';
+        configured: boolean;
+    } | null;
     /** 脱敏后的渠道与模型 */
     providers: Array<{
         id: string;

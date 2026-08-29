@@ -56,7 +56,25 @@ export function saveTimezone (timezone: string): Promise<ConfigView> {
     });
 }
 
-/** 备份并重置模型与时区配置 */
+/** 保存 Tavily 凭证并启用网络访问 */
+export function saveWebAccess (apiKey: string): Promise<ConfigView> {
+    return requestJson<ConfigView>('/api/config/web', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey }),
+    });
+}
+
+/** 关闭网络访问并删除 Tavily 凭证 */
+export function disableWebAccess (): Promise<ConfigView> {
+    return requestJson<ConfigView>('/api/config/web', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+    });
+}
+
+/** 备份并重置模型、网络访问与时区配置 */
 export function resetConfig (): Promise<{ backupDirectory?: string; config: ConfigView }> {
     return requestJson('/api/config/reset', {
         method: 'POST',

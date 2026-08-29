@@ -3,6 +3,7 @@ import { OnboardingCancelledError, type Onboarding } from '../onboarding/onboard
 import type { RuntimeClient } from './runtime-client';
 
 const MODEL_SETUP_RESULT = -2;
+const WEB_SETUP_RESULT = -3;
 
 /** 通过 HTTP 访问唯一 Runtime 的终端客户端 */
 export class Cli {
@@ -77,6 +78,19 @@ export class Cli {
                     }
                     continue;
                 }
+                if (commandResult === WEB_SETUP_RESULT) {
+                    terminal.close();
+                    try {
+                        await this.dependencies.onboarding.configureWebSearch();
+                    } catch (error) {
+                        if (!(error instanceof OnboardingCancelledError)) {
+                            console.error(`命令失败：${error instanceof Error ? error.message : String(error)}`);
+                        }
+                    } finally {
+                        terminal = createInterface({ input: process.stdin, output: process.stdout });
+                    }
+                    continue;
+                }
                 if (commandResult !== null) {
                     if (commandResult >= 0) {
                         return commandResult;
@@ -137,6 +151,9 @@ export class Cli {
         }
         if (command === '/model') {
             return await this.handleModelCommand(args) ? MODEL_SETUP_RESULT : -1;
+        }
+        if (command === '/web') {
+            return await this.handleWebCommand(args);
         }
         if (command === '/skills') {
             const skills = await this.dependencies.client.listSkills();
@@ -234,6 +251,7 @@ export class Cli {
             '/model list                  查看模型',
             '/model add                   新增渠道与模型',
             '/model use <provider/model>  切换模型',
+            '/web status|setup|disable    查看、配置或关闭网络搜索',
             '/skills                      查看技能',
             '/jobs [id]                   查看后台任务或任务日志',
             '/job cancel|resume <id>      取消或恢复后台任务',
@@ -310,5 +328,31 @@ export class Cli {
         );
         console.table(rows);
         return false;
+    }
+
+    /**
+     * 处理网络搜索状态、配置与关闭
+     *
+     * @param args 网络搜索命令参数
+     * @returns 是否进入独立交互流程
+     */
+    private async handleWebCommand (args: string[]): Promise<number> {
+        const action = args[0] || 'status';
+        if (action === 'setup') {
+            return WEB_SETUP_RESULT;
+        }
+        if (action === 'disable') {
+            await this.dependencies.client.disableWebAccess();
+            console.log('网络搜索已关闭，凭证已删除');
+            return -1;
+        }
+        if (action !== 'status') {
+            throw new Error('用法: /web status|setup|disable');
+        }
+        const bootstrap = await this.dependencies.client.bootstrap();
+        console.log(bootstrap.config?.webAccess?.configured
+            ? `网络搜索已启用（${bootstrap.config.webAccess.provider}）`
+            : '网络搜索尚未配置');
+        return -1;
     }
 }

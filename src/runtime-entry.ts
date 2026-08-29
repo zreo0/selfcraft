@@ -20,6 +20,7 @@ import { createTools } from './tools';
 import { PathGuard } from './tools/path-guard';
 import { WorkspaceService } from './workspace/workspace-service';
 import { WebServer } from './web/web-server';
+import { TavilyWebProvider } from './web-access/tavily-web-provider';
 
 const RESTART_EXIT_CODE = 75;
 
@@ -46,6 +47,7 @@ async function main (): Promise<void> {
     );
     const releases = new ReleaseStore(paths.supervisor, paths.evolution);
     const evolution = new EvolutionService(paths, releases, logger);
+    const webProvider = new TavilyWebProvider(() => config.getWebAccess().apiKey);
     const tools = createTools(
         paths.workspace,
         skills,
@@ -54,6 +56,7 @@ async function main (): Promise<void> {
         jobs,
         memory,
         scheduledTasks,
+        webProvider,
     );
     const agent = new AgentRuntime(
         config,

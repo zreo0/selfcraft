@@ -34,6 +34,11 @@ export interface ConfigView {
     timezone: string;
     /** 当前活动模型 */
     activeModel: { providerId: string; modelId: string } | null;
+    /** 可选网络搜索配置 */
+    webAccess: {
+        provider: 'tavily';
+        configured: boolean;
+    } | null;
     /** 已配置渠道 */
     providers: ProviderView[];
 }

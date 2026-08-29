@@ -8,6 +8,7 @@ import { PathGuard } from './path-guard';
 import { createShellTool } from './shell-tool';
 import { createSkillTools } from './skill-tools';
 import { createScheduledTaskTools } from './scheduled-task-tools';
+import { createWebTools } from './web-tools';
 import { wrapToolsWithResultOffload } from '../context/result-store';
 import type { EvolutionService } from '../evolution/evolution-service';
 import type { JobManager } from '../job/job-manager';
@@ -15,6 +16,7 @@ import type { MemoryStore } from '../memory/memory-store';
 import type { NotificationInbox } from '../notification/notification-inbox';
 import type { SkillRegistry } from '../skills/skill-registry';
 import type { ScheduledTaskManager } from '../task/scheduled-task-manager';
+import type { WebProvider } from '../web-access/web-provider';
 
 /** Runtime 注入每次工具执行的可信上下文 */
 export type ToolRuntimeContext = {
@@ -42,6 +44,7 @@ export type ToolRuntimeContext = {
  * @param jobs 持久后台任务
  * @param memory 结构化长期记忆
  * @param scheduledTasks 一次性定时提醒，可选以便独立脚本复用基础工具
+ * @param webProvider 可替换的外部搜索与网页读取实现
  * @returns AI SDK 工具集合
  */
 export function createTools (
@@ -52,6 +55,7 @@ export function createTools (
     jobs: JobManager,
     memory: MemoryStore,
     scheduledTasks?: ScheduledTaskManager,
+    webProvider?: WebProvider,
 ) {
     const guard = new PathGuard(workspacePath);
     const tools = {
@@ -61,6 +65,7 @@ export function createTools (
         ...createJobTools(jobs),
         ...createMemoryTools(memory),
         ...(scheduledTasks ? createScheduledTaskTools(scheduledTasks) : {}),
+        ...(webProvider ? createWebTools(webProvider) : {}),
         notify: createNotifyTool(notifications),
         ...createEvolutionTools(evolution),
     };

@@ -926,7 +926,6 @@ button {
 }
 
 .settings-section-title p {
-    max-width: 65ch;
     margin-top: 0.42rem;
     color: var(--muted-foreground);
     font-size: 0.82rem;

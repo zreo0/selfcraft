@@ -32,6 +32,11 @@ export interface RuntimeConfigView {
     activeModel: ActiveModelConfig | null;
     /** 已配置渠道 */
     providers: RuntimeProviderView[];
+    /** 外部网络访问状态 */
+    webAccess: {
+        provider: 'tavily';
+        configured: boolean;
+    } | null;
 }
 
 /** CLI 初始化所需的 Runtime 状态 */
@@ -97,6 +102,22 @@ export class RuntimeClient {
         return await this.request<RuntimeConfigView>('/api/config/timezone', {
             method: 'PUT',
             body: JSON.stringify({ timezone }),
+        });
+    }
+
+    /** 保存 Tavily 凭证并启用网络访问 */
+    public async configureWebAccess (apiKey: string): Promise<RuntimeConfigView> {
+        return await this.request<RuntimeConfigView>('/api/config/web', {
+            method: 'POST',
+            body: JSON.stringify({ apiKey }),
+        });
+    }
+
+    /** 关闭网络访问并移除 Tavily 凭证 */
+    public async disableWebAccess (): Promise<RuntimeConfigView> {
+        return await this.request<RuntimeConfigView>('/api/config/web', {
+            method: 'DELETE',
+            body: '{}',
         });
     }
 

@@ -99,7 +99,7 @@ function createOnboarding (): {
     const root = createTemporaryDirectory();
     const paths = resolvePaths('production', root);
     const config = new ConfigStore(paths.config);
-    const client: Pick<RuntimeClient, 'bootstrap' | 'addProvider' | 'setTimezone' | 'resetConfig'> = {
+    const client: Pick<RuntimeClient, 'bootstrap' | 'addProvider' | 'setTimezone' | 'resetConfig' | 'configureWebAccess'> = {
         async bootstrap () {
             return {
                 product: 'Selfcraft',
@@ -122,6 +122,10 @@ function createOnboarding (): {
             config.setTimezone(timezone);
             return buildConfigView(config);
         },
+        async configureWebAccess (apiKey) {
+            config.configureWebAccess(apiKey);
+            return buildConfigView(config);
+        },
         async resetConfig () {
             return {
                 backupDirectory: config.backupAndReset(),
@@ -142,6 +146,10 @@ function buildConfigView (config: ConfigStore): RuntimeConfigView {
         configured: config.isConfigured(),
         timezone: value.timezone,
         activeModel: value.activeModel,
+        webAccess: value.webAccess ? {
+            provider: value.webAccess.provider,
+            configured: config.isWebAccessConfigured(),
+        } : null,
         providers: Object.entries(value.providers).map(([id, provider]) => ({
             id,
             type: provider.type,
@@ -237,6 +245,20 @@ describe('Onboarding', () => {
             maxOutputTokens: 8192,
         });
         expect(outroMock).toHaveBeenCalledTimes(1);
+    });
+
+    test('可独立配置网络搜索且不回显凭证', async () => {
+        const { onboarding, config } = createOnboarding();
+        passwordValues.push('', 'tvly-test-key');
+
+        await onboarding.configureWebSearch();
+
+        expect(config.getWebAccess()).toEqual({
+            provider: 'tavily',
+            apiKey: 'tvly-test-key',
+        });
+        expect(validationErrors).toContain('请输入单行非空 API key');
+        expect(logSuccessMock).toHaveBeenCalledWith('网络搜索已经可用');
     });
 
     test('取消时不写入半份配置', async () => {

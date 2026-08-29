@@ -52,6 +52,7 @@ Selfcraft 当前是一个基于 Bun、TypeScript 和 Vercel AI SDK v7 的实验�
 - **Remember** — 保存完整事件时间线，按时间、事项与证据重新想起经历
 - **Reflect** — 在对话后异步整理事实、失败和成长候选
 - **Work** — 使用 workspace 工具，运行后台 Job，并持久化一次性定时提醒
+- **Research** — 搜索外部与近期信息，沿原始网页核验重要结论
 - **Learn** — 通过可发现、可修改的 `SKILL.md` 扩展能力
 - **Evolve** — 在隔离环境验证候选源码，通过后再更新 Runtime
 - **Recover** — 由独立 Supervisor 观察新版本，并在失败时自动回滚
@@ -96,7 +97,9 @@ Web 会在页面内提供对话式引导，优先采用浏览器检测到的时�
 
 如果不设置名字，它就保持未命名。Selfcraft 不会根据项目名替自己决定身份。
 
-API key 只写入权限为 `0600` 的 `config/secrets.json`，不会进入普通配置和日志。
+模型与网络服务的 API key 只写入权限为 `0600` 的 `config/secrets.json`，不会进入普通配置和日志。
+
+网络搜索是可选基础能力。设置页可以配置 Tavily；CLI 使用 `/web setup`。保存后同一个 Runtime 的下一轮对话立即获得 `web_search` 与 `web_fetch`，无需重启。搜索结果只是外部证据，不会自动写入长期记忆。
 
 需要从一份新配置重新开始时，可以运行：
 
@@ -120,7 +123,7 @@ Runtime（可演化）
   ├─ 长期会话与上下文
   ├─ 后台 Job、定时 Task 与通知
   ├─ 事件时间线、结构化记忆与 Reflection
-  ├─ workspace 工具与技能
+  ├─ workspace、网络访问工具与技能
   └─ 候选版本提案与验证
 
 通信入口
@@ -235,6 +238,7 @@ Job 默认最多并发执行两个：
 
 ```text
 /model list|add|use
+/web status|setup|disable
 /skills
 /jobs [id]
 /job cancel|resume <id>
@@ -249,6 +253,8 @@ Job 默认最多并发执行两个：
 ```
 
 模型切换从下一次 Agent run 生效。CLI 是独立进程中的 HTTP 客户端，Web 是由 Runtime 提供的静态客户端；两者都不持有 Agent Loop。它们共用同一个前台执行队列、长期会话、Event 时间线和记忆，多个入口同时提交时会按顺序执行，不会产生两个“大脑”。入口只发送本轮新输入，历史上下文始终由 Runtime 组装。
+
+网络访问首版使用 Tavily 的 Search 与 Extract API，并通过内部统一结果与 Agent 工具隔离具体服务。搜索默认采用基础深度、最多返回五条候选；重要事实再读取原文。未来替换服务实现不需要改变 Agent 的工具名、技能规则或记忆边界。
 
 ## 数据与上下文
 

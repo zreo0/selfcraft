@@ -20,6 +20,7 @@ import { ScheduledTaskManager } from '../../task/scheduled-task-manager';
 import { createTools } from '../../tools';
 import { PathGuard } from '../../tools/path-guard';
 import { WorkspaceService } from '../../workspace/workspace-service';
+import { createWebTools } from '../../tools/web-tools';
 
 const temporaryDirectories: string[] = [];
 
@@ -248,5 +249,70 @@ describe('AgentRuntime', () => {
             outcome: 'failed',
             error: 'model unavailable',
         });
+    });
+
+    test('网络工具随配置在同一个 Runtime 中按轮次显隐', async () => {
+        const root = createTemporaryDirectory();
+        const paths = resolvePaths('development', path.join(root, 'home'));
+        paths.project = path.resolve(import.meta.dir, '../../..');
+        const workspace = new WorkspaceService(paths.workspace, path.join(paths.project, 'workspace-template'));
+        workspace.initialize();
+        const config = new ConfigStore(paths.config);
+        const logger = new Logger(paths.logs);
+        const memory = new MemoryStore(paths.state);
+        const model = new MockLanguageModelV4({
+            doStream: async () => ({
+                stream: simulateReadableStream({
+                    chunks: [
+                        { type: 'text-start', id: 'text' },
+                        { type: 'text-delta', id: 'text', delta: '好' },
+                        { type: 'text-end', id: 'text' },
+                        {
+                            type: 'finish',
+                            finishReason: { unified: 'stop', raw: undefined },
+                            usage: usage(),
+                        },
+                    ] as any,
+                }),
+            }),
+        });
+        const agent = new AgentRuntime(
+            config,
+            workspace,
+            new SkillRegistry(path.join(paths.workspace, 'skills')),
+            new SessionStore(paths.sessions),
+            new ContextManager(),
+            new EvolutionService(paths, new ReleaseStore(paths.supervisor, paths.evolution), logger),
+            memory,
+            { enqueue: () => 'reflection-web-tools' },
+            createWebTools({
+                async search () {
+                    throw new Error('本测试不会执行工具');
+                },
+                async fetchPage () {
+                    throw new Error('本测试不会执行工具');
+                },
+            }) as never,
+            logger,
+            () => ({
+                model,
+                providerId: 'mock',
+                modelId: 'mock-v4',
+                contextWindow: 128000,
+                maxOutputTokens: 4096,
+            }),
+        );
+
+        await agent.run('第一次', () => undefined);
+        config.configureWebAccess('tvly-test-key');
+        await agent.run('第二次', () => undefined);
+
+        const toolNames = model.doStreamCalls.map(call => call.tools?.map(item => item.name) || []);
+        expect(toolNames[0]).not.toContain('web_search');
+        expect(toolNames[0]).not.toContain('web_fetch');
+        expect(toolNames[1]).toContain('web_search');
+        expect(toolNames[1]).toContain('web_fetch');
+        expect(JSON.stringify(model.doStreamCalls[0].prompt)).toContain('当前没有配置网络访问');
+        expect(JSON.stringify(model.doStreamCalls[1].prompt)).toContain('不得只根据搜索摘要作答');
     });
 });

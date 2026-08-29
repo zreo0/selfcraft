@@ -23,6 +23,11 @@ const providerSchema = z.object({
     models: z.record(z.string(), modelSchema),
 });
 
+const webAccessSchema = z.object({
+    provider: z.literal('tavily'),
+    credentialRef: z.string().min(1),
+});
+
 const configSchema = z.object({
     version: z.literal(1),
     activeModel: z.object({
@@ -30,6 +35,7 @@ const configSchema = z.object({
         modelId: z.string().min(1),
     }).nullable(),
     providers: z.record(z.string(), providerSchema),
+    webAccess: webAccessSchema.nullable().default(null),
     maxSteps: z.number().int().min(1).max(100),
     timezone: z.string().min(1).max(100).refine(isValidTimezone, '时区必须是有效的 IANA 名称'),
 });
@@ -93,6 +99,9 @@ export class ConfigStore {
     public assertValid (): void {
         const config = this.read();
         const credentials = this.readSecrets();
+        if (config.webAccess && !credentials[config.webAccess.credentialRef]) {
+            throw new Error('网络访问配置不完整');
+        }
         if (!config.activeModel) {
             return;
         }
@@ -104,7 +113,7 @@ export class ConfigStore {
     }
 
     /**
-     * 按时间备份非敏感配置，并重置模型与凭证设置
+     * 按时间备份非敏感配置，并重置模型、网络访问与凭证设置
      *
      * @returns 旧配置的备份目录；没有旧配置时返回 undefined
      */
@@ -211,6 +220,79 @@ export class ConfigStore {
         const config = this.read();
         config.timezone = normalized;
         this.write(config);
+    }
+
+    /**
+     * 保存 Tavily 网络访问凭证
+     *
+     * @param apiKey Tavily API key
+     * @returns 更新后的非敏感配置
+     */
+    public configureWebAccess (apiKey: string): SelfcraftConfig {
+        const normalized = apiKey.trim();
+        if (!normalized || /[\r\n]/.test(normalized)) {
+            throw new Error('Tavily API key 必须是单行非空文本');
+        }
+        const config = this.read();
+        const credentialRef = 'web:tavily';
+        config.webAccess = {
+            provider: 'tavily',
+            credentialRef,
+        };
+        this.writeSecrets({
+            ...this.readSecrets(),
+            [credentialRef]: normalized,
+        });
+        this.write(config);
+        return config;
+    }
+
+    /**
+     * 关闭网络访问并移除对应凭证
+     *
+     * @returns 更新后的非敏感配置
+     */
+    public disableWebAccess (): SelfcraftConfig {
+        const config = this.read();
+        const credentialRef = config.webAccess?.credentialRef;
+        config.webAccess = null;
+        if (credentialRef) {
+            const credentials = this.readSecrets();
+            delete credentials[credentialRef];
+            this.writeSecrets(credentials);
+        }
+        this.write(config);
+        return config;
+    }
+
+    /** 返回网络访问是否已有可用凭证 */
+    public isWebAccessConfigured (): boolean {
+        try {
+            this.getWebAccess();
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * 返回当前网络访问实现与凭证
+     *
+     * @returns 可用于发起请求的配置
+     */
+    public getWebAccess (): { provider: 'tavily'; apiKey: string } {
+        const config = this.read();
+        if (!config.webAccess) {
+            throw new Error('尚未配置网络访问');
+        }
+        const apiKey = this.readSecrets()[config.webAccess.credentialRef];
+        if (!apiKey) {
+            throw new Error('网络访问配置不完整');
+        }
+        return {
+            provider: config.webAccess.provider,
+            apiKey,
+        };
     }
 
     /**
@@ -332,6 +414,7 @@ function createDefaultConfig (): SelfcraftConfig {
         version: 1,
         activeModel: null,
         providers: {},
+        webAccess: null,
         maxSteps: 32,
         timezone: resolveSystemTimezone(),
     };

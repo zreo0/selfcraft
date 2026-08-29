@@ -37,7 +37,7 @@ export class Onboarding {
      */
     constructor (private readonly client: Pick<
         RuntimeClient,
-        'bootstrap' | 'addProvider' | 'setTimezone' | 'resetConfig'
+        'bootstrap' | 'addProvider' | 'setTimezone' | 'resetConfig' | 'configureWebAccess'
     >) {}
 
     /** 完成首次环境与模型配置 */
@@ -173,6 +173,24 @@ export class Onboarding {
         if (!firstRun) {
             outro('模型已经记下了。需要时可用 /model use 切换。');
         }
+    }
+
+    /** 交互式保存 Tavily 凭证并启用网络访问 */
+    public async configureWebSearch (): Promise<void> {
+        intro(' Selfcraft · 网络搜索 ');
+        log.message('网络访问是可选能力。凭证只保存在本地，搜索结果不会自动进入长期记忆。');
+        const apiKey = this.unwrap(await password({
+            message: 'Tavily API key',
+            clearOnError: true,
+            validate: value => {
+                if (!value?.trim() || /[\r\n]/.test(value)) {
+                    return '请输入单行非空 API key';
+                }
+            },
+        }));
+        await this.client.configureWebAccess(apiKey);
+        log.success('网络搜索已经可用');
+        outro('下次对话会立即看到 web_search 与 web_fetch。');
     }
 
     /**
