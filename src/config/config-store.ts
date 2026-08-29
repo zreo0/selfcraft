@@ -168,10 +168,14 @@ export class ConfigStore {
             credentialRef,
             models: structuredClone(input.models),
         };
-        config.activeModel ||= {
-            providerId: input.providerId,
-            modelId: modelEntries[0][0],
-        };
+        const activeModelStillExists = config.activeModel
+            && config.providers[config.activeModel.providerId]?.models[config.activeModel.modelId];
+        if (!activeModelStillExists) {
+            config.activeModel = {
+                providerId: input.providerId,
+                modelId: modelEntries[0][0],
+            };
+        }
         this.writeSecrets({
             ...this.readSecrets(),
             [credentialRef]: apiKey,
@@ -207,6 +211,20 @@ export class ConfigStore {
         const config = this.read();
         config.timezone = normalized;
         this.write(config);
+    }
+
+    /**
+     * 判断指定渠道是否保存了可用凭证
+     *
+     * @param providerId 渠道标识
+     * @returns 是否存在非空凭证
+     */
+    public hasCredential (providerId: string): boolean {
+        const provider = this.read().providers[providerId];
+        if (!provider) {
+            return false;
+        }
+        return Boolean(this.readSecrets()[provider.credentialRef]);
     }
 
     /**

@@ -23,6 +23,39 @@ afterEach(() => {
 });
 
 describe('Supervisor', () => {
+    test('停止 Supervisor 时把信号转发给唯一 Runtime', async () => {
+        const root = createTemporaryDirectory();
+        const project = path.join(root, 'project');
+        const home = path.join(root, 'home');
+        const runtimePath = path.join(project, 'src', 'runtime-entry.ts');
+        fs.mkdirSync(path.dirname(runtimePath), { recursive: true });
+        fs.writeFileSync(path.join(project, 'package.json'), '{"type":"module"}');
+        fs.writeFileSync(runtimePath, [
+            "import * as fs from 'node:fs';",
+            "import * as path from 'node:path';",
+            "const started = path.join(process.env.SELFCRAFT_HOME!, 'runtime-started');",
+            "const stopped = path.join(process.env.SELFCRAFT_HOME!, 'runtime-stopped');",
+            'fs.mkdirSync(process.env.SELFCRAFT_HOME!, { recursive: true });',
+            "fs.writeFileSync(started, 'started');",
+            "process.once('SIGTERM', () => {",
+            "    fs.writeFileSync(stopped, 'stopped');",
+            '    process.exit(0);',
+            '});',
+            'setInterval(() => undefined, 1000);',
+            '',
+        ].join('\n'));
+
+        const paths = resolvePaths('development', home);
+        paths.project = project;
+        const supervisor = new Supervisor(paths, new Logger(paths.logs));
+        const result = supervisor.run();
+        await waitForFile(path.join(home, 'runtime-started'));
+        supervisor.stop('SIGTERM');
+
+        expect(await result).toBe(0);
+        expect(fs.readFileSync(path.join(home, 'runtime-stopped'), 'utf8')).toBe('stopped');
+    });
+
     test('新 Runtime 在观察期崩溃时回滚并启动旧版本', async () => {
         const root = createTemporaryDirectory();
         const project = path.join(root, 'project');
@@ -92,3 +125,14 @@ describe('Supervisor', () => {
         expect(releases.read()?.status).toBe('stable');
     });
 });
+
+/** 等待子进程创建验收标记 */
+async function waitForFile (filePath: string, timeoutMs = 3000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!fs.existsSync(filePath) && Date.now() < deadline) {
+        await Bun.sleep(10);
+    }
+    if (!fs.existsSync(filePath)) {
+        throw new Error(`等待文件超时: ${filePath}`);
+    }
+}

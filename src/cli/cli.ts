@@ -1,55 +1,41 @@
-import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
-import type { AgentRuntime } from '../agent/agent-runtime';
-import type { ConfigStore } from '../config/config-store';
-import type { SelfcraftPaths } from '../config/paths';
-import type { HealthChecker } from '../health/health-checker';
-import type { JobManager } from '../job/job-manager';
-import type { MemoryStore } from '../memory/memory-store';
-import type { NotificationInbox } from '../notification/notification-inbox';
 import { OnboardingCancelledError, type Onboarding } from '../onboarding/onboarding';
-import type { SkillRegistry } from '../skills/skill-registry';
-import type { ScheduledTaskManager } from '../task/scheduled-task-manager';
+import type { RuntimeClient } from './runtime-client';
 
-const RESTART_EXIT_CODE = 75;
 const MODEL_SETUP_RESULT = -2;
 
-/** 当前版本的 CLI 通信入口 */
+/** 通过 HTTP 访问唯一 Runtime 的终端客户端 */
 export class Cli {
     /**
-     * 创建 CLI
+     * 创建 CLI 客户端
      *
-     * @param dependencies Runtime 命令依赖
+     * @param dependencies Runtime 客户端与终端 onboarding
      */
     constructor (private readonly dependencies: {
-        paths: SelfcraftPaths;
-        config: ConfigStore;
+        client: RuntimeClient;
         onboarding: Onboarding;
-        agent: AgentRuntime;
-        skills: SkillRegistry;
-        notifications: NotificationInbox;
-        jobs: JobManager;
-        scheduledTasks: ScheduledTaskManager;
-        memory: MemoryStore;
-        health: HealthChecker;
     }) {}
 
     /**
      * 启动交互循环
      *
-     * @param args Runtime CLI 参数
+     * @param args CLI 子命令
      * @returns 进程退出码
      */
     public async start (args: string[]): Promise<number> {
-        try {
-            this.dependencies.config.assertValid();
-        } catch {
-            throw new Error('现有配置无效。可运行 bun run start reset-config，先备份旧配置再重新配置');
+        if (!process.stdin.isTTY) {
+            throw new Error('CLI 需要交互式终端；服务本身请运行 bun run start');
         }
-        if (args[0] === 'setup' || !this.dependencies.config.isConfigured()) {
-            if (!process.stdin.isTTY) {
-                throw new Error('首次配置需要交互式终端，请运行 bun run start setup');
-            }
+        if (args[0] === 'reset-config') {
+            await this.dependencies.onboarding.reset();
+            return 0;
+        }
+
+        const bootstrap = await this.dependencies.client.bootstrap();
+        if (!bootstrap.config) {
+            throw new Error(`现有配置无效：${bootstrap.configurationError || '未知错误'}。请运行 bun run cli reset-config`);
+        }
+        if (args[0] === 'setup' || !bootstrap.config.configured) {
             try {
                 await this.dependencies.onboarding.run();
             } catch (error) {
@@ -65,7 +51,7 @@ export class Cli {
 
         let terminal = createInterface({ input: process.stdin, output: process.stdout });
         try {
-            console.log('Selfcraft 已就绪。输入 /help 查看命令。');
+            console.log('Selfcraft CLI 已连接。输入 /help 查看命令。');
             while (true) {
                 const input = (await terminal.question('selfcraft> ')).trim();
                 if (!input) {
@@ -97,36 +83,37 @@ export class Cli {
                     }
                     continue;
                 }
-                let wroteText = false;
-                let lineOpen = false;
-                try {
-                    const result = await this.dependencies.agent.run(input, text => {
-                        wroteText = true;
-                        process.stdout.write(text);
-                        lineOpen = !text.endsWith('\n');
-                    }, status => {
-                        if (lineOpen) {
-                            process.stdout.write('\n');
-                        }
-                        console.log(`→ ${status}`);
-                        lineOpen = false;
-                    });
-                    if (wroteText && lineOpen) {
-                        process.stdout.write('\n');
-                    }
-                    if (result.restartRequired) {
-                        console.log('新版本已通过候选验证，Runtime 将重启并接受 Supervisor 健康观察。');
-                        return RESTART_EXIT_CODE;
-                    }
-                } catch (error) {
-                    if (wroteText && lineOpen) {
-                        process.stdout.write('\n');
-                    }
-                    console.error(`执行失败：${error instanceof Error ? error.message : String(error)}`);
-                }
+                await this.runConversation(input);
             }
         } finally {
             terminal.close();
+        }
+    }
+
+    /** 把一轮 Runtime 流式响应写到终端 */
+    private async runConversation (input: string): Promise<void> {
+        let wroteText = false;
+        let lineOpen = false;
+        try {
+            await this.dependencies.client.chat(input, text => {
+                wroteText = true;
+                process.stdout.write(text);
+                lineOpen = !text.endsWith('\n');
+            }, status => {
+                if (lineOpen) {
+                    process.stdout.write('\n');
+                }
+                console.log(`→ ${status}`);
+                lineOpen = false;
+            });
+            if (wroteText && lineOpen) {
+                process.stdout.write('\n');
+            }
+        } catch (error) {
+            if (wroteText && lineOpen) {
+                process.stdout.write('\n');
+            }
+            console.error(`执行失败：${error instanceof Error ? error.message : String(error)}`);
         }
     }
 
@@ -145,51 +132,21 @@ export class Cli {
             return 0;
         }
         if (command === '/help') {
-            console.log([
-                '/model list                  查看模型',
-                '/model add                   新增渠道与模型',
-                '/model use <provider/model>  切换模型',
-                '/skills                      查看技能',
-                '/jobs [id]                   查看后台任务或任务日志',
-                '/job cancel|resume <id>      取消或恢复后台任务',
-                '/tasks                       查看一次性定时提醒',
-                '/task cancel <id>            取消尚未触发的提醒',
-                '/topics [query]              查看持续事项',
-                '/memory [query]              查看或检索长期记忆',
-                '/growth                      查看 Reflection 成长候选',
-                '/notifications               查看并清空通知',
-                '/status                       查看路径与健康状态',
-                '/exit                         退出',
-            ].join('\n'));
+            this.printHelp();
             return -1;
         }
         if (command === '/model') {
             return await this.handleModelCommand(args) ? MODEL_SETUP_RESULT : -1;
         }
         if (command === '/skills') {
-            const skills = this.dependencies.skills.discover();
+            const skills = await this.dependencies.client.listSkills();
             console.log(skills.length > 0
                 ? skills.map(skill => `${skill.name}: ${skill.description}`).join('\n')
                 : '尚未安装技能');
             return -1;
         }
         if (command === '/jobs') {
-            if (args[0]) {
-                const result = this.dependencies.jobs.readLog(args[0]);
-                console.log(JSON.stringify(result.job, null, 4));
-                if (result.log) {
-                    console.log(result.log);
-                }
-            } else {
-                const jobs = this.dependencies.jobs.list();
-                console.table(jobs.map(job => ({
-                    id: job.id,
-                    type: job.type,
-                    status: job.status,
-                    attempts: job.attempts,
-                    title: job.title,
-                })));
-            }
+            await this.printJobs(args[0]);
             return -1;
         }
         if (command === '/job') {
@@ -198,14 +155,12 @@ export class Cli {
             if (!id || !['cancel', 'resume'].includes(action)) {
                 throw new Error('用法: /job cancel|resume <id>');
             }
-            const changed = action === 'cancel'
-                ? this.dependencies.jobs.cancel(id)
-                : this.dependencies.jobs.resume(id);
+            const changed = await this.dependencies.client.updateJob(id, action as 'cancel' | 'resume');
             console.log(changed ? '任务状态已更新' : '任务不存在或当前状态不支持该操作');
             return -1;
         }
         if (command === '/tasks') {
-            const tasks = this.dependencies.scheduledTasks.list();
+            const tasks = await this.dependencies.client.listTasks();
             console.table(tasks.map(task => ({
                 id: task.id,
                 status: task.status,
@@ -221,34 +176,19 @@ export class Cli {
             if (action !== 'cancel' || !id) {
                 throw new Error('用法: /task cancel <id>');
             }
-            const runId = randomUUID();
-            const timezone = this.dependencies.config.read().timezone;
-            const source = this.dependencies.memory.recordEvent({
-                actor: 'user',
-                type: 'cli_command',
-                payload: { command: 'task_cancel', taskId: id },
-                runId,
-                taskId: id,
-                timezone,
-                idempotencyKey: `run:${runId}:cli-command`,
-            });
-            const changed = this.dependencies.scheduledTasks.cancel(id, {
-                runId,
-                sourceEventId: source.id,
-                timezone,
-            });
+            const changed = await this.dependencies.client.cancelTask(id);
             console.log(changed ? '提醒已取消' : '提醒不存在或已进入终态');
             return -1;
         }
         if (command === '/topics') {
-            const topics = this.dependencies.memory.searchTopics(args.join(' '), 50);
+            const topics = await this.dependencies.client.searchTopics(args.join(' '));
             console.log(topics.length > 0
                 ? topics.map(topic => `[${topic.id}] (${topic.kind || 'general'}) ${topic.title}`).join('\n')
                 : '尚无匹配的持续事项');
             return -1;
         }
         if (command === '/memory') {
-            const memories = this.dependencies.memory.search(args.join(' '), 50);
+            const memories = await this.dependencies.client.searchMemories(args.join(' '));
             console.log(memories.length > 0
                 ? memories.map(item => [
                     `[${item.id}] (${item.kind}/${item.status}) ${item.content}`,
@@ -259,32 +199,73 @@ export class Cli {
             return -1;
         }
         if (command === '/growth') {
-            const proposals = this.dependencies.memory.listGrowth('proposed');
+            const proposals = await this.dependencies.client.listGrowth();
             console.log(proposals.length > 0
                 ? proposals.map(item => `[${item.id}] (${item.kind}, evidence=${item.evidenceCount}) ${item.title}\n${item.observation}`).join('\n\n')
                 : '尚无待评估的成长候选');
             return -1;
         }
         if (command === '/notifications') {
-            const notifications = this.dependencies.notifications.list();
+            const notifications = await this.dependencies.client.listNotifications();
             console.log(notifications.length > 0
                 ? notifications.map(item => `[${item.createdAt}] ${item.title}\n${item.message}`).join('\n\n')
                 : '没有通知');
-            this.dependencies.notifications.clear();
+            await this.dependencies.client.clearNotifications();
             return -1;
         }
         if (command === '/status') {
-            const checks = this.dependencies.health.check(this.dependencies.paths);
+            const bootstrap = await this.dependencies.client.bootstrap();
             console.log(JSON.stringify({
-                environment: this.dependencies.paths.environment,
-                home: this.dependencies.paths.home,
-                workspace: this.dependencies.paths.workspace,
-                checks,
+                environment: bootstrap.runtime.environment,
+                home: bootstrap.runtime.home,
+                workspace: bootstrap.runtime.workspace,
+                pendingForegroundRuns: bootstrap.runtime.pendingForegroundRuns,
+                checks: bootstrap.runtime.checks,
             }, null, 4));
             return -1;
         }
         console.log(`未知命令: ${command}`);
         return -1;
+    }
+
+    /** 输出 CLI 命令帮助 */
+    private printHelp (): void {
+        console.log([
+            '/model list                  查看模型',
+            '/model add                   新增渠道与模型',
+            '/model use <provider/model>  切换模型',
+            '/skills                      查看技能',
+            '/jobs [id]                   查看后台任务或任务日志',
+            '/job cancel|resume <id>      取消或恢复后台任务',
+            '/tasks                       查看一次性定时提醒',
+            '/task cancel <id>            取消尚未触发的提醒',
+            '/topics [query]              查看持续事项',
+            '/memory [query]              查看或检索长期记忆',
+            '/growth                      查看 Reflection 成长候选',
+            '/notifications               查看并清空通知',
+            '/status                       查看路径与健康状态',
+            '/exit                         退出 CLI，Runtime 继续运行',
+        ].join('\n'));
+    }
+
+    /** 输出后台任务列表或单个任务日志 */
+    private async printJobs (id?: string): Promise<void> {
+        if (id) {
+            const result = await this.dependencies.client.readJob(id);
+            console.log(JSON.stringify(result.job, null, 4));
+            if (result.log) {
+                console.log(result.log);
+            }
+            return;
+        }
+        const jobs = await this.dependencies.client.listJobs();
+        console.table(jobs.map(job => ({
+            id: job.id,
+            type: job.type,
+            status: job.status,
+            attempts: job.attempts,
+            title: job.title,
+        })));
     }
 
     /**
@@ -304,7 +285,7 @@ export class Cli {
             if (separator <= 0 || separator === value.length - 1) {
                 throw new Error('用法: /model use <provider/model>');
             }
-            this.dependencies.config.useModel({
+            await this.dependencies.client.useModel({
                 providerId: value.slice(0, separator),
                 modelId: value.slice(separator + 1),
             });
@@ -314,11 +295,15 @@ export class Cli {
         if (action !== 'list') {
             throw new Error('用法: /model list|add|use');
         }
-        const config = this.dependencies.config.read();
-        const rows = Object.entries(config.providers).flatMap(([providerId, provider]) =>
-            Object.keys(provider.models).map(modelId => ({
-                model: `${providerId}/${modelId}`,
-                active: config.activeModel?.providerId === providerId && config.activeModel.modelId === modelId,
+        const bootstrap = await this.dependencies.client.bootstrap();
+        if (!bootstrap.config) {
+            throw new Error(bootstrap.configurationError || '配置无效');
+        }
+        const rows = bootstrap.config.providers.flatMap(provider =>
+            provider.models.map(model => ({
+                model: `${provider.id}/${model.id}`,
+                active: bootstrap.config?.activeModel?.providerId === provider.id
+                    && bootstrap.config.activeModel.modelId === model.id,
                 protocol: provider.type,
                 baseURL: provider.baseURL || 'official',
             })),

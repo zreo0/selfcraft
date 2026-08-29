@@ -11,9 +11,8 @@ import {
     select,
     text,
 } from '@clack/prompts';
-import type { ConfigStore } from '../config/config-store';
-import type { SelfcraftPaths } from '../config/paths';
 import type { ModelConfig, ProviderType } from '../config/types';
+import type { RuntimeClient } from '../cli/runtime-client';
 
 const DEFAULT_CONTEXT_WINDOW = 128000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
@@ -29,32 +28,35 @@ export class OnboardingCancelledError extends Error {
     }
 }
 
-/** 首次启动与后续 /model add 共用的交互式配置流程 */
+/** CLI 首次访问与后续 /model add 共用的交互式配置流程 */
 export class Onboarding {
     /**
      * 创建 onboarding 流程
      *
-     * @param paths 当前实例路径
-     * @param config 模型配置存储
+     * @param client 唯一 Runtime 的 HTTP 客户端
      */
-    constructor (
-        private readonly paths: SelfcraftPaths,
-        private readonly config: ConfigStore,
-    ) {}
+    constructor (private readonly client: Pick<
+        RuntimeClient,
+        'bootstrap' | 'addProvider' | 'setTimezone' | 'resetConfig'
+    >) {}
 
     /** 完成首次环境与模型配置 */
     public async run (): Promise<void> {
+        const bootstrap = await this.client.bootstrap();
+        if (!bootstrap.config) {
+            throw new Error(`现有配置无效：${bootstrap.configurationError || '未知错误'}。请运行 bun run cli reset-config`);
+        }
         intro(' Selfcraft · 初次见面 ');
         log.message([
             '在我们开始之前，先给我一个可以思考的模型。',
             '名字和性格不用现在填写——它们应该在相处里慢慢形成。当然如果你想，你可以随时告诉我。',
         ]);
         note([
-            `环境    ${this.paths.environment}`,
-            `数据    ${this.paths.home}`,
-            `工作区  ${this.paths.workspace}`,
+            `环境    ${bootstrap.runtime.environment}`,
+            `数据    ${bootstrap.runtime.home}`,
+            `工作区  ${bootstrap.runtime.workspace}`,
         ].join('\n'), '我会住在这里');
-        const detectedTimezone = this.config.read().timezone;
+        const detectedTimezone = bootstrap.config.timezone;
         const timezone = this.unwrap(await autocomplete({
             message: '你通常按哪个时区生活？',
             options: createTimezoneOptions(detectedTimezone),
@@ -63,7 +65,7 @@ export class Onboarding {
             maxItems: 8,
         }));
         await this.configureModel(true);
-        this.config.setTimezone(timezone);
+        await this.client.setTimezone(timezone);
         outro('准备好了。接下来，你想让我做点什么？');
     }
 
@@ -84,7 +86,7 @@ export class Onboarding {
             return;
         }
 
-        const backupDirectory = this.config.backupAndReset();
+        const { backupDirectory } = await this.client.resetConfig();
         log.success(backupDirectory
             ? `旧配置已备份到 ${backupDirectory}`
             : '没有发现旧配置，已创建一份新配置');
@@ -159,7 +161,7 @@ export class Onboarding {
         const modelIds = this.parseModelIds(rawModels);
         const models = await this.askModelCapabilities(modelIds);
 
-        this.config.addProvider({
+        await this.client.addProvider({
             providerId,
             type,
             baseURL,

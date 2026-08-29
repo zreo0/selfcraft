@@ -51,6 +51,35 @@ describe('ConfigStore', () => {
         expect(fs.statSync(path.join(directory, 'secrets.json')).mode & 0o777).toBe(0o600);
     });
 
+    test('更新当前渠道并移除旧模型时自动切换到新模型', () => {
+        const store = new ConfigStore(createTemporaryDirectory());
+        store.addProvider({
+            providerId: 'local',
+            type: 'openai-compatible',
+            baseURL: 'http://127.0.0.1:3000/v1',
+            apiKey: 'old-secret',
+            models: {
+                old: { vision: false, contextWindow: 128000, maxOutputTokens: 4096 },
+            },
+        });
+
+        store.addProvider({
+            providerId: 'local',
+            type: 'openai-compatible',
+            baseURL: 'http://127.0.0.1:3000/v1',
+            apiKey: 'new-secret',
+            models: {
+                current: { vision: true, contextWindow: 200000, maxOutputTokens: 8192 },
+            },
+        });
+
+        expect(store.getActiveModel().selection).toEqual({
+            providerId: 'local',
+            modelId: 'current',
+        });
+        expect(store.isConfigured()).toBeTrue();
+    });
+
     test('无需解析旧文件即可按时间备份配置并清空模型凭证', () => {
         const directory = createTemporaryDirectory();
         const store = new ConfigStore(directory);

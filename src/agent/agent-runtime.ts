@@ -24,6 +24,18 @@ interface InstructionContext {
     channel: ToolRuntimeContext['channel'];
 }
 
+/** 一轮前台对话的执行选项 */
+export interface AgentRunOptions {
+    /** 调用方取消本轮生成时使用的信号 */
+    signal?: AbortSignal;
+}
+
+/** 一轮前台对话的执行结果 */
+export interface AgentRunResult {
+    /** 是否已有通过验证、等待 Supervisor 加载的新版本 */
+    restartRequired: boolean;
+}
+
 /** Selfcraft 的最小 Agent 循环 */
 export class AgentRuntime {
     /**
@@ -61,13 +73,15 @@ export class AgentRuntime {
      * @param input 用户输入
      * @param onText 文本增量回调
      * @param onStatus 工具执行状态回调
+     * @param options 调用方取消信号等执行选项
      * @returns 是否需要 Supervisor 重启
      */
     public async run (
         input: string,
         onText: (text: string) => void,
         onStatus: (status: string) => void = () => undefined,
-    ): Promise<{ restartRequired: boolean }> {
+        options: AgentRunOptions = {},
+    ): Promise<AgentRunResult> {
         const runId = randomUUID();
         const now = new Date().toISOString();
         const timezone = this.config.read().timezone;
@@ -136,6 +150,7 @@ export class AgentRuntime {
                     runtimeContext,
                     onText,
                     onStatus,
+                    options.signal,
                 );
             } catch (error) {
                 const toolAlreadyRan = this.memory.listEventsByRun(runId)
@@ -161,6 +176,7 @@ export class AgentRuntime {
                     runtimeContext,
                     onText,
                     onStatus,
+                    options.signal,
                 );
             }
             this.session.append(...execution.responseMessages);

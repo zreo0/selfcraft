@@ -1,5 +1,9 @@
 <h1 align="center">Selfcraft</h1>
 
+<p align="center">
+    <img alt="Selfcraft 云朵角色" src="web/public/brand/selfcraft-cloud.png" width="160">
+</p>
+
 <p align="center"><strong>一个能够发现自身问题、提出改进，并在验证后更新自己的个人智能体</strong></p>
 
 <p align="center">
@@ -43,7 +47,7 @@ Agent 离这些问题最近。它知道哪些工作流反复失败，哪些步�
 
 ## 现在能做什么
 
-Selfcraft 当前是一个基于 Bun、TypeScript 和 Vercel AI SDK v7 的实验性内核，以 CLI 作为第一版入口：
+Selfcraft 当前是一个基于 Bun、TypeScript 和 Vercel AI SDK v7 的实验性内核。CLI 与 Web 是同一个 Runtime 的两个通信入口：
 
 - **Remember** — 保存完整事件时间线，按时间、事项与证据重新想起经历
 - **Reflect** — 在对话后异步整理事实、失败和成长候选
@@ -65,7 +69,30 @@ bun install
 bun run start
 ```
 
-第一次启动会进入 onboarding。Selfcraft 会自动检测本地时区，并提供可以输入城市名筛选的 IANA 时区列表；随后再配置模型协议、Base URL、API key、Model ID 和上下文参数。
+Selfcraft 始终只有一个 Runtime。Web 和 CLI 只是连接它的不同入口，不会分别启动两套 Agent：
+
+| 目的 | 使用方式 |
+|:---|:---|
+| 启动完整服务 | `bun run start` |
+| 使用 Web | 浏览器打开 `http://127.0.0.1:3210` |
+| 使用 CLI | 在另一个终端运行 `bun run cli` |
+| 开发 Web 与 Runtime | `bun run dev`，浏览器打开 `http://127.0.0.1:5173` |
+
+`bun run start` 会构建 Web，然后启动 Supervisor、唯一 Runtime 和 HTTP 服务；它只负责让系统运行，不会在启动终端中进入 onboarding。
+
+CLI 是可选客户端，必须在 Runtime 已经启动后使用：
+
+```bash
+bun run cli
+```
+
+CLI 默认连接 `http://127.0.0.1:3210`，也可以通过 `SELFCRAFT_RUNTIME_URL` 指向其他地址。退出 CLI 不会停止 Runtime；停止服务请回到运行 `bun run start` 的终端按 `Ctrl-C`。
+
+Onboarding 不属于启动器，而属于通信入口。首次使用时任选 Web 或 CLI 完成即可，两者写入同一份模型与时区配置；完成后，另一个入口会直接使用这份配置。请避免同时在两个入口执行首次配置。
+
+Web 会在页面内提供对话式引导，优先采用浏览器检测到的时区，并保留可输入城市名筛选的 IANA 时区选择器。CLI 则使用对应的终端交互，不要求先完成 Web onboarding。
+
+首次流程只询问开始思考所必需的信息。姓名、人格和相处方式不会被做成问卷；完成配置后写下的第一句话会直接进入真实 Agent Loop，而不是停在一张“初始化成功”页面。
 
 如果不设置名字，它就保持未命名。Selfcraft 不会根据项目名替自己决定身份。
 
@@ -74,10 +101,10 @@ API key 只写入权限为 `0600` 的 `config/secrets.json`，不会进入普通
 需要从一份新配置重新开始时，可以运行：
 
 ```bash
-bun run start reset-config
+bun run reset-config
 ```
 
-确认后，旧的非敏感 `config.json` 会备份到 `config/backups/<UTC 时间>/`，再进入 onboarding。API key 不会写入历史备份，会被清空并需要重新输入；记忆、会话、任务、技能和 workspace 均保持不变。
+该命令同样通过正在运行的 Runtime 操作。确认后，旧的非敏感 `config.json` 会备份到 `config/backups/<UTC 时间>/`，再进入 CLI onboarding。API key 不会写入历史备份，会被清空并需要重新输入；记忆、会话、任务、技能和 workspace 均保持不变。Web 设置页也提供相同能力。
 
 > 不要把真实凭证粘贴进对话或 workspace 文件。对话记录本身是长期数据，不属于凭证存储。
 
@@ -88,12 +115,17 @@ Supervisor（稳定）
   └─ 启动 · 健康观察 · 发布状态 · 自动回滚
 
 Runtime（可演化）
-  ├─ Agent Loop / CLI
+  ├─ Agent Loop
+  ├─ HTTP / AI SDK 流式通信边界
   ├─ 长期会话与上下文
   ├─ 后台 Job、定时 Task 与通知
   ├─ 事件时间线、结构化记忆与 Reflection
   ├─ workspace 工具与技能
   └─ 候选版本提案与验证
+
+通信入口
+  ├─ Web ──HTTP──┐
+  └─ CLI ──HTTP──┴─> 同一个 Runtime
 ```
 
 Supervisor 和 Runtime 的边界是刻意留下的：
@@ -189,7 +221,7 @@ Job 默认最多并发执行两个：
 
 定时 Task 第一版只支持一次性绝对时间，不包含 Cron、重复规则或任意延迟动作。Runtime 启动时会补扫已经到期的提醒，通知使用稳定 ID，避免重启后重复投递；创建、触发、完成、取消和失败都会留下时间线 Event。
 
-## 模型与 CLI
+## 模型与通信入口
 
 支持三种模型协议：
 
@@ -216,7 +248,7 @@ Job 默认最多并发执行两个：
 /exit
 ```
 
-模型切换从下一次 Agent run 生效。CLI 只是当前通信入口，其他入口可以复用 Runtime 的单轮执行边界。
+模型切换从下一次 Agent run 生效。CLI 是独立进程中的 HTTP 客户端，Web 是由 Runtime 提供的静态客户端；两者都不持有 Agent Loop。它们共用同一个前台执行队列、长期会话、Event 时间线和记忆，多个入口同时提交时会按顺序执行，不会产生两个“大脑”。入口只发送本轮新输入，历史上下文始终由 Runtime 组装。
 
 ## 数据与上下文
 
@@ -239,7 +271,7 @@ SELFCRAFT_ENV=development SELFCRAFT_HOME=/custom/data bun run start
 bun run dev
 ```
 
-开发模式默认把实例数据保存在项目内的 `.selfcraft/`。
+开发模式默认把实例数据保存在项目内的 `.selfcraft/`。Vite Web 位于 `http://127.0.0.1:5173`，并把 `/api` 代理到 `http://127.0.0.1:3210`。生产构建可以单独执行 `bun run build:web`。
 
 基础检查：
 
@@ -279,10 +311,18 @@ docker compose -f docker-compose.dev.yml up -d --build
 docker compose -f docker-compose.dev.yml exec selfcraft bun run start
 ```
 
+第二条命令由开发者手动启动 Runtime，便于修改代码后自行控制重启。随后在宿主机访问 `http://127.0.0.1:3210`，或从另一个终端进入 CLI：
+
+```bash
+docker compose -f docker-compose.dev.yml exec selfcraft bun run cli
+```
+
+开发容器只把 Web/API 端口绑定到宿主回环地址。
+
 如果命名卷里保留了旧配置，可以在容器中备份并重新配置：
 
 ```bash
-docker compose -f docker-compose.dev.yml exec selfcraft bun run start reset-config
+docker compose -f docker-compose.dev.yml exec selfcraft bun run reset-config
 ```
 
 宿主源码挂载到 `/app`；依赖和实例数据分别保存在 Compose 命名卷。Selfcraft 通过 `docker compose exec` 运行，输出属于当前终端，不会出现在 `docker compose logs`。
@@ -303,10 +343,16 @@ docker compose -f docker-compose.dev.yml down -v --remove-orphans
 
 </details>
 
-生产环境默认使用 `~/.selfcraft/`：
+直接运行时，生产环境默认使用 `~/.selfcraft/`：
 
 ```bash
 SELFCRAFT_ENV=production bun run start
+```
+
+生产 Compose 会自动启动 Runtime，并使用 Docker 的 `restart: unless-stopped` 管理容器生命周期；容器内仍只有 Supervisor 与其唯一 Runtime，不需要 PM2：
+
+```bash
+docker compose up -d --build
 ```
 
 如果允许 Runtime 自我演化，数据目录和项目源码目录都需要持久化。

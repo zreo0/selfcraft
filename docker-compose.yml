@@ -2,11 +2,15 @@ services:
     selfcraft:
         build: .
         image: selfcraft:latest
+        init: true
+        restart: unless-stopped
         environment:
             SELFCRAFT_ENV: production
             SELFCRAFT_HOME: /var/lib/selfcraft
-        stdin_open: true
-        tty: true
+            SELFCRAFT_WEB_HOST: 0.0.0.0
+            SELFCRAFT_WEB_PORT: 3210
+        ports:
+            - "127.0.0.1:3210:3210"
         volumes:
             - selfcraft-code:/app
             - selfcraft-data:/var/lib/selfcraft

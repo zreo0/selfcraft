@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { ConfigStore } from '../../config/config-store';
 import { resolvePaths } from '../../config/paths';
+import type { RuntimeClient, RuntimeConfigView } from '../../cli/runtime-client';
 
 type PromptValidator = (
     value?: string,
@@ -98,9 +99,59 @@ function createOnboarding (): {
     const root = createTemporaryDirectory();
     const paths = resolvePaths('production', root);
     const config = new ConfigStore(paths.config);
+    const client: Pick<RuntimeClient, 'bootstrap' | 'addProvider' | 'setTimezone' | 'resetConfig'> = {
+        async bootstrap () {
+            return {
+                product: 'Selfcraft',
+                config: buildConfigView(config),
+                configurationError: null,
+                runtime: {
+                    environment: paths.environment,
+                    home: paths.home,
+                    workspace: paths.workspace,
+                    pendingForegroundRuns: 0,
+                    checks: [],
+                },
+            };
+        },
+        async addProvider (input) {
+            config.addProvider(input);
+            return buildConfigView(config);
+        },
+        async setTimezone (timezone) {
+            config.setTimezone(timezone);
+            return buildConfigView(config);
+        },
+        async resetConfig () {
+            return {
+                backupDirectory: config.backupAndReset(),
+                config: buildConfigView(config),
+            };
+        },
+    };
     return {
-        onboarding: new Onboarding(paths, config),
+        onboarding: new Onboarding(client),
         config,
+    };
+}
+
+/** 把测试 ConfigStore 转换为 Runtime API 的脱敏配置 */
+function buildConfigView (config: ConfigStore): RuntimeConfigView {
+    const value = config.read();
+    return {
+        configured: config.isConfigured(),
+        timezone: value.timezone,
+        activeModel: value.activeModel,
+        providers: Object.entries(value.providers).map(([id, provider]) => ({
+            id,
+            type: provider.type,
+            baseURL: provider.baseURL,
+            credentialConfigured: config.hasCredential(id),
+            models: Object.entries(provider.models).map(([modelId, model]) => ({
+                id: modelId,
+                ...model,
+            })),
+        })),
     };
 }
 

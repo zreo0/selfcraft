@@ -399,6 +399,35 @@ export class MemoryStore {
     }
 
     /**
+     * 分页读取前台用户与助理消息
+     *
+     * @param limit 本页最多返回的消息数
+     * @param beforeSeq 只返回该时间线序号之前的消息
+     * @returns 按时间线正序排列的消息事件
+     */
+    public listConversationEvents (limit = 50, beforeSeq?: number): EventRecord[] {
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+            throw new Error('消息分页大小必须是 1 到 100 的整数');
+        }
+        if (beforeSeq !== undefined && (!Number.isInteger(beforeSeq) || beforeSeq < 1)) {
+            throw new Error('消息游标必须是正整数');
+        }
+        const cursorCondition = beforeSeq === undefined ? '' : 'AND seq < ?';
+        const parameters = beforeSeq === undefined ? [limit] : [beforeSeq, limit];
+        const rows = this.database.query(`
+            SELECT * FROM (
+                SELECT * FROM events
+                WHERE event_type IN ('user_message', 'assistant_message')
+                    AND json_extract(payload, '$.channel') = 'foreground'
+                    ${cursorCondition}
+                ORDER BY seq DESC
+                LIMIT ?
+            ) ORDER BY seq ASC
+        `).all(...parameters) as EventRow[];
+        return rows.map(row => this.toEventRecord(row));
+    }
+
+    /**
      * 创建一个允许同名的持续事项
      *
      * @param input Topic 展示名称和可选类别

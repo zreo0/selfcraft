@@ -2,9 +2,12 @@ node_modules/
 .selfcraft/
 dist/
 coverage/
+*.tsbuildinfo
 *.log
 .DS_Store
 .history
+.impeccable/review/
 .env
 .env.*
 !.env.example
+.impeccable

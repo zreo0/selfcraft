@@ -1,6 +1,6 @@
 import * as path from 'node:path';
 import { AgentRuntime } from './agent/agent-runtime';
-import { Cli } from './cli/cli';
+import { ForegroundRunner } from './agent/foreground-runner';
 import { ConfigStore } from './config/config-store';
 import { resolvePaths } from './config/paths';
 import { ContextManager } from './context/context-manager';
@@ -12,7 +12,6 @@ import { MemoryStore } from './memory/memory-store';
 import { ReflectionWorker } from './memory/reflection-worker';
 import { ModelFactory } from './model/model-factory';
 import { NotificationInbox } from './notification/notification-inbox';
-import { Onboarding } from './onboarding/onboarding';
 import { SessionStore } from './session/session-store';
 import { SkillRegistry } from './skills/skill-registry';
 import { ReleaseStore } from './supervisor/release-store';
@@ -20,24 +19,17 @@ import { ScheduledTaskManager } from './task/scheduled-task-manager';
 import { createTools } from './tools';
 import { PathGuard } from './tools/path-guard';
 import { WorkspaceService } from './workspace/workspace-service';
+import { WebServer } from './web/web-server';
 
-/** 组装可变 Runtime 并启动当前 CLI 适配器 */
+const RESTART_EXIT_CODE = 75;
+
+/** 组装唯一 Runtime，并启动供各通信入口共享的 HTTP 服务 */
 async function main (): Promise<void> {
     const paths = resolvePaths();
-    const args = process.argv.slice(2);
-    if (args[0] === 'reset-config') {
-        if (!process.stdin.isTTY) {
-            throw new Error('重置配置需要交互式终端，请运行 bun run start reset-config');
-        }
-        const config = new ConfigStore(paths.config);
-        await new Onboarding(paths, config).reset();
-        return;
-    }
-
+    const config = new ConfigStore(paths.config);
     const logger = new Logger(paths.logs);
     const workspace = new WorkspaceService(paths.workspace, path.join(paths.project, 'workspace-template'));
     workspace.initialize();
-    const config = new ConfigStore(paths.config);
     const skills = new SkillRegistry(path.join(paths.workspace, 'skills'));
     const session = new SessionStore(paths.sessions);
     const context = new ContextManager();
@@ -75,28 +67,50 @@ async function main (): Promise<void> {
         tools,
         logger,
     );
+    const foreground = new ForegroundRunner(agent);
     jobs.setAgentExecutor((job, signal, onLog) => agent.runBackground(job, signal, onLog));
     jobs.start();
     scheduledTasks.start();
-    if (config.isConfigured()) {
-        reflection.start();
-    }
-    const onboarding = new Onboarding(paths, config);
-    const cli = new Cli({
+    reflection.start();
+    let resolveShutdown: (exitCode: number) => void = () => undefined;
+    let shuttingDown = false;
+    const shutdown = new Promise<number>(resolve => {
+        resolveShutdown = resolve;
+    });
+    const requestShutdown = (exitCode: number): void => {
+        if (shuttingDown) {
+            return;
+        }
+        shuttingDown = true;
+        resolveShutdown(exitCode);
+    };
+    const web = new WebServer({
         paths,
         config,
-        onboarding,
-        agent,
+        agent: foreground,
+        memory,
         skills,
         notifications,
         jobs,
         scheduledTasks,
-        memory,
         health: new HealthChecker(),
+        logger,
+        staticDirectory: path.join(paths.project, 'web', 'dist'),
+        onRestart: () => requestShutdown(RESTART_EXIT_CODE),
     });
+    const address = web.start();
+    console.log(`Selfcraft Runtime 已就绪：${address.url}`);
+    console.log('Web 可直接访问；终端入口请在另一个终端运行 bun run cli');
+    const handleSigint = (): void => requestShutdown(0);
+    const handleSigterm = (): void => requestShutdown(0);
+    process.once('SIGINT', handleSigint);
+    process.once('SIGTERM', handleSigterm);
     try {
-        process.exitCode = await cli.start(args);
+        process.exitCode = await shutdown;
     } finally {
+        process.off('SIGINT', handleSigint);
+        process.off('SIGTERM', handleSigterm);
+        web.stop();
         scheduledTasks.stop();
         reflection.stop();
     }

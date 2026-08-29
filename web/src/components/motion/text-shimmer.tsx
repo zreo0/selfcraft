@@ -1,0 +1,35 @@
+// Source adapted from https://beui.dev/r/text-shimmer/raw
+import type { ElementType, ReactNode } from 'react';
+import {
+    TEXT_SHIMMER_CLASS_NAME,
+    TEXT_SHIMMER_KEYFRAMES,
+    textShimmerStyle,
+} from '@/lib/text-shimmer';
+import { cn } from '@/lib/utils';
+
+export interface TextShimmerProps {
+    children: ReactNode;
+    as?: ElementType;
+    duration?: number;
+    className?: string;
+}
+
+/** 用柔和流光表达仍在进行中的文字状态 */
+export function TextShimmer ({
+    children,
+    as: Comp = 'span',
+    duration = 2.5,
+    className,
+}: TextShimmerProps) {
+    return (
+        <>
+            <style>{TEXT_SHIMMER_KEYFRAMES}</style>
+            <Comp
+                className={cn('inline-block', TEXT_SHIMMER_CLASS_NAME, className)}
+                style={textShimmerStyle(duration)}
+            >
+                {children}
+            </Comp>
+        </>
+    );
+}

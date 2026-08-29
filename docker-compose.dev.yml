@@ -14,12 +14,17 @@ services:
                 fi
                 bun install --frozen-lockfile
                 echo "Selfcraft development container is ready"
-                echo "Run: docker compose -f docker-compose.dev.yml exec selfcraft bun run start"
+                echo "Runtime: docker compose -f docker-compose.dev.yml exec selfcraft bun run start"
+                echo "CLI:     docker compose -f docker-compose.dev.yml exec selfcraft bun run cli"
                 exec tail -f /dev/null
         environment:
             SELFCRAFT_ENV: development
             SELFCRAFT_HOME: /var/lib/selfcraft
             SELFCRAFT_PROJECT_ROOT: /app
+            SELFCRAFT_WEB_HOST: 0.0.0.0
+            SELFCRAFT_WEB_PORT: 3210
+        ports:
+            - "127.0.0.1:3210:3210"
         stdin_open: true
         tty: true
         volumes:

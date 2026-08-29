@@ -1,6 +1,8 @@
 .git
 .selfcraft
 node_modules
+web/dist
 coverage
 *.log
 .history
+.impeccable/review

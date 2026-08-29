@@ -3,19 +3,29 @@
     "version": "0.1.0",
     "private": true,
     "type": "module",
+    "workspaces": [
+        "web"
+    ],
     "bin": {
         "selfcraft": "src/index.ts"
     },
     "scripts": {
+        "prestart": "bun run build:web",
         "start": "bun run src/index.ts",
-        "dev": "SELFCRAFT_ENV=development bun --watch run src/index.ts",
+        "cli": "bun run src/cli-entry.ts",
+        "setup": "bun run src/cli-entry.ts setup",
+        "reset-config": "bun run src/cli-entry.ts reset-config",
+        "dev": "concurrently --kill-others -n runtime,web -c blue,cyan \"bun run dev:runtime\" \"bun run --cwd web dev\"",
+        "dev:runtime": "SELFCRAFT_ENV=development SELFCRAFT_WEB_PORT=3210 bun --watch run src/runtime-entry.ts",
+        "build:web": "bun run --cwd web build",
         "runtime": "bun run src/runtime-entry.ts",
         "doctor": "bun run src/doctor.ts",
         "smoke": "bun run scripts/smoke.ts",
         "smoke:evolution": "bun run scripts/evolution-smoke.ts",
         "smoke:provider": "bun run scripts/provider-smoke.ts",
         "test": "bun test",
-        "typecheck": "tsc --noEmit",
+        "typecheck": "bun run typecheck:runtime && bun run --cwd web typecheck",
+        "typecheck:runtime": "tsc --noEmit",
         "check": "bun run typecheck && bun test && bun run doctor"
     },
     "dependencies": {
@@ -28,6 +38,9 @@
     },
     "devDependencies": {
         "@types/bun": "latest",
+        "@types/node": "26.2.0",
+        "bun-types": "1.4.0",
+        "concurrently": "^9.2.1",
         "typescript": "^5.9.0"
     }
 }

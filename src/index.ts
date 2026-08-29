@@ -9,7 +9,16 @@ async function main (): Promise<void> {
     const paths = resolvePaths();
     const logger = new Logger(paths.logs);
     const supervisor = new Supervisor(paths, logger);
-    process.exitCode = await supervisor.run(process.argv.slice(2));
+    const handleSigint = (): void => supervisor.stop('SIGINT');
+    const handleSigterm = (): void => supervisor.stop('SIGTERM');
+    process.once('SIGINT', handleSigint);
+    process.once('SIGTERM', handleSigterm);
+    try {
+        process.exitCode = await supervisor.run(process.argv.slice(2));
+    } finally {
+        process.off('SIGINT', handleSigint);
+        process.off('SIGTERM', handleSigterm);
+    }
 }
 
 main().catch(error => {

@@ -10,4 +10,4 @@ if [ ! -d /app/node_modules/ai ]; then
 fi
 
 cd /app
-exec bun run start "$@"
+exec bun run src/index.ts "$@"
