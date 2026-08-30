@@ -109,15 +109,29 @@ export class Cli {
         let wroteText = false;
         let lineOpen = false;
         try {
-            await this.dependencies.client.chat(input, text => {
-                wroteText = true;
-                process.stdout.write(text);
-                lineOpen = !text.endsWith('\n');
-            }, status => {
+            await this.dependencies.client.chat(input, event => {
+                if (event.type === 'text-delta') {
+                    wroteText = true;
+                    process.stdout.write(event.delta);
+                    lineOpen = !event.delta.endsWith('\n');
+                    return;
+                }
                 if (lineOpen) {
                     process.stdout.write('\n');
                 }
-                console.log(`→ ${status}`);
+                if (event.type === 'status') {
+                    console.log(`→ ${event.label}`);
+                } else if (event.type === 'activity') {
+                    const marker = event.activity.state === 'running'
+                        ? '→'
+                        : event.activity.state === 'success'
+                            ? '✓'
+                            : event.activity.state === 'error' ? '×' : '?';
+                    const target = event.activity.target ? ` · ${event.activity.target}` : '';
+                    console.log(`${marker} ${event.activity.label}${target}`);
+                } else {
+                    console.log(`↳ 已读取 ${event.source.title}`);
+                }
                 lineOpen = false;
             });
             if (wroteText && lineOpen) {

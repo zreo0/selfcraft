@@ -8,16 +8,23 @@ import {
     MessageHeader,
     MessageResponse,
 } from '@/components/agents/message';
+import { AgentActivity } from '@/components/agents/agent-activity';
 import { ThinkingShimmer } from '@/components/agents/loading-states/thinking-shimmer';
 import { MessageScroller } from '@/components/agents/message-scroller';
 import {
     PromptInput,
 } from '@/components/agents/prompt-input';
+import { StreamingResponse } from '@/components/agents/streaming-response';
 import { Button } from '@/components/motion/button';
 import { AssistantMurmur } from '@/components/AssistantMurmur';
 import { BRAND_IMAGE_PATH } from '@/lib/brand';
 import { getMessages } from '@/services/runtime';
-import type { ConfigView, MessagePage, SelfcraftMessage } from '@/types/api.types';
+import type {
+    AgentActivityGroup,
+    ConfigView,
+    MessagePage,
+    SelfcraftMessage,
+} from '@/types/api.types';
 
 const chatTransport = new DefaultChatTransport<SelfcraftMessage>({ api: '/api/chat' });
 
@@ -27,6 +34,38 @@ function messageText (message: SelfcraftMessage): string {
         .filter(part => part.type === 'text')
         .map(part => part.text)
         .join('');
+}
+
+/** 判断消息数据是否是可展示的活动组 */
+function isAgentActivityGroup (value: unknown): value is AgentActivityGroup {
+    if (!value || typeof value !== 'object') {
+        return false;
+    }
+    const group = value as Partial<AgentActivityGroup>;
+    return (group.status === 'working' || group.status === 'complete')
+        && Array.isArray(group.items);
+}
+
+/** 从消息中读取 Runtime 持久输出的最后一版活动状态 */
+function messageActivity (message: SelfcraftMessage): AgentActivityGroup | null {
+    for (let index = message.parts.length - 1; index >= 0; index -= 1) {
+        const part = message.parts[index];
+        if (part.type === 'data-activity' && isAgentActivityGroup(part.data)) {
+            return part.data;
+        }
+    }
+    return null;
+}
+
+/** 从消息中读取 Runtime 确认实际访问过的来源 */
+function messageSources (message: SelfcraftMessage) {
+    return message.parts.flatMap(part => part.type === 'source-url'
+        ? [{
+            id: part.sourceId,
+            title: part.title || part.url,
+            url: part.url,
+        }]
+        : []);
 }
 
 /** 使用本地时区显示消息时间 */
@@ -217,28 +256,37 @@ export function ChatView ({
                     {messages.map(message => {
                         const from = message.role === 'user' ? 'user' : 'assistant';
                         const text = messageText(message);
-                        const showThinking = message.id === pendingAssistantId && !text;
+                        const activity = from === 'assistant' ? messageActivity(message) : null;
+                        const sources = from === 'assistant' ? messageSources(message) : [];
+                        const messageIsStreaming = message.id === pendingAssistantId;
+                        const showThinking = messageIsStreaming && !text && !activity;
+                        const occurredAt = messageTime(message);
                         return (
                             <Message animateIn={message.id === lastMessageId && generating} from={from} key={message.id}>
                                 <MessageContent>
                                     <MessageHeader>
                                         {from === 'assistant' && <span className="assistant-mark"><img alt="" src={BRAND_IMAGE_PATH} /></span>}
                                         <span>{from === 'user' ? '你' : 'Selfcraft'}</span>
-                                        {messageTime(message) && <time>{messageTime(message)}</time>}
+                                        {occurredAt && <time>{occurredAt}</time>}
                                     </MessageHeader>
                                     {from === 'assistant' ? (
-                                        showThinking ? (
-                                            <div aria-live="polite" className="thinking-state">
-                                                <ThinkingShimmer>{statusText || '正在思考'}</ThinkingShimmer>
-                                            </div>
-                                        ) : (
-                                            <MessageResponse
-                                                animated
-                                                isAnimating={status === 'streaming' && message.id === lastMessageId}
-                                            >
-                                                {text}
-                                            </MessageResponse>
-                                        )
+                                        <div className="assistant-response-stack">
+                                            {activity && <AgentActivity group={activity} />}
+                                            {showThinking && (
+                                                <div aria-live="polite" className="thinking-state">
+                                                    <ThinkingShimmer>{statusText || '正在思考'}</ThinkingShimmer>
+                                                </div>
+                                            )}
+                                            {text && (
+                                                <StreamingResponse
+                                                    copyText={text}
+                                                    sources={sources}
+                                                    streaming={messageIsStreaming}
+                                                >
+                                                    <MessageResponse>{text}</MessageResponse>
+                                                </StreamingResponse>
+                                            )}
+                                        </div>
                                     ) : (
                                         <p className="message-user-surface whitespace-pre-wrap">{text}</p>
                                     )}

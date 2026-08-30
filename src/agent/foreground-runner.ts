@@ -1,12 +1,12 @@
 import type { AgentRunOptions, AgentRunResult } from './agent-runtime';
+import type { AgentRunEvent } from './run-events';
 
 /** 前台 Agent 需要提供的最小执行接口 */
 export interface ForegroundAgent {
     /** 执行一轮前台对话 */
     run (
         input: string,
-        onText: (text: string) => void,
-        onStatus?: (status: string) => void,
+        onEvent?: (event: AgentRunEvent) => void,
         options?: AgentRunOptions,
     ): Promise<AgentRunResult>;
 }
@@ -27,26 +27,28 @@ export class ForegroundRunner {
      * 排队执行一轮对话，避免多个入口交错写入同一长期会话
      *
      * @param input 用户输入
-     * @param onText 文本增量回调
-     * @param onStatus 运行状态回调
+     * @param onEvent 统一运行事件回调
      * @param options 取消信号等执行选项
      * @returns Agent 执行结果
      */
     public async run (
         input: string,
-        onText: (text: string) => void,
-        onStatus: (status: string) => void = () => undefined,
+        onEvent: (event: AgentRunEvent) => void = () => undefined,
         options: AgentRunOptions = {},
     ): Promise<AgentRunResult> {
         if (this.pending > 0) {
-            onStatus('正在等待上一轮对话结束');
+            onEvent({
+                type: 'status',
+                phase: 'queued',
+                label: '正在等待上一轮对话结束',
+            });
         }
         this.pending += 1;
         const operation = this.tail.then(async () => {
             if (options.signal?.aborted) {
                 throw new DOMException('对话已取消', 'AbortError');
             }
-            return await this.agent.run(input, onText, onStatus, options);
+            return await this.agent.run(input, onEvent, options);
         });
         this.tail = operation.then(() => undefined, () => undefined);
         try {

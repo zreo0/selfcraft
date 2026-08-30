@@ -7,6 +7,14 @@ import {
 } from 'ai';
 import { z } from 'zod';
 import type { ForegroundRunner } from '../agent/foreground-runner';
+import {
+    completeAgentActivity,
+    createAgentActivity,
+    failAgentActivity,
+    type AgentActivity,
+    type AgentRunEvent,
+    type AgentSource,
+} from '../agent/run-events';
 import type { ConfigStore } from '../config/config-store';
 import type { SelfcraftPaths } from '../config/paths';
 import type { SelfcraftConfig } from '../config/types';
@@ -76,7 +84,13 @@ interface WebMessageMetadata {
 interface WebMessageData extends Record<string, unknown> {
     /** 不进入持久消息的短暂运行状态 */
     status: {
+        phase: 'queued' | 'preparing' | 'thinking';
         label: string;
+    };
+    /** 当前 Agent 运行产生的结构化活动 */
+    activity: {
+        status: 'working' | 'complete';
+        items: AgentActivity[];
     };
 }
 
@@ -380,7 +394,10 @@ export class WebServer {
     private buildMessages (limit: number, before?: number): object {
         const events = this.dependencies.memory.listConversationEvents(limit, before);
         return {
-            items: events.map(event => toUIMessage(event)),
+            items: events.map(event => toUIMessage(
+                event,
+                event.runId ? this.dependencies.memory.listEventsByRun(event.runId) : [],
+            )),
             nextCursor: events.length === limit ? events[0]?.seq || null : null,
         };
     }
@@ -411,32 +428,78 @@ export class WebServer {
 
         let restartRequired = false;
         const textId = randomUUID();
+        const activityId = `activity:${textId}`;
         const stream = createUIMessageStream<SelfcraftUIMessage>({
             execute: async ({ writer }) => {
+                const activities = new Map<string, AgentActivity>();
+                const sources = new Set<string>();
+                /** 将统一 Runtime 事件投影为 AI SDK UI Message Stream */
+                const writeEvent = (event: AgentRunEvent): void => {
+                    if (event.type === 'text-delta') {
+                        writer.write({ type: 'text-delta', id: textId, delta: event.delta });
+                        return;
+                    }
+                    if (event.type === 'status') {
+                        writer.write({
+                            type: 'data-status',
+                            data: { phase: event.phase, label: event.label },
+                            transient: true,
+                        });
+                        return;
+                    }
+                    if (event.type === 'activity') {
+                        activities.set(event.activity.id, event.activity);
+                        writer.write({
+                            type: 'data-activity',
+                            id: activityId,
+                            data: { status: 'working', items: [...activities.values()] },
+                        });
+                        return;
+                    }
+                    if (sources.has(event.source.id)) {
+                        return;
+                    }
+                    sources.add(event.source.id);
+                    writer.write({
+                        type: 'source-url',
+                        sourceId: event.source.id,
+                        url: event.source.url,
+                        title: event.source.title,
+                    });
+                };
                 writer.write({ type: 'start' });
                 writer.write({ type: 'start-step' });
-                writer.write({
-                    type: 'data-status',
-                    data: { label: '正在理解你的意思' },
-                    transient: true,
-                });
                 writer.write({ type: 'text-start', id: textId });
                 try {
                     const result = await this.dependencies.agent.run(
                         input,
-                        delta => writer.write({ type: 'text-delta', id: textId, delta }),
-                        status => writer.write({
-                            type: 'data-status',
-                            data: { label: status },
-                            transient: true,
-                        }),
+                        writeEvent,
                         { signal: request.signal },
                     );
                     restartRequired = result.restartRequired;
+                    if (activities.size > 0) {
+                        writer.write({
+                            type: 'data-activity',
+                            id: activityId,
+                            data: { status: 'complete', items: [...activities.values()] },
+                        });
+                    }
                     writer.write({ type: 'text-end', id: textId });
                     writer.write({ type: 'finish-step' });
                     writer.write({ type: 'finish', finishReason: 'stop' });
                 } catch (error) {
+                    for (const [id, activity] of activities) {
+                        if (activity.state === 'running') {
+                            activities.set(id, failAgentActivity(activity));
+                        }
+                    }
+                    if (activities.size > 0) {
+                        writer.write({
+                            type: 'data-activity',
+                            id: activityId,
+                            data: { status: 'complete', items: [...activities.values()] },
+                        });
+                    }
                     writer.write({ type: 'text-end', id: textId });
                     throw error;
                 }
@@ -521,9 +584,12 @@ interface WebConfigView {
     }>;
 }
 
-/** 把持久事件转换为浏览器 UI 消息 */
-function toUIMessage (event: EventRecord): SelfcraftUIMessage {
+/** 把持久事件及同轮工具时间线转换为浏览器 UI 消息 */
+function toUIMessage (event: EventRecord, runEvents: EventRecord[]): SelfcraftUIMessage {
     const payload = event.payload as { text?: unknown } | null;
+    const presentation = event.type === 'assistant_message'
+        ? buildRunPresentation(runEvents)
+        : { activities: [], sources: [] };
     return {
         id: event.id,
         role: event.type === 'user_message' ? 'user' : 'assistant',
@@ -531,11 +597,92 @@ function toUIMessage (event: EventRecord): SelfcraftUIMessage {
             seq: event.seq,
             occurredAt: event.occurredFrom,
         },
-        parts: [{
-            type: 'text',
-            text: typeof payload?.text === 'string' ? payload.text : '',
-        }],
+        parts: [
+            ...(presentation.activities.length > 0 ? [{
+                type: 'data-activity' as const,
+                id: `activity:${event.runId || event.id}`,
+                data: {
+                    status: 'complete' as const,
+                    items: presentation.activities,
+                },
+            }] : []),
+            {
+                type: 'text' as const,
+                text: typeof payload?.text === 'string' ? payload.text : '',
+            },
+            ...presentation.sources.map(source => ({
+                type: 'source-url' as const,
+                sourceId: source.id,
+                url: source.url,
+                title: source.title,
+            })),
+        ],
     };
+}
+
+/** 从工具调用、结果与失败事件重建一次运行的活动和来源 */
+function buildRunPresentation (events: EventRecord[]): {
+    activities: AgentActivity[];
+    sources: AgentSource[];
+} {
+    const outcomes = new Map<string, EventRecord>();
+    for (const event of events) {
+        if (event.type !== 'tool_result' && event.type !== 'tool_error') {
+            continue;
+        }
+        const payload = recordValue(event.payload);
+        if (typeof payload?.toolCallId === 'string') {
+            outcomes.set(payload.toolCallId, event);
+        }
+    }
+
+    const activities: AgentActivity[] = [];
+    const sources = new Map<string, AgentSource>();
+    for (const event of events) {
+        if (event.type !== 'tool_call') {
+            continue;
+        }
+        const payload = recordValue(event.payload);
+        if (typeof payload?.toolName !== 'string' || typeof payload.toolCallId !== 'string') {
+            continue;
+        }
+        const toolInput = payload.input;
+        const started = createAgentActivity(payload.toolName, payload.toolCallId, toolInput);
+        const outcome = outcomes.get(payload.toolCallId);
+        if (!outcome) {
+            activities.push({ ...started, state: 'unknown' });
+            continue;
+        }
+        if (outcome.type === 'tool_error') {
+            activities.push(failAgentActivity(started));
+            continue;
+        }
+        let completion = completeAgentActivity(
+            started,
+            recordValue(outcome.payload)?.result,
+        );
+        const requestedUrl = recordValue(toolInput)?.url;
+        if (
+            started.toolName === 'web_fetch'
+            && completion.sources.length === 0
+            && typeof requestedUrl === 'string'
+        ) {
+            // 大正文可能只在时间线留下截断预览，成功结果仍能证明请求地址已被读取
+            completion = completeAgentActivity(started, { url: requestedUrl });
+        }
+        activities.push(completion.activity);
+        for (const source of completion.sources) {
+            sources.set(source.id, source);
+        }
+    }
+    return { activities, sources: [...sources.values()] };
+}
+
+/** 将未知事件负载收窄成普通对象 */
+function recordValue (value: unknown): Record<string, unknown> | null {
+    return typeof value === 'object' && value !== null
+        ? value as Record<string, unknown>
+        : null;
 }
 
 /** 解析可选正整数查询参数 */

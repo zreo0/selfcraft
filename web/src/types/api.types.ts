@@ -51,10 +51,58 @@ export interface MessageMetadata {
     occurredAt: string;
 }
 
-/** Web 消息接收的短暂数据类型 */
+/** Agent 工具活动的执行状态 */
+export type AgentActivityState = 'running' | 'success' | 'error' | 'unknown';
+
+/** 网络搜索返回的一条候选结果 */
+export interface AgentSearchResultView {
+    /** 当前结果在活动中的稳定标识 */
+    id: string;
+    /** 页面标题 */
+    title: string;
+    /** 页面域名 */
+    domain?: string;
+    /** 页面地址 */
+    url: string;
+}
+
+/** Runtime 输出的一次可展示工具活动 */
+export interface AgentActivityView {
+    /** 工具调用标识 */
+    id: string;
+    /** 搜索或通用工具呈现 */
+    kind: 'search' | 'tool';
+    /** Runtime 工具名 */
+    toolName: string;
+    /** 面向用户的动作名称 */
+    label: string;
+    /** 不包含正文和凭证的目标摘要 */
+    target?: string;
+    /** 当前执行状态 */
+    state: AgentActivityState;
+    /** 执行耗时 */
+    durationMs?: number;
+    /** 网络搜索的有界候选结果 */
+    results?: AgentSearchResultView[];
+}
+
+/** 一轮回复中的 Agent 活动组 */
+export interface AgentActivityGroup {
+    /** 是否仍有活动在执行 */
+    status: 'working' | 'complete';
+    /** 按调用顺序排列的活动 */
+    items: AgentActivityView[];
+}
+
+/** Web 消息接收的结构化数据类型 */
 export interface MessageData extends Record<string, unknown> {
-    /** 当前运行状态 */
-    status: { label: string };
+    /** 不进入历史消息的短暂运行状态 */
+    status: {
+        phase: 'queued' | 'preparing' | 'thinking';
+        label: string;
+    };
+    /** 可持久重建的 Agent 活动 */
+    activity: AgentActivityGroup;
 }
 
 /** Selfcraft Web 的 AI SDK UI 消息 */

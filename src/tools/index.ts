@@ -181,14 +181,49 @@ function toTimelineValue (value: unknown): unknown {
         return '[无法序列化]';
     }
     const redacted = redactTimelineText(serialized);
-    if (redacted.length > 4000) {
-        return { preview: redacted.slice(0, 4000), truncated: true };
-    }
+    let parsed: unknown;
     try {
-        return JSON.parse(redacted) as unknown;
+        parsed = JSON.parse(redacted) as unknown;
     } catch {
         return redacted;
     }
+    if (redacted.length > 4000) {
+        return {
+            preview: redacted.slice(0, 4000),
+            truncated: true,
+            ...timelinePresentation(parsed),
+        };
+    }
+    return parsed;
+}
+
+/** 从截断结果中保留刷新后仍需展示的最小来源结构 */
+function timelinePresentation (value: unknown): Record<string, unknown> {
+    if (!value || typeof value !== 'object') {
+        return {};
+    }
+    const record = value as Record<string, unknown>;
+    const url = typeof record.url === 'string' ? record.url : undefined;
+    const results = Array.isArray(record.results)
+        ? record.results.flatMap(item => {
+            if (!item || typeof item !== 'object') {
+                return [];
+            }
+            const result = item as Record<string, unknown>;
+            if (typeof result.title !== 'string' || typeof result.url !== 'string') {
+                return [];
+            }
+            return [{
+                title: result.title,
+                url: result.url,
+                ...(typeof result.publishedAt === 'string' && { publishedAt: result.publishedAt }),
+            }];
+        }).slice(0, 5)
+        : [];
+    return {
+        ...(url && { url }),
+        ...(results.length > 0 && { results }),
+    };
 }
 
 /** 遮盖工具事件中的常见凭证形态 */

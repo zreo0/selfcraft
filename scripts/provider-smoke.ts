@@ -158,8 +158,10 @@ async function main (): Promise<void> {
             logger,
         );
         let reply = '';
-        await agent.run('创建 provider 验收文件', text => {
-            reply += text;
+        await agent.run('创建 provider 验收文件', event => {
+            if (event.type === 'text-delta') {
+                reply += event.delta;
+            }
         });
         if (
             reply !== 'SELFCRAFT_PROVIDER_OK' ||

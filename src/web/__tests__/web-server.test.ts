@@ -47,10 +47,44 @@ function createServer () {
     const scheduledTasks = new ScheduledTaskManager(paths.state, notifications, memory);
     const calls: string[] = [];
     const agent = new ForegroundRunner({
-        async run (input, onText, onStatus) {
+        async run (input, onEvent) {
             calls.push(input);
-            onStatus?.('使用工具 memory_recall');
-            onText('我记得。');
+            if (input === '触发失败') {
+                onEvent?.({
+                    type: 'activity',
+                    activity: {
+                        id: 'interrupted-call',
+                        kind: 'tool',
+                        toolName: 'read',
+                        label: '读取文件',
+                        state: 'running',
+                    },
+                });
+                throw new Error('模拟运行失败');
+            }
+            onEvent?.({ type: 'status', phase: 'thinking', label: '正在思考' });
+            onEvent?.({
+                type: 'activity',
+                activity: {
+                    id: 'memory-call',
+                    kind: 'tool',
+                    toolName: 'memory_recall',
+                    label: '回想过往',
+                    state: 'running',
+                },
+            });
+            onEvent?.({
+                type: 'activity',
+                activity: {
+                    id: 'memory-call',
+                    kind: 'tool',
+                    toolName: 'memory_recall',
+                    label: '回想过往',
+                    state: 'success',
+                    durationMs: 12,
+                },
+            });
+            onEvent?.({ type: 'text-delta', delta: '我记得。' });
             return { restartRequired: false };
         },
     });
@@ -127,6 +161,119 @@ describe('WebServer', () => {
         expect(serialized).not.toContain('credentialRef');
     });
 
+    test('刷新后从事件时间线重建工具活动和实际读取来源', async () => {
+        const { server, memory } = createServer();
+        const runId = 'run-web-research';
+        const user = memory.recordEvent({
+            actor: 'user',
+            type: 'user_message',
+            payload: { text: '查一下最新资料', channel: 'foreground' },
+            runId,
+        });
+        const searchCall = memory.recordEvent({
+            actor: 'agent',
+            type: 'tool_call',
+            payload: {
+                toolName: 'web_search',
+                toolCallId: 'search-1',
+                input: { query: 'Selfcraft agent' },
+            },
+            runId,
+            sourceEventId: user.id,
+        });
+        memory.recordEvent({
+            actor: 'tool:web_search',
+            type: 'tool_result',
+            payload: {
+                toolName: 'web_search',
+                toolCallId: 'search-1',
+                result: {
+                    results: [{
+                        title: 'Selfcraft 文档',
+                        url: 'https://example.com/selfcraft',
+                        snippet: '候选摘要',
+                    }],
+                },
+            },
+            runId,
+            sourceEventId: searchCall.id,
+        });
+        const fetchCall = memory.recordEvent({
+            actor: 'agent',
+            type: 'tool_call',
+            payload: {
+                toolName: 'web_fetch',
+                toolCallId: 'fetch-1',
+                input: { url: 'https://example.com/selfcraft' },
+            },
+            runId,
+            sourceEventId: user.id,
+        });
+        memory.recordEvent({
+            actor: 'tool:web_fetch',
+            type: 'tool_result',
+            payload: {
+                toolName: 'web_fetch',
+                toolCallId: 'fetch-1',
+                result: {
+                    preview: '过长的网页结果已被截断',
+                    truncated: true,
+                },
+            },
+            runId,
+            sourceEventId: fetchCall.id,
+        });
+        memory.recordEvent({
+            actor: 'agent',
+            type: 'tool_call',
+            payload: {
+                toolName: 'read',
+                toolCallId: 'missing-audit',
+                input: { path: 'notes/research.md' },
+            },
+            runId,
+            sourceEventId: user.id,
+        });
+        memory.recordEvent({
+            actor: 'agent',
+            type: 'assistant_message',
+            payload: { text: '这是查证后的回答', channel: 'foreground' },
+            runId,
+            sourceEventId: user.id,
+        });
+
+        const response = await server.fetch(new Request('http://selfcraft.local/api/bootstrap'));
+        const body = await response.json() as any;
+        const assistant = body.messages.items.find((item: any) => item.role === 'assistant');
+        const activity = assistant.parts.find((part: any) => part.type === 'data-activity');
+        const source = assistant.parts.find((part: any) => part.type === 'source-url');
+
+        expect(activity.data.status).toBe('complete');
+        expect(activity.data.items).toMatchObject([
+            {
+                id: 'search-1',
+                kind: 'search',
+                state: 'success',
+                results: [{ title: 'Selfcraft 文档', domain: 'example.com' }],
+            },
+            {
+                id: 'fetch-1',
+                kind: 'tool',
+                state: 'success',
+            },
+            {
+                id: 'missing-audit',
+                kind: 'tool',
+                state: 'unknown',
+            },
+        ]);
+        expect(source).toMatchObject({
+            sourceId: 'fetch-1:source',
+            url: 'https://example.com/selfcraft',
+            title: 'example.com',
+        });
+    });
+
     test('可通过同源 API 启用和关闭网络搜索且不返回凭证', async () => {
         const { server } = createServer();
 
@@ -192,7 +339,36 @@ describe('WebServer', () => {
         expect(stream).toContain('text-delta');
         expect(stream).toContain('我记得。');
         expect(stream).toContain('data-status');
+        expect(stream).toContain('data-activity');
+        expect(stream).toContain('回想过往');
         expect(calls).toEqual(['还记得吗？']);
+    });
+
+    test('运行失败时把未结束活动收口为失败终态', async () => {
+        const { server, config } = createServer();
+        config.addProvider({
+            providerId: 'default',
+            type: 'openai-compatible',
+            baseURL: 'http://127.0.0.1:3000/v1',
+            apiKey: 'not-a-real-credential',
+            models: {
+                assistant: { vision: false, contextWindow: 128000, maxOutputTokens: 4096 },
+            },
+        });
+        const response = await server.fetch(jsonRequest('/api/chat', 'POST', {
+            messages: [{
+                id: 'user-failed',
+                role: 'user',
+                parts: [{ type: 'text', text: '触发失败' }],
+            }],
+        }));
+        const stream = await response.text();
+
+        expect(response.status).toBe(200);
+        expect(stream).toContain('data-activity');
+        expect(stream).toContain('"status":"complete"');
+        expect(stream).toContain('"state":"error"');
+        expect(stream).toContain('回应没有完成');
     });
 
     test('拒绝跨站状态修改并为前端路由返回构建页面', async () => {
@@ -259,10 +435,17 @@ describe('WebServer', () => {
             expect((await client.disableWebAccess()).webAccess).toBeNull();
 
             const deltas: string[] = [];
-            const statuses: string[] = [];
-            await client.chat('来自 CLI 的消息', delta => deltas.push(delta), status => statuses.push(status));
+            const activities: string[] = [];
+            await client.chat('来自 CLI 的消息', event => {
+                if (event.type === 'text-delta') {
+                    deltas.push(event.delta);
+                }
+                if (event.type === 'activity') {
+                    activities.push(`${event.activity.label}:${event.activity.state}`);
+                }
+            });
             expect(deltas.join('')).toBe('我记得。');
-            expect(statuses).toContain('使用工具 memory_recall');
+            expect(activities).toEqual(['回想过往:running', '回想过往:success']);
             expect(calls).toEqual(['来自 CLI 的消息']);
 
             notifications.push('验收通知', '来自唯一 Runtime');

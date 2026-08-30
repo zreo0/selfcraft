@@ -13,6 +13,13 @@ import type { SkillRegistry } from '../skills/skill-registry';
 import type { ToolRuntimeContext } from '../tools';
 import { WEB_TOOL_NAMES } from '../tools/web-tools';
 import type { WorkspaceService } from '../workspace/workspace-service';
+import {
+    completeAgentActivity,
+    createAgentActivity,
+    failAgentActivity,
+    type AgentActivity,
+    type AgentRunEvent,
+} from './run-events';
 
 interface InstructionContext {
     /** 本轮绝对时间 */
@@ -69,18 +76,16 @@ export class AgentRuntime {
     ) {}
 
     /**
-     * 执行一轮对话并流式返回文本
+     * 执行一轮对话并输出统一的结构化运行事件
      *
      * @param input 用户输入
-     * @param onText 文本增量回调
-     * @param onStatus 工具执行状态回调
+     * @param onEvent 文本、状态、工具与来源事件回调
      * @param options 调用方取消信号等执行选项
      * @returns 是否需要 Supervisor 重启
      */
     public async run (
         input: string,
-        onText: (text: string) => void,
-        onStatus: (status: string) => void = () => undefined,
+        onEvent: (event: AgentRunEvent) => void = () => undefined,
         options: AgentRunOptions = {},
     ): Promise<AgentRunResult> {
         const runId = randomUUID();
@@ -111,6 +116,7 @@ export class AgentRuntime {
         };
         let active: ModelSnapshot | undefined;
         try {
+            onEvent({ type: 'status', phase: 'preparing', label: '正在整理上下文' });
             active = this.resolveModel();
             let snapshot = this.session.load();
             const reservedContext = this.buildInstructions('', input, instructionContext);
@@ -141,6 +147,7 @@ export class AgentRuntime {
                 modelId: active.modelId,
                 historyMessages: snapshot.messages.length,
             });
+            onEvent({ type: 'status', phase: 'thinking', label: '正在思考' });
             let execution;
             try {
                 execution = await this.executeAgent(
@@ -149,8 +156,7 @@ export class AgentRuntime {
                     instructions,
                     messages,
                     runtimeContext,
-                    onText,
-                    onStatus,
+                    onEvent,
                     options.signal,
                 );
             } catch (error) {
@@ -169,14 +175,14 @@ export class AgentRuntime {
                 this.logger.warn('模型拒绝过长上下文，已紧急裁剪并重试', {
                     retainedMessages: recovered.messages.length,
                 });
+                onEvent({ type: 'status', phase: 'preparing', label: '正在收拢上下文' });
                 execution = await this.executeAgent(
                     'selfcraft-main-recovery',
                     active,
                     this.buildInstructions(recovered.summary, input, instructionContext),
                     recovered.messages,
                     runtimeContext,
-                    onText,
-                    onStatus,
+                    onEvent,
                     options.signal,
                 );
             }
@@ -287,8 +293,7 @@ export class AgentRuntime {
                 instructions,
                 [{ role: 'user', content: prompt }],
                 runtimeContext,
-                onLog,
-                status => onLog(`\n[${status}]\n`),
+                event => writeBackgroundEvent(event, onLog),
                 signal,
             );
             this.memory.recordEvent({
@@ -381,18 +386,18 @@ export class AgentRuntime {
         ].join('\n');
     }
 
-    /** 执行一次可复用的 AI SDK 工具循环 */
+    /** 执行一次可复用并输出结构化事件的 AI SDK 工具循环 */
     private async executeAgent (
         id: string,
         active: ModelSnapshot,
         instructions: string,
         messages: ModelMessage[],
         runtimeContext: ToolRuntimeContext,
-        onText: (text: string) => void,
-        onStatus: (status: string) => void,
+        onEvent: (event: AgentRunEvent) => void,
         abortSignal?: AbortSignal,
     ): Promise<{ text: string, responseMessages: ModelMessage[] }> {
         const tools = this.getAvailableTools();
+        const activities = new Map<string, AgentActivity>();
         const agent = new ToolLoopAgent<
             never,
             Record<string, Tool<any, any, ToolRuntimeContext>>,
@@ -412,7 +417,33 @@ export class AgentRuntime {
             abortSignal,
             onToolExecutionStart: ({ toolCall }) => {
                 this.logger.info('Tool execution started', { toolName: toolCall.toolName });
-                onStatus(`使用工具 ${toolCall.toolName}`);
+                const activity = createAgentActivity(
+                    toolCall.toolName,
+                    toolCall.toolCallId,
+                    toolCall.input,
+                );
+                activities.set(toolCall.toolCallId, activity);
+                onEvent({ type: 'activity', activity });
+            },
+            onToolExecutionEnd: ({ toolCall, toolOutput, toolExecutionMs }) => {
+                const activity = activities.get(toolCall.toolCallId)
+                    || createAgentActivity(toolCall.toolName, toolCall.toolCallId, toolCall.input);
+                if (toolOutput.type === 'tool-result') {
+                    const completion = completeAgentActivity(
+                        activity,
+                        toolOutput.output,
+                        toolExecutionMs,
+                    );
+                    activities.set(toolCall.toolCallId, completion.activity);
+                    onEvent({ type: 'activity', activity: completion.activity });
+                    for (const source of completion.sources) {
+                        onEvent({ type: 'source', source });
+                    }
+                    return;
+                }
+                const failed = failAgentActivity(activity, toolExecutionMs);
+                activities.set(toolCall.toolCallId, failed);
+                onEvent({ type: 'activity', activity: failed });
             },
             onStepEnd: ({ toolCalls, usage }) => {
                 this.logger.info('Agent step finished', {
@@ -426,7 +457,7 @@ export class AgentRuntime {
         let text = '';
         for await (const delta of result.textStream) {
             text += delta;
-            onText(delta);
+            onEvent({ type: 'text-delta', delta });
         }
         return {
             text,
@@ -461,6 +492,22 @@ export class AgentRuntime {
             && [...WEB_TOOL_NAMES].every(name => name in this.tools);
     }
 
+}
+
+/** 将统一运行事件压缩成后台任务日志 */
+function writeBackgroundEvent (event: AgentRunEvent, onLog: (text: string) => void): void {
+    if (event.type === 'text-delta') {
+        onLog(event.delta);
+        return;
+    }
+    if (event.type === 'status') {
+        onLog(`\n[${event.label}]\n`);
+        return;
+    }
+    if (event.type === 'activity' && event.activity.state === 'running') {
+        const target = event.activity.target ? ` · ${event.activity.target}` : '';
+        onLog(`\n[${event.activity.label}${target}]\n`);
+    }
 }
 
 /** 在失败事件与 Reflection 输入中遮盖常见凭证形态 */

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { DefaultChatTransport, type UIMessageChunk } from 'ai';
+import type { AgentActivity, AgentRunEvent } from '../agent/run-events';
 import type { AddProviderInput, ActiveModelConfig, ModelConfig, ProviderType } from '../config/types';
 import type { JobRecord } from '../job/job-manager';
 import type { GrowthProposal, MemoryItem, TopicRecord } from '../memory/memory-store';
@@ -129,11 +130,10 @@ export class RuntimeClient {
         });
     }
 
-    /** 向 Runtime 发送一轮对话并消费 AI SDK UI Message Stream */
+    /** 向 Runtime 发送一轮对话并还原统一的结构化运行事件 */
     public async chat (
         input: string,
-        onText: (delta: string) => void,
-        onStatus?: (status: string) => void,
+        onEvent: (event: AgentRunEvent) => void,
         signal?: AbortSignal,
     ): Promise<void> {
         const transport = new DefaultChatTransport<SelfcraftUIMessage>({
@@ -152,12 +152,13 @@ export class RuntimeClient {
             abortSignal: signal,
         });
         const reader = stream.getReader();
+        const activityStates = new Map<string, string>();
         while (true) {
             const result = await reader.read();
             if (result.done) {
                 return;
             }
-            this.consumeChatChunk(result.value, onText, onStatus);
+            this.consumeChatChunk(result.value, onEvent, activityStates);
         }
     }
 
@@ -224,24 +225,60 @@ export class RuntimeClient {
         await this.request('/api/notifications', { method: 'DELETE', body: '{}' });
     }
 
-    /** 把一段聊天流交给 CLI 展示回调 */
+    /** 把 AI SDK 消息块还原成与 Runtime 一致的结构化事件 */
     private consumeChatChunk (
         chunk: UIMessageChunk,
-        onText: (delta: string) => void,
-        onStatus?: (status: string) => void,
+        onEvent: (event: AgentRunEvent) => void,
+        activityStates: Map<string, string>,
     ): void {
         if (chunk.type === 'text-delta') {
-            onText(chunk.delta);
+            onEvent({ type: 'text-delta', delta: chunk.delta });
             return;
         }
         if (chunk.type === 'error') {
             throw new Error(chunk.errorText);
         }
         if (chunk.type === 'data-status') {
-            const data = chunk.data as { label?: unknown };
-            if (typeof data.label === 'string') {
-                onStatus?.(data.label);
+            const data = chunk.data as { phase?: unknown, label?: unknown };
+            if (
+                ['queued', 'preparing', 'thinking'].includes(String(data.phase))
+                && typeof data.label === 'string'
+            ) {
+                onEvent({
+                    type: 'status',
+                    phase: data.phase as 'queued' | 'preparing' | 'thinking',
+                    label: data.label,
+                });
             }
+            return;
+        }
+        if (chunk.type === 'data-activity') {
+            const data = chunk.data as { items?: unknown };
+            if (!Array.isArray(data.items)) {
+                return;
+            }
+            for (const item of data.items) {
+                if (!isAgentActivity(item)) {
+                    continue;
+                }
+                const state = JSON.stringify(item);
+                if (activityStates.get(item.id) === state) {
+                    continue;
+                }
+                activityStates.set(item.id, state);
+                onEvent({ type: 'activity', activity: item });
+            }
+            return;
+        }
+        if (chunk.type === 'source-url') {
+            onEvent({
+                type: 'source',
+                source: {
+                    id: chunk.sourceId,
+                    url: chunk.url,
+                    title: chunk.title || sourceTitle(chunk.url),
+                },
+            });
         }
     }
 
@@ -269,5 +306,27 @@ export class RuntimeClient {
             throw new Error(message || `Runtime 请求失败（HTTP ${response.status}）`);
         }
         return await response.json() as T;
+    }
+}
+
+/** 判断网络消息是否是完整的工具活动 */
+function isAgentActivity (value: unknown): value is AgentActivity {
+    if (!value || typeof value !== 'object') {
+        return false;
+    }
+    const item = value as Partial<AgentActivity>;
+    return typeof item.id === 'string'
+        && (item.kind === 'search' || item.kind === 'tool')
+        && typeof item.toolName === 'string'
+        && typeof item.label === 'string'
+        && ['running', 'success', 'error', 'unknown'].includes(String(item.state));
+}
+
+/** 从来源地址生成没有标题时的可读名称 */
+function sourceTitle (value: string): string {
+    try {
+        return new URL(value).hostname.replace(/^www\./, '') || value;
+    } catch {
+        return value;
     }
 }

@@ -150,4 +150,62 @@ describe('tool timeline', () => {
         })).rejects.toThrow('真实工具失败');
         expect(memory.events.map(event => event.type)).toEqual(['tool_call']);
     });
+
+    test('截断搜索结果仍保留刷新展示所需的候选来源', async () => {
+        const root = createTemporaryDirectory();
+        const memory = new MemoryStore(path.join(root, 'state.sqlite'));
+        const source = memory.recordEvent({
+            actor: 'user',
+            type: 'user_message',
+            payload: { text: '搜索资料' },
+            runId: 'run-large-search',
+        });
+        const tools = createTools(
+            root,
+            {} as never,
+            {} as never,
+            {} as never,
+            {} as never,
+            memory,
+            undefined,
+            {
+                async search (input) {
+                    return {
+                        provider: 'test',
+                        query: input.query,
+                        searchedAt: new Date().toISOString(),
+                        results: Array.from({ length: 5 }, (_, index) => ({
+                            title: `候选 ${index + 1}`,
+                            url: `https://example.com/${index + 1}`,
+                            snippet: 'x'.repeat(800),
+                        })),
+                    };
+                },
+                async fetchPage () {
+                    throw new Error('本测试不会读取网页');
+                },
+            },
+        );
+
+        await tools.web_search.execute!({ query: '测试候选' }, {
+            toolCallId: 'large-search',
+            messages: [],
+            context: {
+                runId: 'run-large-search',
+                sourceEventId: source.id,
+                timezone: 'Asia/Shanghai',
+                channel: 'foreground',
+            },
+        });
+
+        const resultEvent = memory.listEventsByRun('run-large-search')
+            .find(event => event.type === 'tool_result');
+        const result = (resultEvent?.payload as { result?: Record<string, unknown> })?.result;
+        expect(result?.truncated).toBeTrue();
+        expect(result?.results).toEqual(Array.from({ length: 5 }, (_, index) => ({
+            title: `候选 ${index + 1}`,
+            url: `https://example.com/${index + 1}`,
+        })));
+        expect((result?.results as Array<Record<string, unknown>>)[0]?.snippet).toBeUndefined();
+    });
 });

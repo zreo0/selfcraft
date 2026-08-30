@@ -148,12 +148,25 @@ describe('AgentRuntime', () => {
             }),
         );
         let response = '';
+        const activities: Array<{ toolName: string, state: string }> = [];
 
-        await agent.run('到 2099 年 9 月 1 日上午九点提醒我准备材料', text => {
-            response += text;
+        await agent.run('到 2099 年 9 月 1 日上午九点提醒我准备材料', event => {
+            if (event.type === 'text-delta') {
+                response += event.delta;
+            }
+            if (event.type === 'activity') {
+                activities.push({
+                    toolName: event.activity.toolName,
+                    state: event.activity.state,
+                });
+            }
         });
 
         expect(response).toBe('完成');
+        expect(activities).toEqual([
+            { toolName: 'task_schedule', state: 'running' },
+            { toolName: 'task_schedule', state: 'success' },
+        ]);
         expect(scheduledTasks.list()).toHaveLength(1);
         expect(scheduledTasks.list()[0]).toMatchObject({
             title: '准备材料',

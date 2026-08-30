@@ -1,7 +1,7 @@
 // Source adapted from https://beui.dev/r/message/raw
 import { motion, useReducedMotion, type HTMLMotionProps } from 'motion/react';
 import { createContext, memo, useContext, type ComponentPropsWithoutRef, type ReactNode } from 'react';
-import Markdown from 'react-markdown';
+import Markdown, { type ExtraProps } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from '@/lib/utils';
 
@@ -104,6 +104,20 @@ export function MessageHeader ({ className, ...props }: ComponentPropsWithoutRef
     );
 }
 
+/** 将 Markdown 表格包在可横向滚动的语义区域中 */
+function MarkdownTable ({ node: _node, ...props }: ComponentPropsWithoutRef<'table'> & ExtraProps) {
+    return (
+        <div
+            aria-label="消息中的表格"
+            className="message-table-region"
+            role="region"
+            tabIndex={0}
+        >
+            <table {...props} />
+        </div>
+    );
+}
+
 /** 将 Agent Markdown 回复渲染为稳定的消息正文 */
 export const MessageResponse = memo(function MessageResponse ({
     children,
@@ -111,12 +125,10 @@ export const MessageResponse = memo(function MessageResponse ({
 }: {
     children: string;
     className?: string;
-    animated?: boolean;
-    isAnimating?: boolean;
 }) {
     return (
         <div className={cn('message-response max-w-none text-pretty', className)}>
-            <Markdown remarkPlugins={[remarkGfm]}>{children}</Markdown>
+            <Markdown components={{ table: MarkdownTable }} remarkPlugins={[remarkGfm]}>{children}</Markdown>
         </div>
     );
 });

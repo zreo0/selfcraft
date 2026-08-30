@@ -26,8 +26,12 @@ describe('ForegroundRunner', () => {
         });
         const statuses: string[] = [];
 
-        const cli = runner.run('cli', () => undefined);
-        const web = runner.run('web', () => undefined, status => statuses.push(status));
+        const cli = runner.run('cli');
+        const web = runner.run('web', event => {
+            if (event.type === 'status') {
+                statuses.push(event.label);
+            }
+        });
         await Bun.sleep(0);
 
         expect(order).toEqual(['start:cli']);
@@ -53,8 +57,8 @@ describe('ForegroundRunner', () => {
         });
         const controller = new AbortController();
 
-        const running = runner.run('first', () => undefined);
-        const cancelled = runner.run('cancelled', () => undefined, () => undefined, {
+        const running = runner.run('first');
+        const cancelled = runner.run('cancelled', () => undefined, {
             signal: controller.signal,
         });
         controller.abort();
