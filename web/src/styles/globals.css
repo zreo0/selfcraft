@@ -520,11 +520,7 @@ button {
 
 .message-user-surface {
     max-width: min(88%, 34rem);
-    border-radius: 1.35rem 1.35rem 0.38rem 1.35rem;
-    background: var(--user-message);
-    padding: 0.75rem 1rem;
     box-shadow: 0 14px 30px -24px var(--shadow);
-    color: var(--foreground);
     font-size: 0.96rem;
     line-height: 1.75;
 }
@@ -647,7 +643,6 @@ button {
 .message-response {
     width: 100%;
     min-width: 0;
-    max-width: 70ch;
     color: var(--foreground);
     font-size: 0.96rem;
     line-height: 1.78;
@@ -659,7 +654,7 @@ button {
 }
 
 .agent-disclosure {
-    width: min(100%, 42rem);
+    width: 100%;
     overflow: hidden;
     border-radius: 0.9rem;
     background: color-mix(in oklab, var(--card) 72%, transparent);
@@ -862,17 +857,24 @@ button {
 }
 
 .response-footer {
-    display: flex;
-    max-width: 70ch;
+    display: grid;
+    width: 100%;
+    grid-template-columns: auto minmax(0, 1fr);
     align-items: flex-start;
-    justify-content: space-between;
-    gap: 1rem;
+    justify-content: start;
+    gap: 0.2rem;
     margin-top: 0.85rem;
     padding-top: 0.55rem;
     border-top: 1px solid var(--border);
 }
 
-.response-footer > button {
+.response-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.2rem;
+}
+
+.response-actions > button {
     display: inline-flex;
     height: 1.8rem;
     flex: 0 0 auto;
@@ -882,31 +884,31 @@ button {
     border: 0;
     border-radius: 0.48rem;
     background: transparent;
-    color: var(--muted-foreground);
-    font-size: 0.66rem;
+    color: color-mix(in oklab, var(--foreground) 68%, transparent);
+    font-size: 0.7rem;
+    font-weight: 600;
     cursor: pointer;
     outline: none;
     transition: background-color 160ms ease-out, color 160ms ease-out;
 }
 
-.response-footer > button:hover {
+.response-actions > button:hover {
     background: var(--muted);
     color: var(--foreground);
 }
 
-.response-footer > button:focus-visible {
+.response-actions > button:focus-visible {
     box-shadow: 0 0 0 2px var(--ring);
 }
 
-.response-footer > button svg {
+.response-actions > button svg {
     width: 0.72rem;
     height: 0.72rem;
 }
 
 .citations {
-    width: auto;
+    width: 100%;
     min-width: 0;
-    flex: 1;
     border: 0;
     border-radius: 0;
     background: transparent;

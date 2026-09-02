@@ -8,6 +8,11 @@ import {
     MessageHeader,
     MessageResponse,
 } from '@/components/agents/message';
+import {
+    MessageBubble,
+    MessageBubbleCollapsible,
+    MessageBubbleContent,
+} from '@/components/agents/message-bubble';
 import { AgentActivity } from '@/components/agents/agent-activity';
 import { ThinkingShimmer } from '@/components/agents/loading-states/thinking-shimmer';
 import { MessageScroller } from '@/components/agents/message-scroller';
@@ -227,7 +232,7 @@ export function ChatView ({
                 <MessageScroller
                     busy={generating}
                     className="h-full"
-                    contentClassName="mx-auto flex w-full max-w-3xl flex-col gap-8 px-5 py-8 sm:px-8 sm:py-12"
+                    contentClassName="mx-auto flex w-full max-w-4xl flex-col gap-8 px-5 py-8 sm:px-8 sm:py-12"
                     onFollowChange={setFollowing}
                     viewportRef={scrollerRef}
                 >
@@ -261,8 +266,9 @@ export function ChatView ({
                         const messageIsStreaming = message.id === pendingAssistantId;
                         const showThinking = messageIsStreaming && !text && !activity;
                         const occurredAt = messageTime(message);
+                        const animateIn = message.id === lastMessageId && generating;
                         return (
-                            <Message animateIn={message.id === lastMessageId && generating} from={from} key={message.id}>
+                            <Message animateIn={animateIn && from === 'assistant'} from={from} key={message.id}>
                                 <MessageContent>
                                     <MessageHeader>
                                         {from === 'assistant' && <span className="assistant-mark"><img alt="" src={BRAND_IMAGE_PATH} /></span>}
@@ -288,7 +294,13 @@ export function ChatView ({
                                             )}
                                         </div>
                                     ) : (
-                                        <p className="message-user-surface whitespace-pre-wrap">{text}</p>
+                                        <MessageBubble align="end" animateIn={animateIn} variant="tint">
+                                            <MessageBubbleContent className="message-user-surface">
+                                                <MessageBubbleCollapsible collapsedLines={5}>
+                                                    <p className="whitespace-pre-wrap">{text}</p>
+                                                </MessageBubbleCollapsible>
+                                            </MessageBubbleContent>
+                                        </MessageBubble>
                                     )}
                                 </MessageContent>
                             </Message>
@@ -326,7 +338,7 @@ export function ChatView ({
             </div>
 
             <div className="composer-dock">
-                <div className="mx-auto w-full max-w-3xl">
+                <div className="mx-auto w-full max-w-4xl px-2.5 sm:px-8">
                     <PromptInput
                         aria-label="输入消息"
                         disabled={!config?.configured}

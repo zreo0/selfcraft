@@ -327,5 +327,6 @@ describe('AgentRuntime', () => {
         expect(toolNames[1]).toContain('web_fetch');
         expect(JSON.stringify(model.doStreamCalls[0].prompt)).toContain('当前没有配置网络访问');
         expect(JSON.stringify(model.doStreamCalls[1].prompt)).toContain('不得只根据搜索摘要作答');
+        expect(JSON.stringify(model.doStreamCalls[1].prompt)).toContain('正文结尾不要再生成');
     });
 });
