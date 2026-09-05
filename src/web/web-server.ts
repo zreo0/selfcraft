@@ -27,6 +27,7 @@ import type { SkillRegistry } from '../skills/skill-registry';
 import type { ScheduledTaskManager } from '../task/scheduled-task-manager';
 
 const chatRequestSchema = z.object({
+    trigger: z.enum(['submit-message', 'regenerate-message']).optional(),
     messages: z.array(z.object({
         role: z.enum(['system', 'user', 'assistant']),
         parts: z.array(z.unknown()),
@@ -474,7 +475,10 @@ export class WebServer {
                     const result = await this.dependencies.agent.run(
                         input,
                         writeEvent,
-                        { signal: request.signal },
+                        {
+                            signal: request.signal,
+                            retry: body.trigger === 'regenerate-message',
+                        },
                     );
                     restartRequired = result.restartRequired;
                     if (activities.size > 0) {

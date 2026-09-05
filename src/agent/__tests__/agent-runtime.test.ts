@@ -124,6 +124,8 @@ describe('AgentRuntime', () => {
             evolution,
             memory,
             {
+                beginAgentActivity: () => undefined,
+                endAgentActivity: () => undefined,
                 enqueue: input => {
                     reflections.push(input);
                     return 'reflection-test';
@@ -202,7 +204,7 @@ describe('AgentRuntime', () => {
         });
     });
 
-    test('模型失败仍保留用户事件、失败事件和可追溯 Reflection', async () => {
+    test('模型失败保留证据，安全重试不会复制用户消息', async () => {
         setSystemTime(new Date('2026-08-29T16:30:00.000Z'));
         const root = createTemporaryDirectory();
         const paths = resolvePaths('development', path.join(root, 'home'));
@@ -214,16 +216,35 @@ describe('AgentRuntime', () => {
         const logger = new Logger(paths.logs);
         const memory = new MemoryStore(paths.state);
         const reflections: ReflectionInput[] = [];
+        let attempts = 0;
         const model = new MockLanguageModelV4({
             doStream: async () => {
-                throw new Error('model unavailable');
+                attempts += 1;
+                if (attempts === 1) {
+                    throw new Error('model unavailable');
+                }
+                return {
+                    stream: simulateReadableStream({
+                        chunks: [
+                            { type: 'text-start', id: 'retry-text' },
+                            { type: 'text-delta', id: 'retry-text', delta: '这次接住了。' },
+                            { type: 'text-end', id: 'retry-text' },
+                            {
+                                type: 'finish',
+                                finishReason: { unified: 'stop', raw: undefined },
+                                usage: usage(),
+                            },
+                        ] as any,
+                    }),
+                };
             },
         });
+        const session = new SessionStore(paths.sessions);
         const agent = new AgentRuntime(
             config,
             workspace,
             new SkillRegistry(path.join(paths.workspace, 'skills')),
-            new SessionStore(paths.sessions),
+            session,
             new ContextManager(),
             new EvolutionService(
                 paths,
@@ -232,6 +253,8 @@ describe('AgentRuntime', () => {
             ),
             memory,
             {
+                beginAgentActivity: () => undefined,
+                endAgentActivity: () => undefined,
                 enqueue: input => {
                     reflections.push(input);
                     return 'reflection-failed';
@@ -262,6 +285,19 @@ describe('AgentRuntime', () => {
             outcome: 'failed',
             error: 'model unavailable',
         });
+
+        await agent.run('不要丢掉这条输入', () => undefined, { retry: true });
+
+        expect(session.load().messages.map(message => message.role)).toEqual(['user', 'assistant']);
+        expect(memory.listConversationEvents().map(event => event.type)).toEqual([
+            'user_message',
+            'assistant_message',
+        ]);
+        expect(reflections).toHaveLength(2);
+        expect(memory.listEventsByRun(reflections[1].runId).map(event => event.type)).toEqual([
+            'run_retry_started',
+            'assistant_message',
+        ]);
     });
 
     test('网络工具随配置在同一个 Runtime 中按轮次显隐', async () => {
@@ -297,7 +333,11 @@ describe('AgentRuntime', () => {
             new ContextManager(),
             new EvolutionService(paths, new ReleaseStore(paths.supervisor, paths.evolution), logger),
             memory,
-            { enqueue: () => 'reflection-web-tools' },
+            {
+                beginAgentActivity: () => undefined,
+                endAgentActivity: () => undefined,
+                enqueue: () => 'reflection-web-tools',
+            },
             createWebTools({
                 async search () {
                     throw new Error('本测试不会执行工具');

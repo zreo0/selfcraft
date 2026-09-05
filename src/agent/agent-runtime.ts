@@ -5,7 +5,7 @@ import type { ContextManager } from '../context/context-manager';
 import type { EvolutionService } from '../evolution/evolution-service';
 import type { AgentJobPayload, JobRecord } from '../job/job-manager';
 import type { Logger } from '../logging/logger';
-import type { MemoryStore } from '../memory/memory-store';
+import type { EventRecord, MemoryStore } from '../memory/memory-store';
 import type { ReflectionWorker } from '../memory/reflection-worker';
 import { ModelFactory, type ModelSnapshot } from '../model/model-factory';
 import type { SessionStore } from '../session/session-store';
@@ -36,6 +36,8 @@ interface InstructionContext {
 export interface AgentRunOptions {
     /** 调用方取消本轮生成时使用的信号 */
     signal?: AbortSignal;
+    /** 是否重试最后一轮尚未执行工具的失败对话 */
+    retry?: boolean;
 }
 
 /** 一轮前台对话的执行结果 */
@@ -69,7 +71,10 @@ export class AgentRuntime {
         private readonly context: ContextManager,
         private readonly evolution: EvolutionService,
         private readonly memory: MemoryStore,
-        private readonly reflection: Pick<ReflectionWorker, 'enqueue'>,
+        private readonly reflection: Pick<
+            ReflectionWorker,
+            'enqueue' | 'beginAgentActivity' | 'endAgentActivity'
+        >,
         private readonly tools: Record<string, Tool<any, any, ToolRuntimeContext>>,
         private readonly logger: Logger,
         private readonly resolveModel: () => ModelSnapshot = () => ModelFactory.create(this.config),
@@ -91,17 +96,32 @@ export class AgentRuntime {
         const runId = randomUUID();
         const now = new Date().toISOString();
         const timezone = this.config.read().timezone;
-        const userEvent = this.memory.recordEvent({
-            actor: 'user',
-            type: 'user_message',
-            payload: { text: input, channel: 'foreground' },
-            occurredFrom: now,
-            recordedAt: now,
-            precision: 'instant',
-            timezone,
-            runId,
-            idempotencyKey: `run:${runId}:user`,
-        });
+        let snapshot = this.session.load();
+        const retrySource = options.retry ? this.resolveRetrySource(input, snapshot.messages) : null;
+        const userEvent = retrySource
+            ? this.memory.recordEvent({
+                actor: 'system',
+                type: 'run_retry_started',
+                payload: { text: input, channel: 'foreground', retryOf: retrySource.runId },
+                occurredFrom: now,
+                recordedAt: now,
+                precision: 'instant',
+                timezone,
+                runId,
+                sourceEventId: retrySource.id,
+                idempotencyKey: `run:${runId}:retry`,
+            })
+            : this.memory.recordEvent({
+                actor: 'user',
+                type: 'user_message',
+                payload: { text: input, channel: 'foreground' },
+                occurredFrom: now,
+                recordedAt: now,
+                precision: 'instant',
+                timezone,
+                runId,
+                idempotencyKey: `run:${runId}:user`,
+            });
         const instructionContext: InstructionContext = {
             now,
             timezone,
@@ -115,10 +135,10 @@ export class AgentRuntime {
             channel: 'foreground',
         };
         let active: ModelSnapshot | undefined;
+        this.reflection.beginAgentActivity();
         try {
             onEvent({ type: 'status', phase: 'preparing', label: '正在整理上下文' });
             active = this.resolveModel();
-            let snapshot = this.session.load();
             const reservedContext = this.buildInstructions('', input, instructionContext);
             try {
                 const compacted = await this.context.compactIfNeeded(
@@ -138,8 +158,10 @@ export class AgentRuntime {
                 });
             }
             const userMessage: ModelMessage = { role: 'user', content: input };
-            this.session.append(userMessage);
-            let messages = [...snapshot.messages, userMessage];
+            if (!retrySource) {
+                this.session.append(userMessage);
+            }
+            let messages = retrySource ? [...snapshot.messages] : [...snapshot.messages, userMessage];
             const instructions = this.buildInstructions(snapshot.summary, input, instructionContext);
             this.logger.info('Agent run started', {
                 runId,
@@ -231,7 +253,39 @@ export class AgentRuntime {
                 error: message,
             });
             throw error;
+        } finally {
+            this.reflection.endAgentActivity();
         }
+    }
+
+    /**
+     * 校验重试仍对应最后一轮失败输入，且旧运行没有产生工具副作用
+     *
+     * @param input 准备重试的用户输入
+     * @param messages 当前持久会话
+     * @returns 原始用户事件
+     */
+    private resolveRetrySource (input: string, messages: ModelMessage[]): EventRecord {
+        const lastMessage = messages.at(-1);
+        const lastEvent = this.memory.listConversationEvents(1).at(-1);
+        const eventText = (lastEvent?.payload as { text?: unknown } | null)?.text;
+        if (
+            lastMessage?.role !== 'user'
+            || lastMessage.content !== input
+            || lastEvent?.type !== 'user_message'
+            || eventText !== input
+            || !lastEvent.runId
+        ) {
+            throw new Error('最后一轮对话已经变化，请重新发送消息');
+        }
+        const runEvents = this.memory.listInteractionRunEvents(lastEvent.id);
+        if (!runEvents.some(event => event.type === 'run_failed')) {
+            throw new Error('最后一轮对话没有失败，无需重试');
+        }
+        if (runEvents.some(event => event.type === 'tool_call')) {
+            throw new Error('这轮已经执行过操作，请确认结果后重新发送');
+        }
+        return lastEvent;
     }
 
     /**
@@ -285,6 +339,7 @@ export class AgentRuntime {
             '这是独立后台任务。持续执行到可验证终点，把重要进度和最终结果写入输出。',
             '</background-job>',
         ].join('\n');
+        this.reflection.beginAgentActivity();
         try {
             const active = this.resolveModel();
             const execution = await this.executeAgent(
@@ -331,6 +386,8 @@ export class AgentRuntime {
                 error: redactRuntimeText(message),
             });
             throw error;
+        } finally {
+            this.reflection.endAgentActivity();
         }
     }
 

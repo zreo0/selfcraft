@@ -75,7 +75,11 @@ async function main (): Promise<void> {
             new ContextManager(),
             evolution,
             memory,
-            { enqueue: () => 'smoke-reflection' },
+            {
+                beginAgentActivity: () => undefined,
+                endAgentActivity: () => undefined,
+                enqueue: () => 'smoke-reflection',
+            },
             tools,
             logger,
         );

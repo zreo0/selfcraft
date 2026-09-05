@@ -118,6 +118,7 @@ export function ChatView ({
         error,
         stop,
         clearError,
+        regenerate,
     } = useChat<SelfcraftMessage>({
         transport: chatTransport,
         onData: part => {
@@ -200,6 +201,16 @@ export function ChatView ({
         });
     }
 
+    /** 重新执行最后一轮失败响应，同时保留用户原始输入 */
+    function handleRetry (): void {
+        if (generating) {
+            return;
+        }
+        clearError();
+        setStatusText('再想一次');
+        void regenerate();
+    }
+
     /** 向时间线前方加载一页历史消息 */
     async function handleLoadEarlier (): Promise<void> {
         if (!nextCursor || loadingHistory) {
@@ -267,6 +278,9 @@ export function ChatView ({
                         const showThinking = messageIsStreaming && !text && !activity;
                         const occurredAt = messageTime(message);
                         const animateIn = message.id === lastMessageId && generating;
+                        if (from === 'assistant' && !text && !activity && !messageIsStreaming) {
+                            return null;
+                        }
                         return (
                             <Message animateIn={animateIn && from === 'assistant'} from={from} key={message.id}>
                                 <MessageContent>
@@ -318,8 +332,13 @@ export function ChatView ({
                     )}
                     {error && (
                         <div className="chat-error" role="alert">
-                            <strong>这次回应没有完成</strong>
-                            <p>{error.message}</p>
+                            <div className="chat-error-copy">
+                                <strong>这次回应没有完成</strong>
+                                <p>{error.message}</p>
+                            </div>
+                            <Button onClick={handleRetry} size="sm" type="button" variant="outline">
+                                <RotateCcw aria-hidden="true" className="size-3.5" />再试一次
+                            </Button>
                         </div>
                     )}
                 </MessageScroller>

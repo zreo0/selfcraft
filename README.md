@@ -170,7 +170,7 @@ Task ──到期──> Notification + Event
 
 `transcript.jsonl` 仍保存模型会话原文；`context.json` 和会话摘要只是可重建的工作缓存，不是事实来源。
 
-用户明确要求“记住”时，Agent 使用 `memory_remember` 写入 active Memory；普通对话结束后进入持久 Reflection 队列，由当前模型异步提取 candidate：
+用户明确要求“记住”时，Agent 使用 `memory_remember` 写入 active Memory；普通对话结束后只进入持久 Reflection 队列。Runtime 在所有 Agent 工作结束并持续空闲一分钟后，才把尚未回看的连续经历合并为一次 Reflection，由当前模型提取 candidate；如果用户或后台 Agent 在反思期间开始工作，Reflection 会主动中断、放回队列，等下一次空闲继续：
 
 - 身份、事实、偏好、关系、决定和经验教训
 - 可复用技能的改进候选

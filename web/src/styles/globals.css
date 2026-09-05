@@ -1005,6 +1005,17 @@ button {
     line-height: 1.55;
 }
 
+.chat-error {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+}
+
+.chat-error-copy {
+    min-width: 0;
+}
+
 .chat-error p,
 .configuration-error p {
     margin-top: 0.25rem;

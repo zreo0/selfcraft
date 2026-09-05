@@ -153,7 +153,11 @@ async function main (): Promise<void> {
             new ContextManager(),
             evolution,
             memory,
-            { enqueue: () => 'provider-smoke-reflection' },
+            {
+                beginAgentActivity: () => undefined,
+                endAgentActivity: () => undefined,
+                enqueue: () => 'provider-smoke-reflection',
+            },
             createTools(paths.workspace, skills, notifications, evolution, jobs, memory),
             logger,
         );

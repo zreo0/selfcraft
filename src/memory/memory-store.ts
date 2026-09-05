@@ -193,6 +193,8 @@ export interface GrowthCandidate {
     evidence: string;
     /** 候选成立的可信度 */
     confidence: number;
+    /** 支撑该候选的原始事件 */
+    sourceEventIds?: string[];
 }
 
 /** 一次 Reflection 的结构化结果 */
@@ -395,6 +397,25 @@ export class MemoryStore {
         const rows = this.database.query(`
             SELECT * FROM events WHERE run_id = ? ORDER BY seq ASC
         `).all(requireText(runId, '运行标识')) as EventRow[];
+        return rows.map(row => this.toEventRecord(row));
+    }
+
+    /**
+     * 读取一次用户交互及所有直接重试运行产生的事件
+     *
+     * @param sourceEventId 原始用户事件标识
+     * @returns 原始运行与重试运行的完整事件序列
+     */
+    public listInteractionRunEvents (sourceEventId: string): EventRecord[] {
+        const sourceId = requireText(sourceEventId, '交互来源事件');
+        const rows = this.database.query(`
+            SELECT * FROM events
+            WHERE run_id IN (
+                SELECT DISTINCT run_id FROM events
+                WHERE (id = ? OR source_event_id = ?) AND run_id IS NOT NULL
+            )
+            ORDER BY seq ASC
+        `).all(sourceId, sourceId) as EventRow[];
         return rows.map(row => this.toEventRecord(row));
     }
 
@@ -867,24 +888,37 @@ export class MemoryStore {
      * @returns 当前队列项，队列为空时返回 null
      */
     public claimReflection (): ReflectionJob | null {
+        return this.claimReflections(1)[0] || null;
+    }
+
+    /**
+     * 原子领取一批待处理 Reflection
+     *
+     * @param limit 单次空闲回看的最大运行数
+     * @returns 按入队时间排序的队列项
+     */
+    public claimReflections (limit = 12): ReflectionJob[] {
         const claim = this.database.transaction(() => {
-            const row = this.database.query(`
+            const rows = this.database.query(`
                 SELECT id, run_id, event_ids, outcome, error,
                     reflection_output, reflection_error, attempts
                 FROM memory_reflections
                 WHERE status = 'queued'
                 ORDER BY created_at ASC
-                LIMIT 1
-            `).get() as ReflectionRow | null;
-            if (!row) {
-                return null;
+                LIMIT ?
+            `).all(boundedLimit(limit, 50)) as ReflectionRow[];
+            if (rows.length === 0) {
+                return [];
             }
-            this.database.query(`
-                UPDATE memory_reflections
-                SET status = 'running', attempts = attempts + 1, updated_at = ?
-                WHERE id = ? AND status = 'queued'
-            `).run(new Date().toISOString(), row.id);
-            return {
+            const now = new Date().toISOString();
+            for (const row of rows) {
+                this.database.query(`
+                    UPDATE memory_reflections
+                    SET status = 'running', attempts = attempts + 1, updated_at = ?
+                    WHERE id = ? AND status = 'queued'
+                `).run(now, row.id);
+            }
+            return rows.map(row => ({
                 id: row.id,
                 runId: row.run_id,
                 eventIds: parseStringArray(row.event_ids),
@@ -893,7 +927,7 @@ export class MemoryStore {
                 attempts: row.attempts + 1,
                 ...(row.reflection_output && { previousOutput: row.reflection_output }),
                 ...(row.reflection_error && { previousError: row.reflection_error }),
-            } satisfies ReflectionJob;
+            } satisfies ReflectionJob));
         });
         return claim.immediate();
     }
@@ -905,18 +939,58 @@ export class MemoryStore {
      * @param result 结构化结果
      */
     public completeReflection (jobId: string, result: ReflectionResult): void {
+        const job = this.database.query(`
+            SELECT event_ids FROM memory_reflections WHERE id = ?
+        `).get(jobId) as { event_ids: string } | null;
+        if (!job) {
+            throw new Error('Reflection 不存在');
+        }
+        const sourceEventIds = parseStringArray(job.event_ids);
+        this.completeReflections([jobId], {
+            memories: result.memories.map(memory => ({
+                ...memory,
+                sourceEventIds: memory.sourceEventIds || sourceEventIds,
+            })),
+            growth: result.growth.map(growth => ({
+                ...growth,
+                sourceEventIds: growth.sourceEventIds || sourceEventIds,
+            })),
+        });
+    }
+
+    /**
+     * 提交一次空闲回看的批量结果，并校验模型只能引用本批真实事件
+     *
+     * @param jobIds 本次一起回看的 Reflection 标识
+     * @param result 带事件级来源的结构化结果
+     */
+    public completeReflections (jobIds: string[], result: ReflectionResult): void {
+        const ids = uniqueStrings(jobIds);
+        if (ids.length === 0) {
+            throw new Error('Reflection 批次不能为空');
+        }
         const commit = this.database.transaction(() => {
-            const job = this.database.query(`
-                SELECT event_ids FROM memory_reflections WHERE id = ?
-            `).get(jobId) as { event_ids: string } | null;
-            if (!job) {
-                throw new Error('Reflection 不存在');
+            const jobs = this.database.query(`
+                SELECT id, event_ids FROM memory_reflections
+                WHERE id IN (${placeholders(ids.length)}) AND status = 'running'
+            `).all(...ids) as Array<{ id: string; event_ids: string }>;
+            if (jobs.length !== ids.length) {
+                throw new Error('Reflection 批次不存在或不在运行中');
+            }
+            const allowedEvents = new Set(jobs.flatMap(job => parseStringArray(job.event_ids)));
+            const reflectionIdsByEvent = new Map<string, string[]>();
+            for (const job of jobs) {
+                for (const eventId of parseStringArray(job.event_ids)) {
+                    const reflectionIds = reflectionIdsByEvent.get(eventId) || [];
+                    reflectionIds.push(job.id);
+                    reflectionIdsByEvent.set(eventId, reflectionIds);
+                }
             }
             for (const memory of result.memories) {
                 if (memory.sensitive || memory.content.trim().length < 4) {
                     continue;
                 }
-                const sourceEventIds = parseStringArray(job.event_ids);
+                const sourceEventIds = requireReflectionSources(memory.sourceEventIds, allowedEvents);
                 const existing = sourceEventIds[0]
                     ? this.findMemoryFromEvent(memory.kind, memory.content, sourceEventIds[0])
                     : null;
@@ -928,14 +1002,18 @@ export class MemoryStore {
                 if (growth.confidence < 0.5 || growth.title.trim().length < 4) {
                     continue;
                 }
-                this.upsertGrowth(growth, jobId);
+                const sourceEventIds = requireReflectionSources(growth.sourceEventIds, allowedEvents);
+                const reflectionIds = uniqueStrings(sourceEventIds.flatMap(
+                    eventId => reflectionIdsByEvent.get(eventId) || [],
+                ));
+                this.upsertGrowth(growth, reflectionIds);
             }
             this.database.query(`
                 UPDATE memory_reflections
                 SET status = 'completed', updated_at = ?,
                     reflection_output = NULL, reflection_error = NULL
-                WHERE id = ?
-            `).run(new Date().toISOString(), jobId);
+                WHERE id IN (${placeholders(ids.length)})
+            `).run(new Date().toISOString(), ...ids);
         });
         commit.immediate();
     }
@@ -948,12 +1026,60 @@ export class MemoryStore {
      * @param output 本次无效的模型输出
      */
     public failReflection (jobId: string, error: string, output = ''): void {
+        this.failReflections([jobId], error, output);
+    }
+
+    /**
+     * 记录一批 Reflection 失败，最多自动尝试三次
+     *
+     * @param jobIds Reflection 标识
+     * @param error 失败信息
+     * @param output 本次无效的模型输出
+     */
+    public failReflections (jobIds: string[], error: string, output = ''): void {
+        const ids = uniqueStrings(jobIds);
+        if (ids.length === 0) {
+            return;
+        }
         this.database.query(`
             UPDATE memory_reflections
             SET status = CASE WHEN attempts >= 3 THEN 'failed' ELSE 'queued' END,
                 reflection_error = ?, reflection_output = ?, updated_at = ?
-            WHERE id = ?
-        `).run(error.slice(0, 4000), output.slice(0, 30000), new Date().toISOString(), jobId);
+            WHERE id IN (${placeholders(ids.length)})
+        `).run(error.slice(0, 4000), output.slice(0, 30000), new Date().toISOString(), ...ids);
+    }
+
+    /**
+     * 释放因 Agent 活动而暂停的 Reflection，不消耗一次失败重试
+     *
+     * @param jobId Reflection 标识
+     */
+    public releaseReflection (jobId: string): void {
+        this.releaseReflections([jobId]);
+    }
+
+    /**
+     * 释放因 Agent 活动而暂停的一批 Reflection，不消耗失败重试
+     *
+     * @param jobIds Reflection 标识
+     */
+    public releaseReflections (jobIds: string[]): void {
+        const ids = uniqueStrings(jobIds);
+        if (ids.length === 0) {
+            return;
+        }
+        this.database.query(`
+            UPDATE memory_reflections
+            SET status = 'queued', attempts = MAX(0, attempts - 1), updated_at = ?
+            WHERE id IN (${placeholders(ids.length)}) AND status = 'running'
+        `).run(new Date().toISOString(), ...ids);
+    }
+
+    /** 判断是否仍有等待处理的 Reflection */
+    public hasQueuedReflections (): boolean {
+        return Boolean(this.database.query(`
+            SELECT 1 FROM memory_reflections WHERE status = 'queued' LIMIT 1
+        `).get());
     }
 
     /** 将崩溃时留下的 running Reflection 放回队列 */
@@ -1423,7 +1549,11 @@ export class MemoryStore {
     }
 
     /** 提交或增强一条成长候选 */
-    private upsertGrowth (candidate: GrowthCandidate, reflectionId: string): void {
+    private upsertGrowth (candidate: GrowthCandidate, reflectionIds: string[]): void {
+        const candidateSources = uniqueStrings(reflectionIds);
+        if (candidateSources.length === 0) {
+            throw new Error('成长候选必须引用来源 Reflection');
+        }
         const key = normalize(candidate.title);
         const existing = this.database.query(`
             SELECT id, kind, title, observation, evidence, confidence,
@@ -1432,9 +1562,9 @@ export class MemoryStore {
         `).get(candidate.kind, key) as (GrowthRow & { source_reflections: string }) | null;
         const now = new Date().toISOString();
         if (existing) {
-            const sources = uniqueStrings([...parseStringArray(existing.source_reflections), reflectionId]);
             const previousSources = parseStringArray(existing.source_reflections);
-            const evidenceCount = existing.evidence_count + (sources.length > previousSources.length ? 1 : 0);
+            const sources = uniqueStrings([...previousSources, ...candidateSources]);
+            const evidenceCount = existing.evidence_count + sources.length - previousSources.length;
             this.database.query(`
                 UPDATE growth_proposals
                 SET observation = ?, evidence = ?, confidence = ?, evidence_count = ?,
@@ -1455,7 +1585,7 @@ export class MemoryStore {
             INSERT INTO growth_proposals (
                 id, kind, title, normalized_key, observation, evidence, confidence,
                 evidence_count, source_reflections, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 'proposed', ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)
         `).run(
             randomUUID(),
             candidate.kind,
@@ -1464,7 +1594,8 @@ export class MemoryStore {
             candidate.observation.trim(),
             candidate.evidence.trim(),
             clamp(candidate.confidence),
-            JSON.stringify([reflectionId]),
+            candidateSources.length,
+            JSON.stringify(candidateSources),
             now,
             now,
         );
@@ -1542,6 +1673,15 @@ function requireSourceEventIds (values?: string[]): void {
     if (uniqueStrings(values || []).length === 0) {
         throw new Error('已确认记忆必须引用来源事件');
     }
+}
+
+/** 校验 Reflection 候选只引用本次空闲回看中的真实事件 */
+function requireReflectionSources (values: string[] | undefined, allowed: Set<string>): string[] {
+    const sources = uniqueStrings(values || []);
+    if (sources.length === 0 || sources.some(id => !allowed.has(id))) {
+        throw new Error('Reflection 候选必须引用本批真实事件');
+    }
+    return sources;
 }
 
 /** 验证时间并统一为 UTC ISO */

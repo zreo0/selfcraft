@@ -46,9 +46,11 @@ function createServer () {
     );
     const scheduledTasks = new ScheduledTaskManager(paths.state, notifications, memory);
     const calls: string[] = [];
+    const retryCalls: boolean[] = [];
     const agent = new ForegroundRunner({
-        async run (input, onEvent) {
+        async run (input, onEvent, options) {
             calls.push(input);
+            retryCalls.push(options?.retry === true);
             if (input === '触发失败') {
                 onEvent?.({
                     type: 'activity',
@@ -102,7 +104,7 @@ function createServer () {
         staticDirectory,
         onRestart: () => undefined,
     });
-    return { server, config, memory, notifications, scheduledTasks, paths, calls };
+    return { server, config, memory, notifications, scheduledTasks, paths, calls, retryCalls };
 }
 
 /** 创建同源 JSON 请求 */
@@ -369,6 +371,32 @@ describe('WebServer', () => {
         expect(stream).toContain('"status":"complete"');
         expect(stream).toContain('"state":"error"');
         expect(stream).toContain('回应没有完成');
+    });
+
+    test('Web 重试请求会进入 Runtime 的安全重试路径', async () => {
+        const { server, config, retryCalls } = createServer();
+        config.addProvider({
+            providerId: 'default',
+            type: 'openai-compatible',
+            baseURL: 'http://127.0.0.1:3000/v1',
+            apiKey: 'not-a-real-credential',
+            models: {
+                assistant: { vision: false, contextWindow: 128000, maxOutputTokens: 4096 },
+            },
+        });
+
+        const response = await server.fetch(jsonRequest('/api/chat', 'POST', {
+            trigger: 'regenerate-message',
+            messages: [{
+                id: 'user-retry',
+                role: 'user',
+                parts: [{ type: 'text', text: '再试一次' }],
+            }],
+        }));
+
+        expect(response.status).toBe(200);
+        await response.text();
+        expect(retryCalls).toEqual([true]);
     });
 
     test('拒绝跨站状态修改并为前端路由返回构建页面', async () => {

@@ -76,6 +76,41 @@ describe('MemoryStore 核心记忆内核', () => {
         expect(store.buildContext('今天跑了 5 公里', [first.id])).not.toContain(first.id);
     });
 
+    test('交互事件查询覆盖原始运行和所有直接重试运行', () => {
+        const store = createStore();
+        const original = store.recordEvent({
+            actor: 'user',
+            type: 'user_message',
+            payload: { text: '执行一项操作' },
+            runId: 'run-original',
+        });
+        store.recordEvent({
+            actor: 'system',
+            type: 'run_failed',
+            runId: 'run-original',
+            sourceEventId: original.id,
+        });
+        const retry = store.recordEvent({
+            actor: 'system',
+            type: 'run_retry_started',
+            runId: 'run-retry',
+            sourceEventId: original.id,
+        });
+        store.recordEvent({
+            actor: 'agent',
+            type: 'tool_call',
+            runId: 'run-retry',
+            sourceEventId: retry.id,
+        });
+
+        expect(store.listInteractionRunEvents(original.id).map(event => event.type)).toEqual([
+            'user_message',
+            'run_failed',
+            'run_retry_started',
+            'tool_call',
+        ]);
+    });
+
     test('拒绝会被 JavaScript 自动归一化的无效日历日期', () => {
         const store = createStore();
 
@@ -557,6 +592,7 @@ describe('MemoryStore 核心记忆内核', () => {
                             confidence: 0.9,
                             importance: 0.8,
                             sensitive: false,
+                            sourceEventNumbers: [1],
                             sourceEventIds: ['fabricated-event'],
                         }],
                         growth: [],
@@ -576,7 +612,7 @@ describe('MemoryStore 核心记忆内核', () => {
             modelId: 'test',
             contextWindow: 10000,
             maxOutputTokens: 1000,
-        }), new Logger(createTemporaryDirectory()));
+        }), new Logger(createTemporaryDirectory()), 0);
 
         worker.enqueue({ runId: 'run-worker', eventIds: [event.id], outcome: 'completed' });
         await worker.waitForIdle();
@@ -586,8 +622,167 @@ describe('MemoryStore 核心记忆内核', () => {
         expect(candidate.status).toBe('candidate');
         expect(candidate.sourceEventIds).toEqual([event.id]);
         const prompt = JSON.stringify(model.doGenerateCalls[0]?.prompt);
-        expect(prompt).toContain(event.id);
+        expect(prompt).not.toContain(event.id);
+        expect(prompt).toContain('event number');
         expect(prompt).toContain('我长期偏好短而准确的回答');
+    });
+
+    test('连续交互只触发一次空闲回看，并精确绑定各自来源', async () => {
+        const store = createStore();
+        const first = store.recordEvent({
+            actor: 'user',
+            type: 'message',
+            payload: { text: '今天只是打了个招呼' },
+            runId: 'run-batch-first',
+        });
+        const second = store.recordEvent({
+            actor: 'user',
+            type: 'message',
+            payload: { text: '我长期偏好安静的工作环境' },
+            runId: 'run-batch-second',
+        });
+        const model = new MockLanguageModelV4({
+            doGenerate: {
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify({
+                        memories: [{
+                            kind: 'preference',
+                            content: '用户长期偏好安静的工作环境',
+                            confidence: 0.9,
+                            importance: 0.8,
+                            sensitive: false,
+                            sourceEventNumbers: [2],
+                        }],
+                        growth: [],
+                    }),
+                }],
+                finishReason: { unified: 'stop', raw: undefined },
+                usage: {
+                    inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
+                    outputTokens: { total: 1, text: 1, reasoning: undefined },
+                },
+                warnings: [],
+            },
+        });
+        const worker = new ReflectionWorker(store, () => ({
+            model,
+            providerId: 'test',
+            modelId: 'test',
+            contextWindow: 10000,
+            maxOutputTokens: 1000,
+        }), new Logger(createTemporaryDirectory()), 0);
+
+        worker.beginAgentActivity();
+        worker.enqueue({ runId: 'run-batch-first', eventIds: [first.id], outcome: 'completed' });
+        worker.enqueue({ runId: 'run-batch-second', eventIds: [second.id], outcome: 'completed' });
+        worker.endAgentActivity();
+        await worker.waitForIdle();
+        worker.stop();
+
+        expect(model.doGenerateCalls).toHaveLength(1);
+        expect(store.search('安静的工作环境')[0]?.sourceEventIds).toEqual([second.id]);
+        expect(store.search('安静的工作环境')[0]?.sourceEventIds).not.toContain(first.id);
+    });
+
+    test('Reflection 只在 Agent 连续空闲后开始', async () => {
+        const store = createStore();
+        const event = store.recordEvent({
+            actor: 'user',
+            type: 'message',
+            payload: { text: '这是一段需要稍后整理的经历' },
+            runId: 'run-idle-reflection',
+        });
+        const model = new MockLanguageModelV4({
+            doGenerate: {
+                content: [{ type: 'text', text: '{"memories":[],"growth":[]}' }],
+                finishReason: { unified: 'stop', raw: undefined },
+                usage: {
+                    inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
+                    outputTokens: { total: 1, text: 1, reasoning: undefined },
+                },
+                warnings: [],
+            },
+        });
+        const worker = new ReflectionWorker(store, () => ({
+            model,
+            providerId: 'test',
+            modelId: 'test',
+            contextWindow: 10000,
+            maxOutputTokens: 1000,
+        }), new Logger(createTemporaryDirectory()), 20);
+
+        worker.beginAgentActivity();
+        worker.enqueue({
+            runId: 'run-idle-reflection',
+            eventIds: [event.id],
+            outcome: 'completed',
+        });
+        await Bun.sleep(40);
+        expect(model.doGenerateCalls).toHaveLength(0);
+
+        worker.endAgentActivity();
+        await worker.waitForIdle(1000);
+        worker.stop();
+
+        expect(model.doGenerateCalls).toHaveLength(1);
+    });
+
+    test('新的 Agent 活动会中断 Reflection，并在再次空闲后继续', async () => {
+        const store = createStore();
+        const event = store.recordEvent({
+            actor: 'user',
+            type: 'message',
+            payload: { text: '反思应当给正在发生的对话让路' },
+            runId: 'run-preempt-reflection',
+        });
+        let calls = 0;
+        let markStarted: () => void = () => undefined;
+        const started = new Promise<void>(resolve => {
+            markStarted = resolve;
+        });
+        const model = new MockLanguageModelV4({
+            doGenerate: async options => {
+                calls += 1;
+                if (calls === 1) {
+                    markStarted();
+                    await new Promise<void>(resolve => {
+                        options.abortSignal?.addEventListener('abort', () => {
+                            resolve();
+                        }, { once: true });
+                    });
+                }
+                return {
+                    content: [{ type: 'text' as const, text: '{"memories":[],"growth":[]}' }],
+                    finishReason: { unified: 'stop' as const, raw: undefined },
+                    usage: {
+                        inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
+                        outputTokens: { total: 1, text: 1, reasoning: undefined },
+                    },
+                    warnings: [],
+                };
+            },
+        });
+        const worker = new ReflectionWorker(store, () => ({
+            model,
+            providerId: 'test',
+            modelId: 'test',
+            contextWindow: 10000,
+            maxOutputTokens: 1000,
+        }), new Logger(createTemporaryDirectory()), 0);
+
+        worker.enqueue({
+            runId: 'run-preempt-reflection',
+            eventIds: [event.id],
+            outcome: 'completed',
+        });
+        await started;
+        worker.beginAgentActivity();
+        worker.endAgentActivity();
+        await worker.waitForIdle(1000);
+        worker.stop();
+
+        expect(calls).toBe(2);
     });
 
     test('Reflection 拒绝引用其他运行的事件', () => {
