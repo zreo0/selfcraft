@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { DefaultChatTransport, type UIMessageChunk } from 'ai';
 import type { AgentActivity, AgentRunEvent } from '../agent/run-events';
-import type { AddProviderInput, ActiveModelConfig, ModelConfig, ProviderType } from '../config/types';
+import type { AddProviderInput, ModelSelection, ModelConfig, ModelPurpose, ProviderType, SelfcraftConfig } from '../config/types';
 import type { JobRecord } from '../job/job-manager';
 import type { GrowthProposal, MemoryItem, TopicRecord } from '../memory/memory-store';
 import type { Notification } from '../notification/notification-inbox';
@@ -30,7 +30,9 @@ export interface RuntimeConfigView {
     /** 用户时区 */
     timezone: string;
     /** 当前活动模型 */
-    activeModel: ActiveModelConfig | null;
+    defaultModel: ModelSelection | null;
+    /** 后台用途的显式模型覆盖 */
+    modelOverrides: SelfcraftConfig['modelOverrides'];
     /** 已配置渠道 */
     providers: RuntimeProviderView[];
     /** 外部网络访问状态 */
@@ -91,10 +93,10 @@ export class RuntimeClient {
     }
 
     /** 切换活动模型并返回脱敏配置 */
-    public async useModel (selection: ActiveModelConfig): Promise<RuntimeConfigView> {
+    public async useModel (selection: ModelSelection | null, purpose: ModelPurpose = 'agent'): Promise<RuntimeConfigView> {
         return await this.request<RuntimeConfigView>('/api/config/model', {
             method: 'PUT',
-            body: JSON.stringify(selection),
+            body: JSON.stringify({ ...selection, purpose, inherit: selection === null }),
         });
     }
 

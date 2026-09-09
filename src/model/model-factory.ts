@@ -1,8 +1,10 @@
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
-import type { LanguageModel } from 'ai';
+import { wrapLanguageModel, type LanguageModel } from 'ai';
 import type { ConfigStore } from '../config/config-store';
+import type { ModelPurpose, ModelSelection } from '../config/types';
+import type { Logger } from '../logging/logger';
 
 /** 一次 Agent run 使用的不可变模型快照 */
 export interface ModelSnapshot {
@@ -16,18 +18,23 @@ export interface ModelSnapshot {
     contextWindow: number;
     /** 最大输出 token */
     maxOutputTokens: number;
+    /** 已确认的视觉输入能力 */
+    vision?: boolean;
 }
 
 /** 将持久配置转换为 AI SDK 模型 */
 export class ModelFactory {
     /**
-     * 构建当前活动模型
+     * 按用途构建不可变模型快照，不改变配置
      *
      * @param configStore 模型配置存储
+     * @param purpose 调用用途
+     * @param logger 可选请求指标日志
+     * @param requested 显式连接测试使用的模型选择
      * @returns 本轮固定模型
      */
-    public static create (configStore: ConfigStore): ModelSnapshot {
-        const { selection, provider, model, apiKey } = configStore.getActiveModel();
+    public static create (configStore: ConfigStore, purpose: ModelPurpose = 'agent', logger?: Logger, requested?: ModelSelection): ModelSnapshot {
+        const { selection, provider, model, apiKey } = configStore.getModel(purpose, requested);
         let languageModel: LanguageModel;
         if (provider.type === 'openai-compatible') {
             const compatible = createOpenAICompatible({
@@ -51,12 +58,51 @@ export class ModelFactory {
             });
             languageModel = anthropic(selection.modelId);
         }
-        return {
-            model: languageModel,
+        return Object.freeze({
+            model: wrapLanguageModel({
+                model: languageModel,
+                middleware: {
+                    specificationVersion: 'v4',
+                    transformParams: async ({ params }) => ({
+                        ...params,
+                        ...(selection.reasoningEffort && { reasoning: selection.reasoningEffort }),
+                    }),
+                    wrapGenerate: async ({ doGenerate }) => {
+                        const startedAt = Date.now();
+                        const result = await doGenerate();
+                        logger?.info('Model request completed', {
+                            purpose, providerId: selection.providerId, modelId: selection.modelId,
+                            streaming: false, durationMs: Date.now() - startedAt,
+                            usage: result.usage, finishReason: result.finishReason, warnings: result.warnings,
+                        });
+                        return result;
+                    },
+                    wrapStream: async ({ doStream }) => {
+                        const startedAt = Date.now();
+                        const result = await doStream();
+                        return {
+                            ...result,
+                            stream: result.stream.pipeThrough(new TransformStream({
+                                transform (part, controller) {
+                                    if (part.type === 'finish') {
+                                        logger?.info('Model request completed', {
+                                            purpose, providerId: selection.providerId, modelId: selection.modelId,
+                                            streaming: true, durationMs: Date.now() - startedAt,
+                                            usage: part.usage, finishReason: part.finishReason,
+                                        });
+                                    }
+                                    controller.enqueue(part);
+                                },
+                            })),
+                        };
+                    },
+                },
+            }),
             providerId: selection.providerId,
             modelId: selection.modelId,
             contextWindow: model.contextWindow,
             maxOutputTokens: model.maxOutputTokens,
-        };
+            vision: model.vision,
+        });
     }
 }

@@ -37,7 +37,7 @@ async function main (): Promise<void> {
     const notifications = new NotificationInbox(paths.notifications);
     const memory = new MemoryStore(paths.state);
     const scheduledTasks = new ScheduledTaskManager(paths.state, notifications, memory);
-    const reflection = new ReflectionWorker(memory, () => ModelFactory.create(config), logger);
+    const reflection = new ReflectionWorker(memory, () => ModelFactory.create(config, 'reflection', logger), logger);
     const jobs = new JobManager(
         paths.state,
         paths.jobs,

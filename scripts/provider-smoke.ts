@@ -44,8 +44,9 @@ function createTestServer () {
                 model?: string;
                 messages?: Array<{ role?: string }>;
                 tools?: unknown[];
+                reasoning_effort?: string;
             };
-            if (body.model !== 'provider-smoke' || !body.tools?.length) {
+            if (body.model !== 'provider-smoke' || !body.tools?.length || body.reasoning_effort !== 'high') {
                 return new Response('invalid request', { status: 400 });
             }
             requestCount += 1;
@@ -130,6 +131,7 @@ async function main (): Promise<void> {
             },
         });
         const logger = new Logger(paths.logs);
+        config.useModel({ providerId: 'local-smoke', modelId: 'provider-smoke', reasoningEffort: 'high' });
         const skills = new SkillRegistry(path.join(paths.workspace, 'skills'));
         const evolution = new EvolutionService(
             paths,

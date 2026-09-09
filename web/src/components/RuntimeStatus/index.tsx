@@ -19,7 +19,7 @@ export function RuntimeStatus ({ runtime, config }: { runtime: RuntimeView; conf
                 <div className="runtime-popover-heading">
                     <div>
                         <strong>{healthy ? '运行正常' : '需要检查'}</strong>
-                        <span>{config?.configured ? `${config.activeModel?.providerId}/${config.activeModel?.modelId}` : '等待模型配置'}</span>
+                        <span>{config?.configured ? `${config.defaultModel?.providerId}/${config.defaultModel?.modelId}` : '等待模型配置'}</span>
                     </div>
                     <span className={healthy ? 'status-light status-light--healthy' : 'status-light status-light--error'} />
                 </div>

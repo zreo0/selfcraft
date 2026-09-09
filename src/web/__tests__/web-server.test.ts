@@ -126,6 +126,25 @@ afterEach(() => {
 });
 
 describe('WebServer', () => {
+    test('模型用途覆盖可独立保存和恢复继承，非法选择不改变配置', async () => {
+        const { server, config } = createServer();
+        config.addProvider({
+            providerId: 'local', type: 'openai-compatible', baseURL: 'http://localhost:3000/v1', apiKey: '',
+            models: { assistant: { vision: false, contextWindow: 32000, maxOutputTokens: 4096 } },
+        });
+        const response = await server.fetch(jsonRequest('/api/config/model', 'PUT', {
+            purpose: 'reflection', providerId: 'local', modelId: 'assistant', reasoningEffort: 'high',
+        }));
+        expect(response.status).toBe(200);
+        expect((await response.json() as any).modelOverrides.reflection.reasoningEffort).toBe('high');
+        expect(config.getModel().selection.reasoningEffort).toBeUndefined();
+        const invalid = await server.fetch(jsonRequest('/api/config/model', 'PUT', { purpose: 'compression', modelId: 'missing' }));
+        expect(invalid.status).toBe(400);
+        expect(config.read().modelOverrides.compression).toBeUndefined();
+        const inherited = await server.fetch(jsonRequest('/api/config/model', 'PUT', { purpose: 'reflection', inherit: true }));
+        expect(inherited.status).toBe(200);
+        expect(config.read().modelOverrides).toEqual({});
+    });
     test('初始化只返回脱敏配置、健康状态与前台消息', async () => {
         const { server, config, memory } = createServer();
         config.addProvider({
@@ -324,7 +343,7 @@ describe('WebServer', () => {
         expect((await afterSetup.json() as any).config).toMatchObject({
             configured: true,
             timezone: 'Asia/Shanghai',
-            activeModel: { providerId: 'default', modelId: 'assistant' },
+            defaultModel: { providerId: 'default', modelId: 'assistant' },
         });
 
         const response = await server.fetch(jsonRequest('/api/chat', 'POST', {

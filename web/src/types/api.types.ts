@@ -22,6 +22,8 @@ export interface ProviderView {
     baseURL?: string;
     /** 是否已经保存凭证 */
     credentialConfigured: boolean;
+    /** 是否为显式无认证渠道 */
+    auth: 'api-key' | 'none';
     /** 渠道内模型 */
     models: ModelView[];
 }
@@ -33,7 +35,9 @@ export interface ConfigView {
     /** 用户本地时区 */
     timezone: string;
     /** 当前活动模型 */
-    activeModel: { providerId: string; modelId: string } | null;
+    defaultModel: { providerId: string; modelId: string; reasoningEffort?: 'low' | 'medium' | 'high' } | null;
+    /** 后台用途未配置时跟随默认模型 */
+    modelOverrides: Partial<Record<'reflection' | 'compression', NonNullable<ConfigView['defaultModel']>>>;
     /** 可选网络搜索配置 */
     webAccess: {
         provider: 'tavily';

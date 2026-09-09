@@ -39,9 +39,18 @@ export function saveProvider (input: ProviderInput): Promise<ConfigView> {
 }
 
 /** 切换活动模型 */
-export function useModel (providerId: string, modelId: string): Promise<ConfigView> {
+export function useModel (providerId: string, modelId: string, purpose: 'agent' | 'reflection' | 'compression' = 'agent', reasoningEffort?: 'low' | 'medium' | 'high'): Promise<ConfigView> {
     return requestJson<ConfigView>('/api/config/model', {
         method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ providerId: providerId || undefined, modelId: modelId || undefined, purpose, inherit: !providerId, reasoningEffort }),
+    });
+}
+
+/** 显式验证已保存模型的流式连接，不产生会话 */
+export function testModel (providerId: string, modelId: string): Promise<{ durationMs: number; finishReason: string; warnings: unknown[] }> {
+    return requestJson('/api/config/model/test', {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ providerId, modelId }),
     });

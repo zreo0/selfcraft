@@ -145,7 +145,8 @@ function buildConfigView (config: ConfigStore): RuntimeConfigView {
     return {
         configured: config.isConfigured(),
         timezone: value.timezone,
-        activeModel: value.activeModel,
+        defaultModel: value.defaultModel,
+        modelOverrides: value.modelOverrides,
         webAccess: value.webAccess ? {
             provider: value.webAccess.provider,
             configured: config.isWebAccessConfigured(),
@@ -200,7 +201,7 @@ describe('Onboarding', () => {
 
         await onboarding.run();
 
-        const active = config.getActiveModel();
+        const active = config.getModel();
         const provider = config.read().providers.default;
         expect(config.read().timezone).toBe('Asia/Shanghai');
         expect(active.selection).toEqual({ providerId: 'default', modelId: 'model-a' });
@@ -213,7 +214,6 @@ describe('Onboarding', () => {
         expect(provider.models['model-b'].vision).toBeTrue();
         expect(validationErrors).toEqual([
             '请输入完整的 URL',
-            '请输入单行非空 API key',
             '请输入正整数',
             '尚未配置这些模型：unknown-model',
         ]);
@@ -288,7 +288,7 @@ describe('Onboarding', () => {
         await onboarding.reset();
 
         expect(config.read()).toEqual(before);
-        expect(config.getActiveModel().apiKey).toBe('old-key');
+        expect(config.getModel().apiKey).toBe('old-key');
         expect(cancelMock).toHaveBeenCalledWith('配置保持不变');
         expect(autocompleteMock).not.toHaveBeenCalled();
     });
@@ -314,7 +314,7 @@ describe('Onboarding', () => {
         expect(config.read().providers).toHaveProperty('default');
         expect(config.read().providers).not.toHaveProperty('old');
         expect(config.read().timezone).toBe('Asia/Tokyo');
-        expect(config.getActiveModel()).toMatchObject({
+        expect(config.getModel()).toMatchObject({
             selection: { providerId: 'default', modelId: 'new-model' },
             apiKey: 'new-key',
         });
@@ -336,7 +336,7 @@ describe('Onboarding', () => {
 
         await expect(onboarding.reset()).resolves.toBeUndefined();
 
-        expect(config.read().activeModel).toBeNull();
+        expect(config.read().defaultModel).toBeNull();
         expect(config.read().providers).toEqual({});
         expect(logMessageMock.mock.calls.some(call => String(call[0]).includes('下次启动时会继续 onboarding'))).toBeTrue();
     });

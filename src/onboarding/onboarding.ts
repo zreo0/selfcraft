@@ -145,11 +145,11 @@ export class Onboarding {
         }));
         const baseURL = await this.askBaseURL(type);
         const apiKey = this.unwrap(await password({
-            message: 'API key',
+            message: 'API key（已有渠道留空保留；本地兼容接口可不填）',
             clearOnError: true,
             validate: value => {
-                if (!value?.trim() || /[\r\n]/.test(value)) {
-                    return '请输入单行非空 API key';
+                if (value && /[\r\n]/.test(value)) {
+                    return '请输入单行 API key';
                 }
             },
         }));

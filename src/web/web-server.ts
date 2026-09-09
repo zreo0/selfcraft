@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import {
     createUIMessageStream,
     createUIMessageStreamResponse,
+    streamText,
     type UIMessage,
 } from 'ai';
 import { z } from 'zod';
@@ -16,6 +17,7 @@ import {
     type AgentSource,
 } from '../agent/run-events';
 import type { ConfigStore } from '../config/config-store';
+import { ModelFactory } from '../model/model-factory';
 import type { SelfcraftPaths } from '../config/paths';
 import type { SelfcraftConfig } from '../config/types';
 import type { HealthChecker } from '../health/health-checker';
@@ -44,7 +46,7 @@ const providerRequestSchema = z.object({
     providerId: z.string().min(1).max(64),
     type: z.enum(['openai-compatible', 'openai', 'anthropic']),
     baseURL: z.string().max(2048).optional(),
-    apiKey: z.string().min(1).max(8192),
+    apiKey: z.string().max(8192).default(''),
     modelId: z.string().min(1).max(128).optional(),
     vision: z.boolean().default(false).optional(),
     contextWindow: z.number().int().positive().max(10_000_000).optional(),
@@ -63,9 +65,14 @@ const providerRequestSchema = z.object({
 });
 
 const modelRequestSchema = z.object({
-    providerId: z.string().min(1).max(64),
-    modelId: z.string().min(1).max(128),
-});
+    providerId: z.string().min(1).max(64).optional(),
+    modelId: z.string().min(1).max(128).optional(),
+    purpose: z.enum(['agent', 'reflection', 'compression']).default('agent'),
+    reasoningEffort: z.enum(['low', 'medium', 'high']).optional(),
+    inherit: z.boolean().default(false),
+}).refine(value => value.inherit
+    ? value.purpose !== 'agent'
+    : Boolean(value.providerId && value.modelId), '请选择模型，或让后台用途跟随默认模型');
 
 const timezoneRequestSchema = z.object({
     timezone: z.string().min(1).max(100),
@@ -235,8 +242,40 @@ export class WebServer {
         }
         if (request.method === 'PUT' && url.pathname === '/api/config/model') {
             this.assertMutationRequest(request);
-            this.dependencies.config.useModel(modelRequestSchema.parse(await request.json()));
+            const input = modelRequestSchema.parse(await request.json());
+            this.dependencies.config.useModel(input.inherit ? null : {
+                providerId: input.providerId!,
+                modelId: input.modelId!,
+                ...(input.reasoningEffort && { reasoningEffort: input.reasoningEffort }),
+            }, input.purpose);
             return jsonResponse(this.buildConfigView());
+        }
+        if (request.method === 'POST' && url.pathname === '/api/config/model/test') {
+            this.assertMutationRequest(request);
+            const input = modelRequestSchema.parse(await request.json());
+            const active = ModelFactory.create(this.dependencies.config, input.purpose, undefined,
+                input.inherit ? undefined : {
+                    providerId: input.providerId!, modelId: input.modelId!, reasoningEffort: input.reasoningEffort,
+                });
+            const startedAt = Date.now();
+            const result = streamText({
+                model: active.model,
+                prompt: 'Reply with OK only.',
+                maxOutputTokens: Math.min(active.maxOutputTokens, 256),
+                maxRetries: 0,
+                abortSignal: AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]),
+            });
+            // 测试走真实流式协议，但不写会话、记忆或修改默认模型
+            for await (const part of result.fullStream) {
+                if (part.type === 'error') {
+                    throw part.error;
+                }
+            }
+            return jsonResponse({
+                durationMs: Date.now() - startedAt,
+                finishReason: await result.finishReason,
+                warnings: await result.warnings,
+            });
         }
         if (request.method === 'PUT' && url.pathname === '/api/config/timezone') {
             this.assertMutationRequest(request);
@@ -373,7 +412,8 @@ export class WebServer {
         return {
             configured: this.dependencies.config.isConfigured(),
             timezone: config.timezone,
-            activeModel: config.activeModel,
+            defaultModel: config.defaultModel,
+            modelOverrides: config.modelOverrides,
             webAccess: config.webAccess ? {
                 provider: config.webAccess.provider,
                 configured: this.dependencies.config.isWebAccessConfigured(),
@@ -383,6 +423,7 @@ export class WebServer {
                 type: provider.type,
                 baseURL: provider.baseURL,
                 credentialConfigured: this.dependencies.config.hasCredential(id),
+                auth: provider.auth,
                 models: Object.entries(provider.models).map(([modelId, model]) => ({
                     id: modelId,
                     ...model,
@@ -567,7 +608,9 @@ interface WebConfigView {
     /** 用户本地时区 */
     timezone: string;
     /** 当前活动模型 */
-    activeModel: SelfcraftConfig['activeModel'];
+    defaultModel: SelfcraftConfig['defaultModel'];
+    /** 后台用途的显式模型覆盖 */
+    modelOverrides: SelfcraftConfig['modelOverrides'];
     /** 脱敏后的网络访问配置 */
     webAccess: {
         provider: 'tavily';
@@ -579,6 +622,7 @@ interface WebConfigView {
         type: string;
         baseURL?: string;
         credentialConfigured: boolean;
+        auth: 'api-key' | 'none';
         models: Array<{
             id: string;
             vision: boolean;

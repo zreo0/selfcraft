@@ -20,10 +20,49 @@ afterEach(() => {
 });
 
 describe('ConfigStore', () => {
+    test('用途覆盖直接跟随默认且运行快照不随配置变化', () => {
+        const store = new ConfigStore(createTemporaryDirectory());
+        store.addProvider({
+            providerId: 'local', type: 'openai-compatible', baseURL: 'http://localhost:3000/v1', apiKey: '',
+            models: {
+                first: { vision: false, contextWindow: 32000, maxOutputTokens: 4096 },
+                second: { vision: false, contextWindow: 64000, maxOutputTokens: 8192 },
+            },
+        });
+        expect(store.getModel('reflection').selection.modelId).toBe('first');
+        const snapshot = store.getModel();
+        store.useModel({ providerId: 'local', modelId: 'first', reasoningEffort: 'high' }, 'reflection');
+        store.useModel({ providerId: 'local', modelId: 'second' });
+        expect(snapshot.selection.modelId).toBe('first');
+        expect(store.getModel('compression').selection.modelId).toBe('second');
+        expect(store.getModel('reflection').selection.reasoningEffort).toBe('high');
+        store.useModel(null, 'reflection');
+        expect(store.getModel('reflection').selection.modelId).toBe('second');
+        expect(() => store.useModel(null)).toThrow();
+        expect(() => store.useModel({ providerId: 'local', modelId: 'missing' }, 'compression')).toThrow();
+        expect(store.read().modelOverrides).toEqual({});
+    });
+
+    test('空 Key 保留现有凭证，首次兼容接口可以显式免认证', () => {
+        const store = new ConfigStore(createTemporaryDirectory());
+        const input = {
+            providerId: 'local', type: 'openai-compatible' as const, baseURL: 'http://localhost:3000/v1', apiKey: '',
+            models: { first: { vision: false, contextWindow: 32000, maxOutputTokens: 4096 } },
+        };
+        store.addProvider(input);
+        expect(store.getModel().provider.auth).toBe('none');
+        expect(store.getModel().apiKey).toBeUndefined();
+        expect(store.isConfigured()).toBeTrue();
+        store.addProvider({ ...input, apiKey: 'test-key' });
+        store.addProvider(input);
+        expect(store.getModel().apiKey).toBe('test-key');
+        expect(store.getModel().provider.auth).toBe('api-key');
+        expect(() => store.addProvider({ ...input, providerId: 'official', type: 'openai' })).toThrow();
+    });
     test('首次读取不伪造默认模型', () => {
         const store = new ConfigStore(createTemporaryDirectory());
 
-        expect(store.read().activeModel).toBeNull();
+        expect(store.read().defaultModel).toBeNull();
         expect(store.read().webAccess).toBeNull();
         expect(store.read().timezone).toBeTruthy();
         expect(store.isConfigured()).toBeFalse();
@@ -58,7 +97,7 @@ describe('ConfigStore', () => {
         const store = new ConfigStore(directory);
         fs.writeFileSync(path.join(directory, 'config.json'), JSON.stringify({
             version: 1,
-            activeModel: null,
+            defaultModel: null,
             providers: {},
             maxSteps: 32,
             timezone: 'Asia/Shanghai',
@@ -83,14 +122,14 @@ describe('ConfigStore', () => {
         store.useModel({ providerId: 'local', modelId: 'pro' });
         store.setTimezone('Asia/Shanghai');
 
-        expect(store.getActiveModel().selection.modelId).toBe('pro');
+        expect(store.getModel().selection.modelId).toBe('pro');
         expect(store.read().timezone).toBe('Asia/Shanghai');
         expect(fs.readFileSync(path.join(directory, 'config.json'), 'utf8')).not.toContain('test-secret');
         expect(fs.readFileSync(path.join(directory, 'secrets.json'), 'utf8')).toContain('test-secret');
         expect(fs.statSync(path.join(directory, 'secrets.json')).mode & 0o777).toBe(0o600);
     });
 
-    test('更新当前渠道并移除旧模型时自动切换到新模型', () => {
+    test('更新当前渠道时合并模型并保留默认选择', () => {
         const store = new ConfigStore(createTemporaryDirectory());
         store.addProvider({
             providerId: 'local',
@@ -112,10 +151,11 @@ describe('ConfigStore', () => {
             },
         });
 
-        expect(store.getActiveModel().selection).toEqual({
+        expect(store.getModel().selection).toEqual({
             providerId: 'local',
-            modelId: 'current',
+            modelId: 'old',
         });
+        expect(Object.keys(store.read().providers.local.models)).toEqual(['old', 'current']);
         expect(store.isConfigured()).toBeTrue();
     });
 
@@ -137,7 +177,7 @@ describe('ConfigStore', () => {
         expect(fs.readFileSync(path.join(backupDirectory, 'config.json'), 'utf8')).toBe(legacyConfig);
         expect(fs.statSync(backupDirectory).mode & 0o777).toBe(0o700);
         expect(fs.statSync(path.join(backupDirectory, 'config.json')).mode & 0o777).toBe(0o600);
-        expect(store.read().activeModel).toBeNull();
+        expect(store.read().defaultModel).toBeNull();
         expect(store.read().providers).toEqual({});
         expect(JSON.parse(fs.readFileSync(path.join(directory, 'secrets.json'), 'utf8')).credentials).toEqual({});
         expect(fs.readFileSync(path.join(directory, 'keep.txt'), 'utf8')).toBe('keep');
@@ -168,7 +208,7 @@ describe('ConfigStore', () => {
         const store = new ConfigStore(directory);
 
         expect(store.backupAndReset()).toBeUndefined();
-        expect(store.read().activeModel).toBeNull();
+        expect(store.read().defaultModel).toBeNull();
         expect(fs.existsSync(path.join(directory, 'backups'))).toBeFalse();
         expect(fs.existsSync(path.join(directory, 'secrets.json'))).toBeFalse();
     });

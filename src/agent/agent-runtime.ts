@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { isStepCount, ToolLoopAgent, type ModelMessage, type Tool } from 'ai';
+import { prepareMessages } from '../model/prepare-messages';
 import type { ConfigStore } from '../config/config-store';
 import type { ContextManager } from '../context/context-manager';
 import type { EvolutionService } from '../evolution/evolution-service';
@@ -77,7 +78,7 @@ export class AgentRuntime {
         >,
         private readonly tools: Record<string, Tool<any, any, ToolRuntimeContext>>,
         private readonly logger: Logger,
-        private readonly resolveModel: () => ModelSnapshot = () => ModelFactory.create(this.config),
+        private readonly resolveModel: () => ModelSnapshot = () => ModelFactory.create(this.config, 'agent', this.logger),
     ) {}
 
     /**
@@ -143,9 +144,10 @@ export class AgentRuntime {
             try {
                 const compacted = await this.context.compactIfNeeded(
                     snapshot,
-                    active.model,
                     active.contextWindow,
                     reservedContext,
+                    () => ModelFactory.create(this.config, 'compression', this.logger),
+                    options.signal,
                 );
                 if (compacted.compacted) {
                     snapshot = compacted.snapshot;
@@ -470,7 +472,7 @@ export class AgentRuntime {
             maxOutputTokens: active.maxOutputTokens,
         });
         const result = await agent.stream({
-            messages,
+            messages: prepareMessages(messages, active.vision),
             abortSignal,
             onToolExecutionStart: ({ toolCall }) => {
                 this.logger.info('Tool execution started', { toolName: toolCall.toolName });

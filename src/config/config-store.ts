@@ -3,9 +3,10 @@ import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type {
-    ActiveModelConfig,
+    ModelSelection,
     AddProviderInput,
     ModelConfig,
+    ModelPurpose,
     ProviderConfig,
     SelfcraftConfig,
 } from './types';
@@ -20,6 +21,7 @@ const providerSchema = z.object({
     type: z.enum(['openai-compatible', 'openai', 'anthropic']),
     baseURL: z.string().url().optional(),
     credentialRef: z.string().min(1),
+    auth: z.enum(['api-key', 'none']).default('api-key'),
     models: z.record(z.string(), modelSchema),
 });
 
@@ -30,10 +32,15 @@ const webAccessSchema = z.object({
 
 const configSchema = z.object({
     version: z.literal(1),
-    activeModel: z.object({
+    defaultModel: z.object({
         providerId: z.string().min(1),
         modelId: z.string().min(1),
+        reasoningEffort: z.enum(['low', 'medium', 'high']).optional(),
     }).nullable(),
+    modelOverrides: z.object({
+        reflection: z.object({ providerId: z.string().min(1), modelId: z.string().min(1), reasoningEffort: z.enum(['low', 'medium', 'high']).optional() }).optional(),
+        compression: z.object({ providerId: z.string().min(1), modelId: z.string().min(1), reasoningEffort: z.enum(['low', 'medium', 'high']).optional() }).optional(),
+    }).default({}),
     providers: z.record(z.string(), providerSchema),
     webAccess: webAccessSchema.nullable().default(null),
     maxSteps: z.number().int().min(1).max(100),
@@ -71,7 +78,7 @@ export class ConfigStore {
      */
     public isConfigured (): boolean {
         try {
-            this.getActiveModel();
+            this.getModel();
             return true;
         } catch {
             return false;
@@ -87,7 +94,9 @@ export class ConfigStore {
         if (!fs.existsSync(this.configPath)) {
             return createDefaultConfig();
         }
-        const parsed = configSchema.parse(JSON.parse(fs.readFileSync(this.configPath, 'utf8')));
+        const raw = JSON.parse(fs.readFileSync(this.configPath, 'utf8'));
+        // 旧配置只做字段迁移，不丢弃已保存的渠道与凭证
+        const parsed = configSchema.parse({ ...raw, defaultModel: raw.defaultModel ?? raw.activeModel ?? null });
         return structuredClone(parsed) as SelfcraftConfig;
     }
 
@@ -102,13 +111,11 @@ export class ConfigStore {
         if (config.webAccess && !credentials[config.webAccess.credentialRef]) {
             throw new Error('网络访问配置不完整');
         }
-        if (!config.activeModel) {
+        if (!config.defaultModel) {
             return;
         }
-        const provider = config.providers[config.activeModel.providerId];
-        const model = provider?.models[config.activeModel.modelId];
-        if (!provider || !model || !credentials[provider.credentialRef]) {
-            throw new Error('活动模型配置不完整');
+        for (const purpose of ['agent', 'reflection', 'compression'] as const) {
+            this.getModel(purpose);
         }
     }
 
@@ -165,30 +172,34 @@ export class ConfigStore {
             }
         }
         const apiKey = input.apiKey.trim();
-        if (!apiKey || /[\r\n]/.test(apiKey)) {
-            throw new Error('API key 必须是单行非空文本');
+        if (/[\r\n]/.test(apiKey)) {
+            throw new Error('API key 必须是单行文本');
         }
 
         const config = this.read();
         const credentialRef = `provider:${input.providerId}`;
+        const credentials = this.readSecrets();
+        if (!apiKey && !credentials[credentialRef] && input.type !== 'openai-compatible') {
+            throw new Error('此渠道需要 API key');
+        }
         config.providers[input.providerId] = {
             type: input.type,
             ...(baseURL && { baseURL }),
             credentialRef,
-            models: structuredClone(input.models),
+            auth: apiKey || credentials[credentialRef] ? 'api-key' : 'none',
+            models: { ...config.providers[input.providerId]?.models, ...structuredClone(input.models) },
         };
-        const activeModelStillExists = config.activeModel
-            && config.providers[config.activeModel.providerId]?.models[config.activeModel.modelId];
-        if (!activeModelStillExists) {
-            config.activeModel = {
+        const defaultModelStillExists = config.defaultModel
+            && config.providers[config.defaultModel.providerId]?.models[config.defaultModel.modelId];
+        if (!defaultModelStillExists) {
+            config.defaultModel = {
                 providerId: input.providerId,
                 modelId: modelEntries[0][0],
             };
         }
-        this.writeSecrets({
-            ...this.readSecrets(),
-            [credentialRef]: apiKey,
-        });
+        if (apiKey) {
+            this.writeSecrets({ ...credentials, [credentialRef]: apiKey });
+        }
         this.write(config);
         return config;
     }
@@ -197,13 +208,23 @@ export class ConfigStore {
      * 切换后续对话使用的模型
      *
      * @param selection 目标渠道与模型
+     * @param purpose 使用用途；非 agent 传 null 时恢复继承
      */
-    public useModel (selection: ActiveModelConfig): void {
+    public useModel (selection: ModelSelection | null, purpose: ModelPurpose = 'agent'): void {
         const config = this.read();
-        if (!config.providers[selection.providerId]?.models[selection.modelId]) {
+        if (selection && !config.providers[selection.providerId]?.models[selection.modelId]) {
             throw new Error(`模型不存在: ${selection.providerId}/${selection.modelId}`);
         }
-        config.activeModel = selection;
+        if (purpose === 'agent') {
+            if (!selection) {
+                throw new Error('默认模型不可为空');
+            }
+            config.defaultModel = selection;
+        } else if (selection) {
+            config.modelOverrides[purpose] = selection;
+        } else {
+            delete config.modelOverrides[purpose];
+        }
         this.write(config);
     }
 
@@ -310,28 +331,31 @@ export class ConfigStore {
     }
 
     /**
-     * 返回活动模型、渠道和凭证
+     * 返回指定用途的模型、渠道和凭证副本
      *
+     * @param purpose 使用用途
+     * @param requested 连接测试的显式选择，不修改默认配置
      * @returns 当前可用于请求的配置
      */
-    public getActiveModel (): {
-        selection: ActiveModelConfig;
+    public getModel (purpose: ModelPurpose = 'agent', requested?: ModelSelection): {
+        selection: ModelSelection;
         provider: ProviderConfig;
         model: ModelConfig;
-        apiKey: string;
+        apiKey: string | undefined;
     } {
         const config = this.read();
-        if (!config.activeModel) {
+        const selection = requested ?? (purpose === 'agent' ? undefined : config.modelOverrides[purpose]) ?? config.defaultModel;
+        if (!selection) {
             throw new Error('尚未配置活动模型');
         }
-        const provider = config.providers[config.activeModel.providerId];
-        const model = provider?.models[config.activeModel.modelId];
+        const provider = config.providers[selection.providerId];
+        const model = provider?.models[selection.modelId];
         const apiKey = provider && this.readSecrets()[provider.credentialRef];
-        if (!provider || !model || !apiKey) {
+        if (!provider || !model || (!apiKey && provider.auth !== 'none')) {
             throw new Error('活动模型配置不完整');
         }
         return {
-            selection: structuredClone(config.activeModel),
+            selection: structuredClone(selection),
             provider: structuredClone(provider),
             model: structuredClone(model),
             apiKey,
@@ -412,7 +436,8 @@ export class ConfigStore {
 function createDefaultConfig (): SelfcraftConfig {
     return {
         version: 1,
-        activeModel: null,
+        defaultModel: null,
+        modelOverrides: {},
         providers: {},
         webAccess: null,
         maxSteps: 32,

@@ -71,8 +71,8 @@ export function OnboardingView ({
         }
     }
 
-    const activeModel = config.activeModel
-        ? `${config.activeModel.providerId}/${config.activeModel.modelId}`
+    const defaultModel = config.defaultModel
+        ? `${config.defaultModel.providerId}/${config.defaultModel.modelId}`
         : null;
 
     const stepCopy = {
@@ -123,9 +123,9 @@ export function OnboardingView ({
                 </section>
 
                 <section aria-live="polite" className="onboarding-thread">
-                    {(activeModel || step === 'ready') && (
+                    {(defaultModel || step === 'ready') && (
                         <div className="onboarding-confirmations">
-                            {activeModel && <span><Check aria-hidden="true" />{activeModel}</span>}
+                            {defaultModel && <span><Check aria-hidden="true" />{defaultModel}</span>}
                             {step === 'ready' && <span><Check aria-hidden="true" />{timezone}</span>}
                         </div>
                     )}

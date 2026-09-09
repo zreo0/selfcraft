@@ -95,8 +95,8 @@ export function SettingsView ({
 
                     <div className="settings-section" id="settings-model">
                         <div className="settings-section-title">
-                            <h2>当前模型</h2>
-                            <p>所有入口共用这里选择的同一个模型。</p>
+                            <h2>默认模型</h2>
+                            <p>对话与后台任务共用默认模型。更改只影响下一次运行。</p>
                         </div>
                         {config ? <ModelList config={config} onChanged={onChanged} /> : <p className="text-sm text-muted-foreground">配置暂不可用</p>}
                     </div>
@@ -104,9 +104,9 @@ export function SettingsView ({
                     <div className="settings-section" id="settings-provider">
                         <div className="settings-section-title">
                             <h2>{config?.providers.length ? '添加或更新渠道' : '先给我一个可以思考的模型'}</h2>
-                            <p>保存同名渠道会更新它。API Key 不会从服务端再次读回页面。</p>
+                            <p>同名渠道会合并模型，空 Key 保留原凭证。API Key 不会从服务端再次读回页面。</p>
                         </div>
-                        <ProviderForm onSaved={onChanged} />
+                        <ProviderForm config={config} onSaved={onChanged} />
                     </div>
 
                     <div className="settings-section" id="settings-web">

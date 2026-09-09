@@ -1,5 +1,6 @@
 import { useState, type Dispatch, type FormEvent, type SetStateAction } from 'react';
 import { Button } from '@/components/motion/button';
+import { Combobox } from '@/components/motion/combobox';
 import { Input } from '@/components/motion/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/motion/select';
 import { Switch } from '@/components/motion/switch';
@@ -22,10 +23,12 @@ export function ProviderForm ({
     compact = false,
     onSaved,
     submitLabel = '保存渠道',
+    config,
 }: {
     compact?: boolean;
     onSaved: (config: ConfigView) => void;
     submitLabel?: string;
+    config?: ConfigView | null;
 }) {
     const [input, setInput] = useState<ProviderInput>(INITIAL_PROVIDER);
     const [saving, setSaving] = useState(false);
@@ -50,6 +53,23 @@ export function ProviderForm ({
 
     return (
         <form className="settings-form" onSubmit={handleSubmit}>
+            {Boolean(config?.providers.length) && (
+                <label className="field-label">
+                    <span>编辑已有模型，或直接填写下方内容添加</span>
+                    <Combobox
+                        ariaLabel="载入模型配置"
+                        onValueChange={value => {
+                            const provider = config?.providers.find(item => value.startsWith(`${item.id}/`));
+                            const model = provider?.models.find(item => value === `${provider.id}/${item.id}`);
+                            if (provider && model) {
+                                setInput({ providerId: provider.id, type: provider.type, baseURL: provider.baseURL || '', apiKey: '', modelId: model.id, vision: model.vision, contextWindow: model.contextWindow, maxOutputTokens: model.maxOutputTokens });
+                            }
+                        }}
+                        options={config?.providers.flatMap(provider => provider.models.map(model => ({ value: `${provider.id}/${model.id}`, label: `${provider.id}/${model.id}` }))) || []}
+                        placeholder="搜索已保存的模型"
+                    />
+                </label>
+            )}
             <div className="settings-grid">
                 <label className="field-label">
                     <span>渠道标识</span>
@@ -76,14 +96,14 @@ export function ProviderForm ({
                     </Select>
                 </label>
             </div>
-            {input.type === 'openai-compatible' && (
+            {(
                 <label className="field-label">
-                    <span>API 根地址</span>
+                    <span>API 根地址{input.type !== 'openai-compatible' && '（可选）'}</span>
                     <Input
                         inputMode="url"
                         onChange={value => setInput(current => ({ ...current, baseURL: value }))}
                         placeholder="http://127.0.0.1:3000/v1"
-                        required
+                        required={input.type === 'openai-compatible'}
                         value={input.baseURL}
                     />
                 </label>
@@ -104,8 +124,7 @@ export function ProviderForm ({
                     <Input
                         autoComplete="new-password"
                         onChange={value => setInput(current => ({ ...current, apiKey: value }))}
-                        placeholder="只写入本地 secrets.json"
-                        required
+                        placeholder="留空保留已有凭证；本地接口可不填"
                         type="password"
                         value={input.apiKey}
                     />

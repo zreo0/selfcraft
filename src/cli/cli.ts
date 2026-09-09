@@ -312,6 +312,14 @@ export class Cli {
             return true;
         }
         if (action === 'use') {
+            const purpose = args[2] || 'agent';
+            if (purpose !== 'agent' && purpose !== 'reflection' && purpose !== 'compression') {
+                throw new Error('用途必须是 agent、reflection 或 compression');
+            }
+            const reasoningEffort = args[3] || undefined;
+            if (reasoningEffort !== undefined && reasoningEffort !== 'low' && reasoningEffort !== 'medium' && reasoningEffort !== 'high') {
+                throw new Error('推理强度必须是 low、medium 或 high；省略则使用提供方默认');
+            }
             const value = args[1] || '';
             const separator = value.indexOf('/');
             if (separator <= 0 || separator === value.length - 1) {
@@ -320,8 +328,18 @@ export class Cli {
             await this.dependencies.client.useModel({
                 providerId: value.slice(0, separator),
                 modelId: value.slice(separator + 1),
-            });
-            console.log(`已切换到 ${value}`);
+                reasoningEffort,
+            }, purpose);
+            console.log(`${purpose} 已切换到 ${value}，下一次运行生效`);
+            return false;
+        }
+        if (action === 'inherit') {
+            const purpose = args[1];
+            if (purpose !== 'reflection' && purpose !== 'compression') {
+                throw new Error('用法: /model inherit reflection|compression');
+            }
+            await this.dependencies.client.useModel(null, purpose);
+            console.log(`${purpose} 已跟随默认模型`);
             return false;
         }
         if (action !== 'list') {
@@ -334,13 +352,17 @@ export class Cli {
         const rows = bootstrap.config.providers.flatMap(provider =>
             provider.models.map(model => ({
                 model: `${provider.id}/${model.id}`,
-                active: bootstrap.config?.activeModel?.providerId === provider.id
-                    && bootstrap.config.activeModel.modelId === model.id,
+                active: bootstrap.config?.defaultModel?.providerId === provider.id
+                    && bootstrap.config.defaultModel.modelId === model.id,
                 protocol: provider.type,
                 baseURL: provider.baseURL || 'official',
             })),
         );
         console.table(rows);
+        console.table(['reflection', 'compression'].map(purpose => {
+            const override = bootstrap.config!.modelOverrides[purpose as 'reflection' | 'compression'];
+            return { purpose, model: override ? `${override.providerId}/${override.modelId}` : '跟随默认模型', reasoning: override?.reasoningEffort || '提供方默认' };
+        }));
         return false;
     }
 

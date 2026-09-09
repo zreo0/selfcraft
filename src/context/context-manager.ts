@@ -1,5 +1,6 @@
-import { generateText, type LanguageModel, type ModelMessage } from 'ai';
+import { generateText, type ModelMessage } from 'ai';
 import type { SessionSnapshot } from '../session/session-store';
+import type { ModelSnapshot } from '../model/model-factory';
 
 /** 为长期会话提供有界上下文和可持久摘要 */
 export class ContextManager {
@@ -7,16 +8,18 @@ export class ContextManager {
      * 判断并压缩过长历史
      *
      * @param snapshot 当前会话
-     * @param model 摘要使用的模型
-     * @param contextWindow 当前上下文窗口
+     * @param contextWindow 对话模型的上下文窗口
      * @param reservedContext 身份、记忆、技能和工具需要预留的上下文
+     * @param resolveCompression 需要整理时才解析用途模型
+     * @param abortSignal 当前交互取消信号
      * @returns 是否压缩及新快照
      */
     public async compactIfNeeded (
         snapshot: SessionSnapshot,
-        model: LanguageModel,
         contextWindow: number,
-        reservedContext = '',
+        reservedContext: string,
+        resolveCompression: () => ModelSnapshot,
+        abortSignal?: AbortSignal,
     ): Promise<{ compacted: boolean, snapshot: SessionSnapshot }> {
         const estimatedTokens = this.estimate(snapshot.summary)
             + this.estimate(reservedContext)
@@ -28,21 +31,45 @@ export class ContextManager {
         const keepFrom = this.findRecentBoundary(snapshot.messages);
         const olderMessages = snapshot.messages.slice(0, keepFrom);
         const recentMessages = snapshot.messages.slice(keepFrom);
-        const result = await generateText({
-            model,
-            instructions: [
-                '你负责压缩一段长期个人助理会话。',
-                '保留事实、决定、承诺、偏好、未完成事项、重要原因和可追溯的工具结果。',
-                '将已有摘要和新历史改写成一份新摘要，不要无限追加。',
-                '不要添加原文中没有的信息，不要把会话摘要冒充长期记忆，使用紧凑 Markdown。',
-            ].join('\n'),
-            prompt: `已有摘要：\n${snapshot.summary || '无'}\n\n待压缩消息：\n${this.renderMessages(olderMessages)}`,
-            maxOutputTokens: Math.min(2500, Math.max(800, Math.floor(contextWindow * 0.025))),
-        });
+        const compression = resolveCompression();
+        const outputBudget = Math.min(compression.maxOutputTokens, 2500,
+            Math.max(128, Math.floor(contextWindow * 0.025)),
+            Math.floor(compression.contextWindow * 0.15));
+        const inputBudget = Math.floor(compression.contextWindow * 0.7) - outputBudget;
+        if (inputBudget < 512) {
+            throw new Error('上下文整理模型的窗口不足');
+        }
+        let summary = snapshot.summary;
+        let remaining = this.renderMessages(olderMessages);
+        // 按整理模型的窗口分批归纳，不能拿对话模型的窗口约束另一个模型
+        while (remaining) {
+            const availableCharacters = (inputBudget - this.estimate(summary) - 200) * 2;
+            if (availableCharacters < 256) {
+                throw new Error('已有摘要超过上下文整理模型的输入预算');
+            }
+            const chunk = remaining.slice(0, availableCharacters);
+            const result = await generateText({
+                model: compression.model,
+                abortSignal,
+                instructions: [
+                    '你负责压缩一段长期个人助理会话。',
+                    '保留事实、决定、承诺、偏好、未完成事项、重要原因和可追溯的工具结果。',
+                    '将已有摘要和新历史改写成一份新摘要，不要无限追加。',
+                    '不要添加原文中没有的信息，不要把会话摘要冒充长期记忆，使用紧凑 Markdown。',
+                ].join('\n'),
+                prompt: `已有摘要：\n${summary || '无'}\n\n待压缩消息：\n${chunk}`,
+                maxOutputTokens: outputBudget,
+            });
+            if (!result.text.trim() || result.finishReason === 'length') {
+                throw new Error('上下文整理未返回完整摘要，保留原始上下文');
+            }
+            summary = result.text.trim();
+            remaining = remaining.slice(chunk.length);
+        }
         return {
             compacted: true,
             snapshot: {
-                summary: result.text.trim(),
+                summary,
                 messages: recentMessages,
             },
         };
