@@ -1,3 +1,4 @@
+import type { EvolutionService } from '../evolution/evolution-service';
 import { tool } from 'ai';
 import { z } from 'zod';
 import type { MemoryStore } from '../memory/memory-store';
@@ -18,7 +19,7 @@ const memoryKindSchema = z.enum([
  * @param memory 结构化记忆存储
  * @returns AI SDK 工具集合
  */
-export function createMemoryTools (memory: MemoryStore) {
+export function createMemoryTools (memory: MemoryStore, evolution?: EvolutionService) {
     return {
         memory_remember: tool({
             description: '仅在用户明确要求长期记住时，保存已确认的事实、偏好、身份、关系、决定或经验教训',
@@ -208,8 +209,24 @@ export function createMemoryTools (memory: MemoryStore) {
             inputSchema: z.object({
                 id: z.string().uuid(),
                 status: z.enum(['accepted', 'dismissed']),
+                evidence: z.string().min(10).max(4000),
             }),
-            execute: async ({ id, status }) => ({ updated: memory.resolveGrowth(id, status) }),
+            execute: async ({ id, status, evidence }, options) => {
+                const context = requireToolContext(options.context);
+                const proposal = memory.listGrowth(undefined, 200).find(item => item.id === id);
+                if (status === 'accepted' && proposal?.kind === 'runtime') {
+                    const release = evolution?.releaseStatus();
+                    if (release?.status !== 'stable' || release.growthId !== id) {
+                        throw new Error('关联版本尚未稳定；先等待 Supervisor 重启，再通过 runtime_release 核实');
+                    }
+                }
+                memory.recordEvent({
+                    actor: 'agent', type: 'growth_evaluated', payload: { id, status, evidence },
+                    sourceEventId: context.sourceEventId, runId: context.runId, timezone: context.timezone,
+                    idempotencyKey: `growth:${id}:${context.runId}:${status}`,
+                });
+                return { updated: memory.resolveGrowth(id, status) };
+            },
         }),
     };
 }

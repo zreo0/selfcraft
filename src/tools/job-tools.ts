@@ -1,3 +1,5 @@
+import type { WorkStore } from '../work/work-store';
+import type { ToolRuntimeContext } from './index';
 import { tool } from 'ai';
 import { z } from 'zod';
 import type { JobManager } from '../job/job-manager';
@@ -8,29 +10,49 @@ import type { JobManager } from '../job/job-manager';
  * @param jobs 持久后台任务管理器
  * @returns AI SDK 工具集合
  */
-export function createJobTools (jobs: JobManager) {
+export function createJobTools (jobs: JobManager, works?: WorkStore) {
     return {
         job_start: tool({
             description: '启动可独立运行的后台长任务。普通的短工具调用应当直接完成，不要滥用后台任务',
             inputSchema: z.discriminatedUnion('type', [
                 z.object({
                     type: z.literal('agent'),
+                    workId: z.string().optional(),
+                    workRevision: z.number().int().positive().optional(),
                     title: z.string().min(1).max(120),
                     prompt: z.string().min(1).max(30000),
                     timeoutSeconds: z.number().int().min(1).max(86400).optional(),
                 }),
                 z.object({
                     type: z.literal('shell'),
+                    workId: z.string().optional(),
+                    workRevision: z.number().int().positive().optional(),
                     title: z.string().min(1).max(120),
                     command: z.string().min(1).max(100000),
                     cwd: z.string().optional(),
                     timeoutSeconds: z.number().int().min(1).max(86400).optional(),
                 }),
             ]),
-            execute: async input => {
+            execute: async (input, options) => {
+                const context = options.context as ToolRuntimeContext | undefined;
+                const workId = context?.workId || input.workId;
+                const revision = context?.workRevision ?? input.workRevision;
+                if (workId && (revision === undefined || !works)) {
+                    throw new Error('关联事项需要最新版本');
+                }
+                if (workId) {
+                    works!.requireCurrent(workId, revision!);
+                }
+                const owner = workId ? { workId, workRevision: revision! + 1 } : {};
                 const job = input.type === 'agent'
-                    ? jobs.createAgent(input.title, input.prompt, input.timeoutSeconds)
-                    : jobs.createShell(input.title, input.command, input.cwd, input.timeoutSeconds);
+                    ? jobs.createAgent(input.title, input.prompt, input.timeoutSeconds, owner)
+                    : jobs.createShell(input.title, input.command, input.cwd, input.timeoutSeconds, owner);
+                if (workId) {
+                    works!.update(workId, revision!, {
+                        status: 'waiting', waitFor: 'job', jobId: job.id,
+                        next: '后台执行结束后核实结果并继续原目标',
+                    });
+                }
                 return {
                     id: job.id,
                     title: job.title,

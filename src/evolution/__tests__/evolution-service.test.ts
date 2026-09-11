@@ -45,6 +45,8 @@ describe('EvolutionService', () => {
             content: 'export const value = 2;\n',
         }], 'Fix a reproduced behavior and cover it with tests');
 
+        expect(fs.readFileSync(path.join(project, 'src', 'agent', 'behavior.ts'), 'utf8')).toContain('1');
+        releases.activate(project);
         expect(fs.readFileSync(path.join(project, 'src', 'agent', 'behavior.ts'), 'utf8')).toContain('2');
         expect(releases.read()?.status).toBe('pending');
         releases.rollback(project, 'simulated crash');
@@ -69,4 +71,43 @@ describe('EvolutionService', () => {
             content: 'broken',
         }], 'Attempt to modify immutable supervisor boundary')).rejects.toThrow('不可演化');
     });
+});
+
+test('暂存候选不覆盖随后发生的实例源码修改，稳定备份可以回退', async () => {
+    const root = createTemporaryDirectory();
+    const paths = resolvePaths('development', path.join(root, 'home'));
+    paths.project = path.join(root, 'project');
+    fs.mkdirSync(path.join(paths.project, 'src'), { recursive: true });
+    const file = path.join(paths.project, 'src', 'behavior.ts');
+    fs.writeFileSync(file, 'export const value = 1;');
+    const releases = new ReleaseStore(paths.supervisor, paths.evolution);
+    const service = new EvolutionService(paths, releases, new Logger(paths.logs), async () => ({ healthy: true, output: 'verified' }));
+    await service.propose([{ path: 'src/behavior.ts', content: 'export const value = 2;' }], 'Verified local improvement');
+    fs.writeFileSync(file, 'export const value = 3;');
+    expect(() => releases.activate(paths.project)).toThrow('基础已改变');
+    releases.rollback(paths.project, 'conflict');
+    expect(fs.readFileSync(file, 'utf8')).toContain('3');
+    await service.propose([{ path: 'src/behavior.ts', content: 'export const value = 4;' }], 'Rebased improvement');
+    releases.activate(paths.project);
+    releases.markStable();
+    expect(fs.existsSync(path.join(paths.evolution, releases.read()!.backupDirectory))).toBeTrue();
+    releases.rollback(paths.project, 'later behavioral regression');
+    expect(fs.readFileSync(file, 'utf8')).toContain('3');
+});
+
+test('并发演化只有一个候选进入验证与发布通道', async () => {
+    const root = createTemporaryDirectory();
+    const paths = resolvePaths('development', path.join(root, 'home'));
+    paths.project = path.join(root, 'project');
+    fs.mkdirSync(path.join(paths.project, 'src'), { recursive: true });
+    let finish: () => void = () => undefined;
+    const gate = new Promise<void>(resolve => { finish = resolve; });
+    const service = new EvolutionService(paths, new ReleaseStore(paths.supervisor, paths.evolution), new Logger(paths.logs), async () => {
+        await gate;
+        return { healthy: true, output: 'verified' };
+    });
+    const first = service.propose([{ path: 'src/one.ts', content: 'export const one = 1;' }], 'First validated change');
+    await expect(service.propose([{ path: 'src/two.ts', content: 'export const two = 2;' }], 'Concurrent change')).rejects.toThrow('正在验证');
+    finish();
+    await first;
 });

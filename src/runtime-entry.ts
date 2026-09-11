@@ -1,3 +1,7 @@
+import { acquireRuntimeLease } from './supervisor/runtime-lease';
+import { ExecutionStore } from './execution/execution-store';
+import { WorkStore } from './work/work-store';
+import { WorkRunner } from './work/work-runner';
 import * as path from 'node:path';
 import { AgentRuntime } from './agent/agent-runtime';
 import { ForegroundRunner } from './agent/foreground-runner';
@@ -27,6 +31,10 @@ const RESTART_EXIT_CODE = 75;
 /** 组装唯一 Runtime，并启动供各通信入口共享的 HTTP 服务 */
 async function main (): Promise<void> {
     const paths = resolvePaths();
+    if (!process.argv.includes('--check-state')) {
+        const releaseLease = acquireRuntimeLease(paths.home);
+        process.once('exit', releaseLease);
+    }
     const config = new ConfigStore(paths.config);
     const logger = new Logger(paths.logs);
     const workspace = new WorkspaceService(paths.workspace, path.join(paths.project, 'workspace-template'));
@@ -36,6 +44,8 @@ async function main (): Promise<void> {
     const context = new ContextManager();
     const notifications = new NotificationInbox(paths.notifications);
     const memory = new MemoryStore(paths.state);
+    const executions = new ExecutionStore(paths.state);
+    const works = new WorkStore(paths.state);
     const scheduledTasks = new ScheduledTaskManager(paths.state, notifications, memory);
     const reflection = new ReflectionWorker(memory, () => ModelFactory.create(config, 'reflection', logger), logger);
     const jobs = new JobManager(
@@ -47,6 +57,10 @@ async function main (): Promise<void> {
     );
     const releases = new ReleaseStore(paths.supervisor, paths.evolution);
     const evolution = new EvolutionService(paths, releases, logger);
+    if (process.argv.includes('--check-state')) {
+        console.log('实例状态兼容检查通过');
+        return;
+    }
     const webProvider = new TavilyWebProvider(() => config.getWebAccess().apiKey);
     const tools = createTools(
         paths.workspace,
@@ -57,6 +71,8 @@ async function main (): Promise<void> {
         memory,
         scheduledTasks,
         webProvider,
+        executions,
+        works,
     );
     const agent = new AgentRuntime(
         config,
@@ -69,9 +85,13 @@ async function main (): Promise<void> {
         reflection,
         tools,
         logger,
+        undefined,
+        executions,
+        works,
     );
-    const foreground = new ForegroundRunner(agent);
-    jobs.setAgentExecutor((job, signal, onLog) => agent.runBackground(job, signal, onLog));
+    const foreground = new ForegroundRunner(agent, executions, () => requestShutdown(RESTART_EXIT_CODE));
+    jobs.setAgentExecutor((job, signal, onLog) => agent.runBackground(job, signal, onLog),
+        job => Boolean(executions.get(`job:${job.id}`)));
     jobs.start();
     scheduledTasks.start();
     reflection.start();
@@ -87,6 +107,16 @@ async function main (): Promise<void> {
         shuttingDown = true;
         resolveShutdown(exitCode);
     };
+    const workRunner = new WorkRunner(works, agent, foreground, jobs, memory, notifications, logger,
+        () => requestShutdown(RESTART_EXIT_CODE), () => evolution.hasPendingRelease(), () => config.isConfigured());
+    foreground.recover((id, error, result) => {
+        notifications.pushOnce(`recovered:${id}`, error ? '中断的请求需要处理' : '中断的请求已完成',
+            error ? String(error) : '已恢复处理，请查看对话历史');
+        if (result?.restartRequired) {
+            requestShutdown(RESTART_EXIT_CODE);
+        }
+    });
+    workRunner.start();
     const web = new WebServer({
         paths,
         config,
@@ -113,6 +143,9 @@ async function main (): Promise<void> {
     } finally {
         process.off('SIGINT', handleSigint);
         process.off('SIGTERM', handleSigterm);
+        foreground.stop();
+        jobs.stop();
+        workRunner.stop();
         web.stop();
         scheduledTasks.stop();
         reflection.stop();

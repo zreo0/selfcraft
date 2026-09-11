@@ -1,4 +1,8 @@
-import type { Tool } from 'ai';
+import type { ExecutionStore } from '../execution/execution-store';
+import type { WorkStore } from '../work/work-store';
+import { createWorkTools } from './work-tools';
+import { tool, type Tool } from 'ai';
+import { z } from 'zod';
 import { createEvolutionTools } from './evolution-tool';
 import { createFileTools } from './file-tools';
 import { createJobTools } from './job-tools';
@@ -32,6 +36,10 @@ export type ToolRuntimeContext = {
     taskId?: string;
     /** 当前运行已知的长期事项 */
     topicIds?: string[];
+    /** 本轮承接的事项及其版本 */
+    workId?: string;
+    /** 运行开始时的事项版本 */
+    workRevision?: number;
 };
 
 /**
@@ -56,21 +64,31 @@ export function createTools (
     memory: MemoryStore,
     scheduledTasks?: ScheduledTaskManager,
     webProvider?: WebProvider,
+    executions?: ExecutionStore,
+    works?: WorkStore,
 ) {
     const guard = new PathGuard(workspacePath);
     const tools = {
         ...createFileTools(guard),
+        ...(executions ? {
+            execution_status: tool({
+                description: '检查中断执行的完整工具参数与已知结果；未知结果必须查询实际状态，不能直接重放',
+                inputSchema: z.object({ id: z.string() }),
+                execute: async ({ id }) => executions.inspect(id),
+            }),
+        } : {}),
         shell: createShellTool(guard),
         ...createSkillTools(skills),
-        ...createJobTools(jobs),
-        ...createMemoryTools(memory),
+        ...createJobTools(jobs, works),
+        ...createMemoryTools(memory, evolution),
+        ...(works ? createWorkTools(works) : {}),
         ...(scheduledTasks ? createScheduledTaskTools(scheduledTasks) : {}),
         ...(webProvider ? createWebTools(webProvider) : {}),
         notify: createNotifyTool(notifications),
         ...createEvolutionTools(evolution),
     };
     const offloaded = wrapToolsWithResultOffload(tools, workspacePath);
-    return wrapToolsWithTimeline(offloaded, memory);
+    return wrapToolsWithTimeline(offloaded, memory, executions, works);
 }
 
 /**
@@ -83,6 +101,8 @@ export function createTools (
 function wrapToolsWithTimeline (
     tools: Record<string, any>,
     memory: MemoryStore,
+    executions?: ExecutionStore,
+    works?: WorkStore,
 ): Record<string, Tool<any, any, ToolRuntimeContext>> {
     return Object.fromEntries(Object.entries(tools).map(([name, definition]) => {
         if (typeof definition.execute !== 'function') {
@@ -95,6 +115,11 @@ function wrapToolsWithTimeline (
                 if (!context) {
                     return definition.execute(input, options);
                 }
+                options.abortSignal?.throwIfAborted();
+                if (context.workId && context.workRevision !== undefined) {
+                    works?.requireCurrent(context.workId, context.workRevision);
+                }
+                executions?.startTool(context.runId, options.toolCallId, name, input);
                 const callEvent = memory.recordEvent({
                     actor: 'agent',
                     type: 'tool_call',
@@ -112,6 +137,7 @@ function wrapToolsWithTimeline (
                 let result: unknown;
                 try {
                     result = await definition.execute(input, options);
+                    executions?.finishTool(context.runId, options.toolCallId, result);
                 } catch (error) {
                     try {
                         memory.recordEvent({

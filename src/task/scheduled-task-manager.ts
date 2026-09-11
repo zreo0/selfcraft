@@ -1,3 +1,4 @@
+import { assertStateVersion } from '../supervisor/state-version';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -139,6 +140,7 @@ export class ScheduledTaskManager {
     ) {
         fs.mkdirSync(path.dirname(databasePath), { recursive: true });
         this.database = new Database(databasePath, { create: true });
+        assertStateVersion(this.database);
         this.database.run('PRAGMA journal_mode = WAL');
         this.database.run('PRAGMA busy_timeout = 5000');
         this.scanIntervalMs = Math.max(50, Math.trunc(scanIntervalMs));

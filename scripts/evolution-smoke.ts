@@ -41,6 +41,7 @@ async function main (): Promise<void> {
                 '',
             ].join('\n'),
         }], 'Verify the complete candidate validation, activation and rollback pipeline');
+        releases.activate(project);
         if (!fs.existsSync(path.join(project, markerPath)) || releases.read()?.status !== 'pending') {
             throw new Error('候选版本未被正确激活');
         }

@@ -1,3 +1,6 @@
+import { fingerprintProject } from '../supervisor/release-store';
+import { validateCandidate } from '../supervisor/candidate-validator';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -31,6 +34,7 @@ const PROTECTED_PATHS = [
 
 /** 负责提案式自我修改，不允许绕过验证直接覆盖运行代码 */
 export class EvolutionService {
+    private proposing = false;
     /**
      * 创建演化服务
      *
@@ -43,17 +47,34 @@ export class EvolutionService {
         private readonly paths: SelfcraftPaths,
         private readonly releases: ReleaseStore,
         private readonly logger: Logger,
-        private readonly validator: CandidateValidator = candidatePath => this.validateWithBun(candidatePath),
+        private readonly validator: CandidateValidator = candidatePath => validateCandidate(candidatePath, this.paths.home),
     ) {}
 
     /**
-     * 验证并激活一组源码修改
+     * 验证并暂存一组源码修改，由 Supervisor 激活
      *
      * @param changes 完整文件修改
      * @param rationale 修改原因与预期收益
      * @returns 发布标识与验证信息
      */
-    public async propose (changes: EvolutionChange[], rationale: string): Promise<{
+    public async propose (changes: EvolutionChange[], rationale: string, growthId?: string): Promise<{
+        releaseId: string;
+        restartRequired: true;
+        validation: string;
+    }> {
+        if (this.proposing) {
+            throw new Error('已有候选正在验证，请等待该发布完成');
+        }
+        this.proposing = true;
+        try {
+            return await this.stage(changes, rationale, growthId);
+        } finally {
+            this.proposing = false;
+        }
+    }
+
+    /** 在单一发布通道中构建并暂存候选 */
+    private async stage (changes: EvolutionChange[], rationale: string, growthId?: string): Promise<{
         releaseId: string;
         restartRequired: true;
         validation: string;
@@ -67,6 +88,14 @@ export class EvolutionService {
         const normalized = changes.map(change => ({
             path: this.validateChangePath(change.path),
             content: change.content,
+        }));
+        if (new Set(normalized.map(change => change.path)).size !== normalized.length) {
+            throw new Error('候选包含重复文件');
+        }
+        const baseFingerprint = fingerprintProject(this.paths.project);
+        const baseHashes = Object.fromEntries(normalized.map(change => {
+            const file = path.join(this.paths.project, change.path);
+            return [change.path, fs.existsSync(file) ? createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null];
         }));
         const releaseId = `${Date.now()}-${randomUUID().slice(0, 8)}`;
         const candidatePath = path.join(this.paths.evolution, 'candidates', releaseId);
@@ -84,6 +113,22 @@ export class EvolutionService {
             throw new Error(`候选版本未通过验证：${validation.output.slice(-2000)}`);
         }
 
+        for (const change of normalized) {
+            const file = path.join(this.paths.project, change.path);
+            const current = fs.existsSync(file) ? createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null;
+            if (current !== baseHashes[change.path]) {
+                fs.rmSync(candidatePath, { recursive: true, force: true });
+                throw new Error('候选验证期间基础源码已变化，请基于最新版本重新提案');
+            }
+        }
+        if (fingerprintProject(this.paths.project) !== baseFingerprint) {
+            fs.rmSync(candidatePath, { recursive: true, force: true });
+            throw new Error('候选验证期间项目基础已改变，请重新合并后验证');
+        }
+        if (this.releases.read()?.status === 'pending') {
+            fs.rmSync(candidatePath, { recursive: true, force: true });
+            throw new Error('验证期间出现另一待发布版本，已取消当前候选');
+        }
         const backupDirectory = path.join('backups', releaseId);
         const backupPath = path.join(this.paths.evolution, backupDirectory);
         const files = normalized.map(change => {
@@ -94,7 +139,7 @@ export class EvolutionService {
                 fs.mkdirSync(path.dirname(backupFile), { recursive: true });
                 fs.copyFileSync(sourcePath, backupFile);
             }
-            return { path: change.path, existed };
+            return { path: change.path, existed, baseHash: baseHashes[change.path], candidateHash: createHash('sha256').update(change.content).digest('hex') };
         });
 
         // 先持久化回滚信息，确保多文件激活中途崩溃后 Supervisor 仍能恢复
@@ -104,23 +149,13 @@ export class EvolutionService {
             createdAt: new Date().toISOString(),
             backupDirectory,
             files,
+            candidateDirectory: path.join('candidates', releaseId),
+            validation: validation.output.slice(-12000),
+            baseFingerprint,
+            parentId: this.releases.read()?.status === 'rolled_back' ? this.releases.read()?.parentId : this.releases.read()?.id,
+            ...(growthId && { growthId }),
         });
-        try {
-            for (const change of normalized) {
-                const sourcePath = path.join(candidatePath, change.path);
-                const targetPath = path.join(this.paths.project, change.path);
-                fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-                const temporaryPath = `${targetPath}.${releaseId}.tmp`;
-                fs.copyFileSync(sourcePath, temporaryPath);
-                fs.renameSync(temporaryPath, targetPath);
-            }
-        } catch (error) {
-            this.releases.rollback(this.paths.project, '候选版本激活失败');
-            fs.rmSync(candidatePath, { recursive: true, force: true });
-            throw error;
-        }
-        fs.rmSync(candidatePath, { recursive: true, force: true });
-        this.logger.info('演化候选已激活，等待新进程健康验证', {
+        this.logger.info('演化候选已暂存，等待 Supervisor 验证和切换', {
             releaseId,
             files: files.map(file => file.path),
         });
@@ -129,6 +164,11 @@ export class EvolutionService {
             restartRequired: true,
             validation: validation.output.slice(-2000),
         };
+    }
+
+    /** 返回最新发布来源与状态，供助理确认升级是否真正生效 */
+    public releaseStatus () {
+        return this.releases.read();
     }
 
     /** 返回是否有版本等待 Supervisor 重启验证 */
@@ -184,7 +224,7 @@ export class EvolutionService {
 
     /** 只允许修改 Runtime 与工作区模板，Supervisor 边界保持不可变 */
     private validateChangePath (input: string): string {
-        const normalized = input.replaceAll('\\', '/').replace(/^\.\//, '');
+        const normalized = path.posix.normalize(input.replaceAll('\\', '/')).replace(/^\.\//, '');
         if (
             normalized.includes('../') ||
             normalized.startsWith('/') ||
@@ -192,6 +232,13 @@ export class EvolutionService {
             PROTECTED_PATHS.some(protectedPath => normalized === protectedPath || normalized.startsWith(protectedPath))
         ) {
             throw new Error(`不可演化的路径: ${input}`);
+        }
+        let current = this.paths.project;
+        for (const part of normalized.split('/')) {
+            current = path.join(current, part);
+            if (fs.existsSync(current) && fs.lstatSync(current).isSymbolicLink()) {
+                throw new Error('演化路径不能经过符号链接');
+            }
         }
         return normalized;
     }
@@ -211,34 +258,4 @@ export class EvolutionService {
         }
     }
 
-    /** 在独立候选目录执行类型、测试和启动健康检查 */
-    private async validateWithBun (candidatePath: string): Promise<ValidationResult> {
-        const commands = [
-            ['bun', 'run', 'typecheck'],
-            ['bun', 'test'],
-            ['bun', 'run', 'src/doctor.ts', '--code-only'],
-        ];
-        let output = '';
-        for (const command of commands) {
-            const subprocess = Bun.spawn(command, {
-                cwd: candidatePath,
-                env: {
-                    ...process.env,
-                    SELFCRAFT_PROJECT_ROOT: candidatePath,
-                },
-                stdout: 'pipe',
-                stderr: 'pipe',
-            });
-            const [stdout, stderr, exitCode] = await Promise.all([
-                new Response(subprocess.stdout).text(),
-                new Response(subprocess.stderr).text(),
-                subprocess.exited,
-            ]);
-            output += `$ ${command.join(' ')}\n${stdout}${stderr}`;
-            if (exitCode !== 0) {
-                return { healthy: false, output };
-            }
-        }
-        return { healthy: true, output };
-    }
 }

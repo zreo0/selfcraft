@@ -1,5 +1,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { Database } from 'bun:sqlite';
+import { randomUUID } from 'node:crypto';
+import { assertStateVersion } from '../supervisor/state-version';
 import { modelMessageSchema, type ModelMessage } from 'ai';
 
 /** 持久会话快照 */
@@ -10,8 +13,9 @@ export interface SessionSnapshot {
     messages: ModelMessage[];
 }
 
-/** 使用 JSONL 保存一个长期连续会话 */
+/** 在 SQLite 事务中保存原文和派生上下文，旧 JSONL 只导入一次 */
 export class SessionStore {
+    private readonly database: Database;
     private readonly contextPath: string;
     private readonly transcriptPath: string;
 
@@ -29,7 +33,41 @@ export class SessionStore {
         fs.mkdirSync(sessionPath, { recursive: true });
         this.contextPath = path.join(sessionPath, 'context.json');
         this.transcriptPath = path.join(sessionPath, 'transcript.jsonl');
-        this.migrateLegacy(sessionPath);
+        this.database = new Database(path.join(sessionPath, 'session.sqlite'));
+        assertStateVersion(this.database);
+        this.database.run('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000');
+        this.database.run(`
+            CREATE TABLE IF NOT EXISTS session_context (id INTEGER PRIMARY KEY, snapshot TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS session_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS session_appends (id TEXT PRIMARY KEY);
+        `);
+        if (!this.database.query('SELECT id FROM session_context WHERE id = 1').get()) {
+            this.migrateLegacy(sessionPath);
+            let snapshot: SessionSnapshot;
+            try {
+                snapshot = JSON.parse(fs.readFileSync(this.contextPath, 'utf8')) as SessionSnapshot;
+                if (typeof snapshot.summary !== 'string' || !Array.isArray(snapshot.messages)) {
+                    throw new Error('旧会话快照无效');
+                }
+                snapshot.messages.forEach(message => modelMessageSchema.parse(message));
+            } catch (error) {
+                if (!fs.existsSync(this.transcriptPath)) {
+                    throw error;
+                }
+                snapshot = { summary: '', messages: fs.readFileSync(this.transcriptPath, 'utf8')
+                    .split(/\r?\n/).filter(Boolean).map(line => modelMessageSchema.parse(JSON.parse(line))) };
+            }
+            const transcript = fs.existsSync(this.transcriptPath)
+                ? fs.readFileSync(this.transcriptPath, 'utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line))
+                : snapshot.messages;
+            [...snapshot.messages, ...transcript].forEach(message => modelMessageSchema.parse(message));
+            this.database.transaction(() => {
+                this.database.query('INSERT INTO session_context VALUES (1, ?)').run(JSON.stringify(snapshot));
+                for (const message of transcript) {
+                    this.database.query('INSERT INTO session_messages (message) VALUES (?)').run(JSON.stringify(message));
+                }
+            }).immediate();
+        }
     }
 
     /**
@@ -38,24 +76,10 @@ export class SessionStore {
      * @returns 当前会话快照
      */
     public load (): SessionSnapshot {
-        if (!fs.existsSync(this.contextPath)) {
-            return { summary: '', messages: [] };
-        }
-        const value = JSON.parse(fs.readFileSync(this.contextPath, 'utf8')) as {
-            summary?: unknown;
-            messages?: unknown;
-        };
-        if (typeof value.summary !== 'string' || !Array.isArray(value.messages)) {
-            throw new Error('会话上下文文件无效');
-        }
-        const messages = value.messages.map(message => {
-            const parsed = modelMessageSchema.safeParse(message);
-            if (!parsed.success) {
-                throw new Error('会话上下文包含无效消息');
-            }
-            return parsed.data;
-        });
-        return { summary: value.summary, messages };
+        const row = this.database.query('SELECT snapshot FROM session_context WHERE id = 1').get() as { snapshot: string };
+        const snapshot = JSON.parse(row.snapshot) as SessionSnapshot;
+        snapshot.messages.forEach(message => modelMessageSchema.parse(message));
+        return snapshot;
     }
 
     /**
@@ -64,19 +88,29 @@ export class SessionStore {
      * @param messages AI SDK 标准消息
      */
     public append (...messages: ModelMessage[]): void {
-        if (messages.length === 0) {
-            return;
-        }
-        const serialized = messages.map(message => {
-            modelMessageSchema.parse(message);
-            return JSON.stringify(message);
-        });
-        const snapshot = this.load();
-        this.writeContext({
-            summary: snapshot.summary,
-            messages: [...snapshot.messages, ...messages],
-        });
-        fs.appendFileSync(this.transcriptPath, `${serialized.join('\n')}\n`, 'utf8');
+        this.appendOnce(randomUUID(), ...messages);
+    }
+
+    /** 以稳定提交标识原子追加上下文和原文，恢复后不会重复写入 */
+    public appendOnce (id: string, ...messages: ModelMessage[]): void {
+        messages.forEach(message => modelMessageSchema.parse(message));
+        this.database.transaction(() => {
+            const inserted = this.database.query('INSERT OR IGNORE INTO session_appends VALUES (?)').run(id);
+            if (!inserted.changes) {
+                return;
+            }
+            const snapshot = this.load();
+            this.database.query('UPDATE session_context SET snapshot = ? WHERE id = 1')
+                .run(JSON.stringify({ ...snapshot, messages: [...snapshot.messages, ...messages] }));
+            for (const message of messages) {
+                this.database.query('INSERT INTO session_messages (message) VALUES (?)').run(JSON.stringify(message));
+            }
+        }).immediate();
+    }
+
+    /** 判断稳定提交是否已经写入，避免恢复时重复组装用户输入 */
+    public hasAppend (id: string): boolean {
+        return Boolean(this.database.query('SELECT id FROM session_appends WHERE id = ?').get(id));
     }
 
     /**
@@ -89,13 +123,16 @@ export class SessionStore {
         for (const message of messages) {
             modelMessageSchema.parse(message);
         }
-        this.writeContext({ summary: summary.trim(), messages });
+        this.database.query('UPDATE session_context SET snapshot = ? WHERE id = 1')
+            .run(JSON.stringify({ summary: summary.trim(), messages }));
     }
 
     /** 清空当前会话但保留目录 */
     public clear (): void {
-        this.writeContext({ summary: '', messages: [] });
-        fs.writeFileSync(this.transcriptPath, '', 'utf8');
+        this.database.transaction(() => {
+            this.replace('', []);
+            this.database.run('DELETE FROM session_messages; DELETE FROM session_appends');
+        }).immediate();
     }
 
     /**
@@ -105,17 +142,10 @@ export class SessionStore {
      * @returns 按原始顺序排列的消息
      */
     public loadTranscript (limit = 1000): ModelMessage[] {
-        if (!fs.existsSync(this.transcriptPath)) {
-            return [];
-        }
-        const lines = fs.readFileSync(this.transcriptPath, 'utf8').split(/\r?\n/).filter(Boolean);
-        return lines.slice(-Math.max(1, limit)).map(line => {
-            const parsed = modelMessageSchema.safeParse(JSON.parse(line));
-            if (!parsed.success) {
-                throw new Error('原始会话记录包含无效消息');
-            }
-            return parsed.data;
-        });
+        const rows = this.database.query(`SELECT message FROM (
+            SELECT id, message FROM session_messages ORDER BY id DESC LIMIT ?
+        ) ORDER BY id`).all(Math.max(1, limit)) as { message: string }[];
+        return rows.map(row => modelMessageSchema.parse(JSON.parse(row.message)));
     }
 
     /** 使用单文件原子替换上下文快照 */
@@ -128,6 +158,12 @@ export class SessionStore {
     /** 一次性导入最早版的 messages.jsonl 和 summary.md */
     private migrateLegacy (sessionPath: string): void {
         if (fs.existsSync(this.contextPath)) {
+            return;
+        }
+        if (fs.existsSync(this.transcriptPath)) {
+            const messages = fs.readFileSync(this.transcriptPath, 'utf8').split(/\r?\n/).filter(Boolean)
+                .map(line => modelMessageSchema.parse(JSON.parse(line)));
+            this.writeContext({ summary: '', messages });
             return;
         }
         const messagesPath = path.join(sessionPath, 'messages.jsonl');

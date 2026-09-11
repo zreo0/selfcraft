@@ -50,3 +50,20 @@ describe('SessionStore', () => {
         ]);
     });
 });
+
+test('旧实例一次性迁移保留原文，后续稳定提交跨重启去重', () => {
+    const root = createTemporaryDirectory();
+    const directory = path.join(root, 'main');
+    fs.mkdirSync(directory);
+    const user = { role: 'user', content: '以前交代的事项' };
+    fs.writeFileSync(path.join(directory, 'context.json'), JSON.stringify({ summary: '摘要', messages: [user] }));
+    const original = `${JSON.stringify(user)}\n`;
+    fs.writeFileSync(path.join(directory, 'transcript.jsonl'), original);
+    const first = new SessionStore(root);
+    first.appendOnce('reply:1', { role: 'assistant', content: '已接续' });
+    const restored = new SessionStore(root);
+    restored.appendOnce('reply:1', { role: 'assistant', content: '已接续' });
+    expect(restored.loadTranscript()).toHaveLength(2);
+    expect(restored.load().summary).toBe('摘要');
+    expect(fs.readFileSync(path.join(directory, 'transcript.jsonl'), 'utf8')).toBe(original);
+});

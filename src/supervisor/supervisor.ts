@@ -1,3 +1,5 @@
+import { acquireRuntimeLease } from './runtime-lease';
+import { validateCandidate } from './candidate-validator';
 import type { Subprocess } from 'bun';
 import type { SelfcraftPaths } from '../config/paths';
 import type { Logger } from '../logging/logger';
@@ -32,8 +34,39 @@ export class Supervisor {
      * @returns 最终退出码
      */
     public async run (runtimeArgs: string[] = []): Promise<number> {
+        if (runtimeArgs.includes('--rollback')) {
+            const releaseLease = acquireRuntimeLease(this.paths.home);
+            try {
+                this.releases.rollback(this.paths.project, '用户请求回退到上一版本');
+            } finally {
+                releaseLease();
+            }
+            runtimeArgs = runtimeArgs.filter(argument => argument !== '--rollback');
+        }
+        let crashCount = 0;
         while (!this.stopping) {
-            const pending = this.releases.read()?.status === 'pending';
+            const release = this.releases.read();
+            const pending = release?.status === 'pending';
+            if (pending && release.candidateDirectory && release.activated && !release.activationComplete) {
+                this.releases.rollback(this.paths.project, '源码切换过程中断，恢复上一完整版本');
+                continue;
+            }
+            if (pending && release.candidateDirectory && !release.activated) {
+                const releaseLease = acquireRuntimeLease(this.paths.home);
+                try {
+                    const validation = await validateCandidate(this.releases.candidatePath()!, this.paths.home);
+                    if (!validation.healthy) {
+                        throw new Error(validation.output.slice(-2000));
+                    }
+                    this.releases.activate(this.paths.project, this.paths.home);
+                } catch (error) {
+                    this.logger.error('暂存候选未通过稳定边界检查', { error: String(error) });
+                    this.releases.rollback(this.paths.project, String(error));
+                    continue;
+                } finally {
+                    releaseLease();
+                }
+            }
             if (pending && !(await this.preflightCurrentCode())) {
                 this.logger.error('新版本启动前健康检查失败，执行回滚');
                 this.releases.rollback(this.paths.project, '启动前健康检查失败');
@@ -73,6 +106,7 @@ export class Supervisor {
                     return early.exitCode;
                 }
             }
+            const startedAt = Date.now();
             const exitCode = await child.exited;
             this.clearActiveRuntime(child);
             if (this.stopping) {
@@ -81,6 +115,14 @@ export class Supervisor {
             if (exitCode === RESTART_EXIT_CODE) {
                 this.logger.info('Runtime 请求重启以加载新版本');
                 continue;
+            }
+            if (exitCode !== 0) {
+                crashCount = Date.now() - startedAt > 60_000 ? 1 : crashCount + 1;
+                if (crashCount <= 3) {
+                    this.logger.warn('Runtime 意外退出，保留状态后重启', { exitCode, crashCount });
+                    await Bun.sleep(Math.min(1000 * crashCount, 3000));
+                    continue;
+                }
             }
             return exitCode;
         }

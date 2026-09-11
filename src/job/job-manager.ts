@@ -1,3 +1,4 @@
+import { assertStateVersion } from '../supervisor/state-version';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -18,12 +19,20 @@ export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancell
 export interface AgentJobPayload {
     /** 需要独立完成的目标 */
     prompt: string;
+    /** 关联事项的不可变执行版本 */
+    workId?: string;
+    /** 关联事项版本 */
+    workRevision?: number;
 }
 
 /** Shell 后台任务输入 */
 export interface ShellJobPayload {
     /** Shell 命令 */
     command: string;
+    /** 关联事项标识 */
+    workId?: string;
+    /** 关联事项版本 */
+    workRevision?: number;
     /** workspace 相对工作目录 */
     cwd: string;
 }
@@ -32,6 +41,10 @@ export interface ShellJobPayload {
 export interface JobRecord {
     /** 任务标识 */
     id: string;
+    /** 助理内部接续所关联的事项 */
+    workId?: string;
+    /** 事项版本 */
+    workRevision?: number;
     /** 用户可读标题 */
     title: string;
     /** 任务类型 */
@@ -98,6 +111,7 @@ export class JobManager {
     private readonly database: Database;
     private readonly active = new Map<string, ActiveJob>();
     private agentExecutor?: AgentJobExecutor;
+    private canRecoverAgent: (job: JobRecord) => boolean = () => false;
     private started = false;
     private draining = false;
 
@@ -122,6 +136,7 @@ export class JobManager {
         fs.mkdirSync(path.dirname(databasePath), { recursive: true });
         fs.mkdirSync(jobsPath, { recursive: true });
         this.database = new Database(databasePath, { create: true });
+        assertStateVersion(this.database);
         this.database.run('PRAGMA journal_mode = WAL');
         this.database.run('PRAGMA busy_timeout = 5000');
         this.migrate();
@@ -132,8 +147,9 @@ export class JobManager {
      *
      * @param executor 与前台共用内核但隔离会话的执行器
      */
-    public setAgentExecutor (executor: AgentJobExecutor): void {
+    public setAgentExecutor (executor: AgentJobExecutor, canRecover: (job: JobRecord) => boolean = () => false): void {
         this.agentExecutor = executor;
+        this.canRecoverAgent = canRecover;
     }
 
     /** 恢复中断状态并开始处理持久队列 */
@@ -146,6 +162,14 @@ export class JobManager {
         this.drain();
     }
 
+    /** 停止领取并中断模型；独立 Shell 留给下一 Runtime 接管 */
+    public stop (): void {
+        this.started = false;
+        for (const active of this.active.values()) {
+            active.controller?.abort(new Error('Runtime 正在停止'));
+        }
+    }
+
     /**
      * 创建一个后台 Agent 任务
      *
@@ -154,8 +178,8 @@ export class JobManager {
      * @param timeoutSeconds 最长执行时间
      * @returns 已持久化任务
      */
-    public createAgent (title: string, prompt: string, timeoutSeconds = 3600): JobRecord {
-        const job = this.create('agent', title, { prompt }, timeoutSeconds);
+    public createAgent (title: string, prompt: string, timeoutSeconds = 3600, owner: { workId?: string; workRevision?: number } = {}): JobRecord {
+        const job = this.create('agent', title, { prompt, ...owner }, timeoutSeconds);
         this.drain();
         return job;
     }
@@ -174,13 +198,14 @@ export class JobManager {
         command: string,
         cwd = '.',
         timeoutSeconds = 3600,
+        owner: { workId?: string; workRevision?: number } = {},
     ): JobRecord {
         assertSafeShellCommand(command);
         const workingDirectory = this.guard.resolveRead(cwd);
         if (!fs.statSync(workingDirectory).isDirectory()) {
             throw new Error('后台 Shell 工作路径不是目录');
         }
-        const job = this.create('shell', title, { command, cwd }, timeoutSeconds);
+        const job = this.create('shell', title, { command, cwd, ...owner }, timeoutSeconds);
         this.drain();
         return job;
     }
@@ -196,6 +221,11 @@ export class JobManager {
             SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?
         `).all(Math.max(1, Math.min(limit, 200))) as JobRow[];
         return rows.map(toJobRecord);
+    }
+
+    /** 列出仍可能产生副作用的执行，供事项版本检查 */
+    public unfinished (): JobRecord[] {
+        return (this.database.query("SELECT * FROM jobs WHERE status IN ('queued', 'running')").all() as JobRow[]).map(toJobRecord);
     }
 
     /**
@@ -352,6 +382,11 @@ export class JobManager {
         for (const row of running) {
             const job = toJobRecord(row);
             if (job.type === 'agent') {
+                if (!this.canRecoverAgent(job)) {
+                    this.finish(job.id, 'interrupted', undefined, '旧执行缺少可验证检查点，未自动重放');
+                    this.notifications.push(`后台任务需要核实：${job.title}`, `任务 ${job.id} 没有执行检查点，请先检查实际结果`);
+                    continue;
+                }
                 this.database.query(`
                     UPDATE jobs SET status = 'queued', pid = NULL,
                         error = 'Runtime 重启，Agent 任务将根据日志继续', updated_at = ?
@@ -429,34 +464,18 @@ export class JobManager {
         }
         const timeout = setTimeout(() => controller.abort(new Error('后台 Agent 任务超时')), job.timeoutSeconds * 1000);
         timeout.unref();
-        const previousLog = job.attempts > 1 ? readTail(job.logPath, 16000) : '';
-        const executableJob = previousLog
-            ? {
-                ...job,
-                payload: {
-                    prompt: [
-                        (job.payload as AgentJobPayload).prompt,
-                        '',
-                        '该任务曾因 Runtime 重启中断。先检查 workspace 实际状态，再从已完成处继续；不要重复不可逆操作。',
-                        '<previous-job-log>',
-                        previousLog,
-                        '</previous-job-log>',
-                    ].join('\n'),
-                },
-            }
-            : job;
         this.appendLog(job.logPath, `[${new Date().toISOString()}] agent attempt ${job.attempts} started\n`);
         try {
-            await this.agentExecutor(executableJob, controller.signal, text => {
+            await this.agentExecutor(job, controller.signal, text => {
                 this.appendLog(job.logPath, text);
             });
-            if (this.get(job.id)?.status !== 'running') {
+            if (!this.started || this.get(job.id)?.status !== 'running') {
                 return;
             }
             this.finish(job.id, 'completed');
             this.notifications.push(`后台任务完成：${job.title}`, `任务 ${job.id} 已完成，可查看任务日志了解结果`);
         } catch (error) {
-            if (this.get(job.id)?.status !== 'running') {
+            if (!this.started || this.get(job.id)?.status !== 'running') {
                 return;
             }
             const message = error instanceof Error ? error.message : String(error);
@@ -520,7 +539,7 @@ export class JobManager {
     /** 监视可跨 Runtime 重启存活的 Shell 任务 */
     private async monitorShell (job: JobRecord, resultPath: string): Promise<void> {
         const startedAt = job.startedAt ? Date.parse(job.startedAt) : Date.now();
-        while (this.get(job.id)?.status === 'running') {
+        while (this.started && this.get(job.id)?.status === 'running') {
             if (resultPath && fs.existsSync(resultPath)) {
                 this.completeShellFromResult(job, resultPath);
                 return;
@@ -595,6 +614,8 @@ export class JobManager {
 function toJobRecord (row: JobRow): JobRecord {
     return {
         id: row.id,
+        workId: (JSON.parse(row.payload) as AgentJobPayload).workId,
+        workRevision: (JSON.parse(row.payload) as AgentJobPayload).workRevision,
         title: row.title,
         type: row.type,
         payload: JSON.parse(row.payload) as AgentJobPayload | ShellJobPayload,

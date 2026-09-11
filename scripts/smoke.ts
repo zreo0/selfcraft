@@ -1,3 +1,5 @@
+import { ExecutionStore } from '../src/execution/execution-store';
+import { WorkStore } from '../src/work/work-store';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -59,6 +61,8 @@ async function main (): Promise<void> {
             logger,
         );
         const memory = new MemoryStore(paths.state);
+        const executions = new ExecutionStore(paths.state);
+        const works = new WorkStore(paths.state);
         const jobs = new JobManager(
             paths.state,
             paths.jobs,
@@ -66,7 +70,7 @@ async function main (): Promise<void> {
             notifications,
             logger,
         );
-        const tools = createTools(paths.workspace, skills, notifications, evolution, jobs, memory);
+        const tools = createTools(paths.workspace, skills, notifications, evolution, jobs, memory, undefined, undefined, executions, works);
         const createAgent = () => new AgentRuntime(
             config,
             workspace,
@@ -82,12 +86,17 @@ async function main (): Promise<void> {
             },
             tools,
             logger,
+            undefined,
+            executions,
+            works,
         );
         let firstReply = '';
         await createAgent().run(
             '记住验收代号 SC-2718。使用 write 工具创建 files/smoke.txt，内容必须是 SC-2718；再读取确认，最后只回复 SELFCRAFT_SMOKE_OK。',
-            text => {
-                firstReply += text;
+            event => {
+                if (event.type === 'text-delta') {
+                    firstReply += event.delta;
+                }
             },
         );
         const artifact = fs.readFileSync(path.join(paths.workspace, 'files', 'smoke.txt'), 'utf8').trim();
@@ -96,8 +105,10 @@ async function main (): Promise<void> {
         }
 
         let secondReply = '';
-        await createAgent().run('我们刚才的验收代号是什么？只回复代号。', text => {
-            secondReply += text;
+        await createAgent().run('我们刚才的验收代号是什么？只回复代号。', event => {
+            if (event.type === 'text-delta') {
+                secondReply += event.delta;
+            }
         });
         if (!secondReply.includes('SC-2718')) {
             throw new Error(`会话恢复验收失败: ${secondReply}`);

@@ -1,3 +1,5 @@
+import { Database } from 'bun:sqlite';
+import { assertStateVersion } from '../supervisor/state-version';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -14,8 +16,9 @@ export interface Notification {
     message: string;
 }
 
-/** CLI 阶段使用的持久通知收件箱 */
+/** 所有入口共用的持久通知，已读记录仍保留投递去重标识 */
 export class NotificationInbox {
+    private readonly database: Database;
     /**
      * 创建通知收件箱
      *
@@ -23,6 +26,25 @@ export class NotificationInbox {
      */
     constructor (private readonly filePath: string) {
         fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        this.database = new Database(`${filePath}.sqlite`);
+        assertStateVersion(this.database);
+        this.database.run('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000');
+        this.database.run(`CREATE TABLE IF NOT EXISTS notifications (
+            id TEXT PRIMARY KEY, record TEXT NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0
+        ); CREATE TABLE IF NOT EXISTS notification_import (id INTEGER PRIMARY KEY);`);
+        this.database.transaction(() => {
+            if (this.database.query('SELECT id FROM notification_import WHERE id = 1').get()) {
+                return;
+            }
+            if (fs.existsSync(filePath)) {
+                for (const line of fs.readFileSync(filePath, 'utf8').split(/\r?\n/).filter(Boolean)) {
+                    const notification = JSON.parse(line) as Notification;
+                    this.database.query('INSERT OR IGNORE INTO notifications (id, record) VALUES (?, ?)')
+                        .run(notification.id, JSON.stringify(notification));
+                }
+            }
+            this.database.run('INSERT INTO notification_import VALUES (1)');
+        }).immediate();
     }
 
     /**
@@ -45,9 +67,9 @@ export class NotificationInbox {
      * @returns 已存在或新保存的通知
      */
     public pushOnce (id: string, title: string, message: string): Notification {
-        const existing = this.list().find(notification => notification.id === id);
+        const existing = this.database.query('SELECT record FROM notifications WHERE id = ?').get(id) as { record: string } | null;
         if (existing) {
-            return existing;
+            return JSON.parse(existing.record);
         }
         return this.append(id, title, message);
     }
@@ -67,7 +89,7 @@ export class NotificationInbox {
             title,
             message,
         };
-        fs.appendFileSync(this.filePath, `${JSON.stringify(notification)}\n`, 'utf8');
+        this.database.query('INSERT OR IGNORE INTO notifications (id, record) VALUES (?, ?)').run(id, JSON.stringify(notification));
         return notification;
     }
 
@@ -77,16 +99,12 @@ export class NotificationInbox {
      * @returns 按写入顺序排列的通知
      */
     public list (): Notification[] {
-        if (!fs.existsSync(this.filePath)) {
-            return [];
-        }
-        return fs.readFileSync(this.filePath, 'utf8').split(/\r?\n/)
-            .filter(Boolean)
-            .map(line => JSON.parse(line) as Notification);
+        const rows = this.database.query('SELECT record FROM notifications WHERE acknowledged = 0 ORDER BY rowid').all() as { record: string }[];
+        return rows.map(row => JSON.parse(row.record));
     }
 
-    /** 清空通知收件箱 */
+    /** 将当前通知标记已读，保留去重依据 */
     public clear (): void {
-        fs.writeFileSync(this.filePath, '', 'utf8');
+        this.database.run('UPDATE notifications SET acknowledged = 1 WHERE acknowledged = 0');
     }
 }

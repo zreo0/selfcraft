@@ -1,3 +1,4 @@
+import { assertStateVersion } from '../supervisor/state-version';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -340,6 +341,7 @@ export class MemoryStore {
     constructor (databasePath: string) {
         fs.mkdirSync(path.dirname(databasePath), { recursive: true });
         this.database = new Database(databasePath, { create: true });
+        assertStateVersion(this.database);
         this.database.run('PRAGMA journal_mode = WAL');
         this.database.run('PRAGMA busy_timeout = 5000');
         this.database.run('PRAGMA foreign_keys = ON');
