@@ -1,3 +1,4 @@
+import type { FileUIPart } from 'ai';
 import type {
     BootstrapView,
     ConfigView,
@@ -90,4 +91,11 @@ export function resetConfig (): Promise<{ backupDirectory?: string; config: Conf
         headers: { 'Content-Type': 'application/json' },
         body: '{}',
     });
+}
+
+/** 上传一张图片，返回 Runtime 持久保存的标准文件部分 */
+export function uploadImage (file: File): Promise<FileUIPart> {
+    const body = new FormData();
+    body.append('file', file);
+    return requestJson<FileUIPart>('/api/attachments', { method: 'POST', body });
 }

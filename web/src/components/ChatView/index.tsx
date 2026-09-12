@@ -1,5 +1,5 @@
 import { useChat } from '@ai-sdk/react';
-import { DefaultChatTransport } from 'ai';
+import { DefaultChatTransport, type FileUIPart } from 'ai';
 import { ArrowDown, Compass, History, RotateCcw, Settings2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import {
@@ -23,7 +23,7 @@ import { StreamingResponse } from '@/components/agents/streaming-response';
 import { Button } from '@/components/motion/button';
 import { AssistantMurmur } from '@/components/AssistantMurmur';
 import { BRAND_IMAGE_PATH } from '@/lib/brand';
-import { getMessages } from '@/services/runtime';
+import { getMessages, uploadImage } from '@/services/runtime';
 import type {
     AgentActivityGroup,
     ConfigView,
@@ -31,7 +31,12 @@ import type {
     SelfcraftMessage,
 } from '@/types/api.types';
 
-const chatTransport = new DefaultChatTransport<SelfcraftMessage>({ api: '/api/chat' });
+const chatTransport = new DefaultChatTransport<SelfcraftMessage>({
+    api: '/api/chat',
+    prepareSendMessagesRequest: ({ messages, trigger }) => ({
+        body: { messages: messages.filter(message => message.role === 'user').slice(-1), trigger },
+    }),
+});
 
 /** 从 AI SDK 消息中读取所有文本内容 */
 function messageText (message: SelfcraftMessage): string {
@@ -106,6 +111,10 @@ export function ChatView ({
     const initialMessageSent = useRef(false);
     const scrollerRef = useRef<HTMLElement>(null);
     const [input, setInput] = useState('');
+    const [files, setFiles] = useState<FileUIPart[]>([]);
+    const [uploading, setUploading] = useState(false);
+    const [uploadError, setUploadError] = useState<string | null>(null);
+    const uploadInFlight = useRef(false);
     const [statusText, setStatusText] = useState<string | null>(null);
     const [nextCursor, setNextCursor] = useState(initialCursor);
     const [loadingHistory, setLoadingHistory] = useState(false);
@@ -161,7 +170,7 @@ export function ChatView ({
     /** 提交本轮新输入，历史上下文仍由服务端持有 */
     function handleSubmit (value: string): void {
         const text = value.trim();
-        if (!text || status === 'submitted' || status === 'streaming') {
+        if ((!text && files.length === 0) || uploadInFlight.current || status === 'submitted' || status === 'streaming') {
             return;
         }
         if (!config?.configured) {
@@ -170,11 +179,43 @@ export function ChatView ({
         }
         clearError();
         setInput('');
+        setFiles([]);
+        setUploadError(null);
         setStatusText('正在接住这句话');
         void sendMessage({
             text,
+            files,
             metadata: { occurredAt: new Date().toISOString() },
         });
+    }
+
+    /** 上传图片后保留标准附件，失败不清空文字和已上传图片 */
+    async function handleFilesAdded (selected: File[]): Promise<void> {
+        if (uploadInFlight.current || status === 'submitted' || status === 'streaming' || !selected.length) {
+            return;
+        }
+        setUploadError(null);
+        if (selected.length + files.length > 4) {
+            setUploadError('每条消息最多添加 4 张图片，请减少数量后重试');
+            return;
+        }
+        if (selected.some(file => !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(file.type) || !file.size || file.size > 10 * 1024 * 1024)) {
+            setUploadError('请选择不超过 10 MB 的 PNG、JPEG、GIF 或 WebP 图片');
+            return;
+        }
+        uploadInFlight.current = true;
+        setUploading(true);
+        try {
+            const results = await Promise.allSettled(selected.map(uploadImage));
+            setFiles(current => [...current, ...results.flatMap(result => result.status === 'fulfilled' ? [result.value] : [])]);
+            const failed = results.find(result => result.status === 'rejected');
+            if (failed?.status === 'rejected') {
+                setUploadError(`${failed.reason instanceof Error ? failed.reason.message : '图片上传失败'}，请重新选择失败的图片`);
+            }
+        } finally {
+            uploadInFlight.current = false;
+            setUploading(false);
+        }
     }
 
     /** 让读者主动返回持续对话的最新位置 */
@@ -242,6 +283,7 @@ export function ChatView ({
             <div className="conversation-stage">
                 <MessageScroller
                     busy={generating}
+                    followOutput={messages.length > 0}
                     className="h-full"
                     contentClassName="mx-auto flex w-full max-w-4xl flex-col gap-8 px-5 py-8 sm:px-8 sm:py-12"
                     onFollowChange={setFollowing}
@@ -310,9 +352,14 @@ export function ChatView ({
                                     ) : (
                                         <MessageBubble align="end" animateIn={animateIn} variant="tint">
                                             <MessageBubbleContent className="message-user-surface">
-                                                <MessageBubbleCollapsible collapsedLines={5}>
+                                                {message.parts.filter(part => part.type === 'file' && part.mediaType.startsWith('image/')).map((part, index) => part.type === 'file' && (
+                                                    <a aria-label={`查看${part.filename || '原图'}`} className="mb-2 block rounded-lg focus-visible:outline-2 focus-visible:outline-ring" href={part.url} key={`${part.url}:${index}`} rel="noreferrer" target="_blank">
+                                                        <img alt={part.filename || '用户上传的图片'} className="max-h-80 max-w-full rounded-lg object-contain" loading="lazy" src={part.url} />
+                                                    </a>
+                                                ))}
+                                                {text && <MessageBubbleCollapsible collapsedLines={5}>
                                                     <p className="whitespace-pre-wrap">{text}</p>
-                                                </MessageBubbleCollapsible>
+                                                </MessageBubbleCollapsible>}
                                             </MessageBubbleContent>
                                         </MessageBubble>
                                     )}
@@ -361,6 +408,11 @@ export function ChatView ({
                     <PromptInput
                         aria-label="输入消息"
                         disabled={!config?.configured}
+                        files={files}
+                        onFilesAdded={handleFilesAdded}
+                        onRemoveFile={index => setFiles(current => current.filter((_, position) => position !== index))}
+                        uploading={uploading}
+                        uploadError={uploadError}
                         loading={generating}
                         onStop={stop}
                         onSubmit={handleSubmit}

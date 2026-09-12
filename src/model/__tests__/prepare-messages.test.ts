@@ -22,9 +22,9 @@ describe('prepareMessages', () => {
         expect(messages).toEqual(original);
     });
 
-    test('模型不支持图片时明确拒绝，而不是静默丢失图片', () => {
+    test('纯文本模型保留未读取标记，不让历史图片阻断对话', () => {
         const messages: ModelMessage[] = [{ role: 'user', content: [{ type: 'image', image: new URL('https://example.com/image.png') }] }];
-        expect(() => prepareMessages(messages, false)).toThrow('不支持');
+        expect(JSON.stringify(prepareMessages(messages, false))).toContain('当前模型未读取像素');
         expect(prepareMessages(messages, true)).toEqual(messages);
     });
 });

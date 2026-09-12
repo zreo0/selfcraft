@@ -54,6 +54,7 @@ export class ContextManager {
                 instructions: [
                     '你负责压缩一段长期个人助理会话。',
                     '保留事实、决定、承诺、偏好、未完成事项、重要原因和可追溯的工具结果。',
+                    '图片引用必须与相关事项一起保留，便于以后重新读取；仅有附件引用不代表已经理解内容，不得推测原图。',
                     '将已有摘要和新历史改写成一份新摘要，不要无限追加。',
                     '不要添加原文中没有的信息，不要把会话摘要冒充长期记忆，使用紧凑 Markdown。',
                 ].join('\n'),
@@ -125,7 +126,12 @@ export class ContextManager {
 
     /** 估算标准消息的序列化体积 */
     private estimateMessages (messages: ModelMessage[]): number {
-        return messages.reduce((total, message) => total + this.estimate(JSON.stringify(message)), 0);
+        return messages.reduce((total, message) => {
+            const images = Array.isArray(message.content) ? message.content.filter(part => part.type === 'image'
+                || (part.type === 'file' && /^image(?:\/|$)/.test(part.mediaType))).length : 0;
+            // 文件引用很短，但原图会占用视觉上下文；这里只作估计，提供方溢出仍走现有恢复流程
+            return total + this.estimate(JSON.stringify(message)) + images * 2000;
+        }, 0);
     }
 
     /** 保留约四成最新消息，并尽量从 user 消息开始 */

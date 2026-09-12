@@ -1,3 +1,4 @@
+import type { UserModelMessage } from 'ai';
 import { randomUUID } from 'node:crypto';
 import type { ExecutionStore } from '../execution/execution-store';
 import type { AgentRunOptions, AgentRunResult } from './agent-runtime';
@@ -7,7 +8,7 @@ import type { AgentRunEvent } from './run-events';
 export interface ForegroundAgent {
     /** 执行一轮前台对话 */
     run (
-        input: string,
+        input: UserModelMessage['content'],
         onEvent?: (event: AgentRunEvent) => void,
         options?: AgentRunOptions,
     ): Promise<AgentRunResult>;
@@ -49,7 +50,7 @@ export class ForegroundRunner {
      * @returns Agent 执行结果
      */
     public async run (
-        input: string,
+        input: UserModelMessage['content'],
         onEvent: (event: AgentRunEvent) => void = () => undefined,
         options: AgentRunOptions = {},
     ): Promise<AgentRunResult> {

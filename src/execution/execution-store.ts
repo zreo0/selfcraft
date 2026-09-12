@@ -1,7 +1,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Database } from 'bun:sqlite';
-import type { ModelMessage } from 'ai';
+import type { ModelMessage, UserModelMessage } from 'ai';
+import { userContentText } from '../model/user-content';
 import { assertStateVersion } from '../supervisor/state-version';
 
 /** 可跨进程接续的一轮执行 */
@@ -9,7 +10,7 @@ export interface ExecutionRecord {
     /** 稳定执行标识 */
     id: string;
     /** 原始输入 */
-    input: string;
+    input: UserModelMessage['content'];
     /** 执行入口 */
     channel: 'foreground' | 'background';
     /** 当前生命周期 */
@@ -45,14 +46,18 @@ export class ExecutionStore {
                 PRIMARY KEY (execution_id, call_id)
             );
         `);
+        const columns = this.database.query('PRAGMA table_info(executions)').all() as { name: string }[];
+        if (!columns.some(column => column.name === 'input_content')) {
+            this.database.run('ALTER TABLE executions ADD COLUMN input_content TEXT');
+        }
     }
 
     /** 持久接收输入；相同标识只允许相同内容，返回原记录 */
-    public accept (id: string, input: string, channel: ExecutionRecord['channel'], retry = false): ExecutionRecord {
-        this.database.query(`INSERT OR IGNORE INTO executions (id, input, channel, status, retry, created_at)
-            VALUES (?, ?, ?, 'queued', ?, ?)`).run(id, input, channel, Number(retry), new Date().toISOString());
+    public accept (id: string, input: UserModelMessage['content'], channel: ExecutionRecord['channel'], retry = false): ExecutionRecord {
+        this.database.query(`INSERT OR IGNORE INTO executions (id, input, channel, status, retry, created_at, input_content)
+            VALUES (?, ?, ?, 'queued', ?, ?, ?)`).run(id, userContentText(input), channel, Number(retry), new Date().toISOString(), typeof input === 'string' ? null : JSON.stringify(input));
         const record = this.get(id)!;
-        if (record.input !== input || record.channel !== channel) {
+        if (JSON.stringify(record.input) !== JSON.stringify(input) || record.channel !== channel) {
             throw new Error('执行标识已被其他输入使用');
         }
         return record;
@@ -61,8 +66,8 @@ export class ExecutionStore {
     /** 按标识读取执行，不存在返回 null */
     public get (id: string): ExecutionRecord | null {
         const row = this.database.query('SELECT * FROM executions WHERE id = ?').get(id) as
-            (Omit<ExecutionRecord, 'messages' | 'retry'> & { messages: string; retry: number }) | null;
-        return row ? { ...row, messages: JSON.parse(row.messages), retry: Boolean(row.retry) } : null;
+            (Omit<ExecutionRecord, 'messages' | 'retry'> & { messages: string; retry: number; input_content: string | null }) | null;
+        return row ? { ...row, input: row.input_content ? JSON.parse(row.input_content) : row.input, messages: JSON.parse(row.messages), retry: Boolean(row.retry) } : null;
     }
 
     /** 按接收顺序读取未完成前台输入，供启动恢复 */

@@ -1,3 +1,5 @@
+import { AttachmentStore, MAX_IMAGES, MAX_IMAGE_BYTES } from '../attachment/attachment-store';
+import { userContentFiles } from '../model/user-content';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
@@ -5,6 +7,7 @@ import {
     createUIMessageStreamResponse,
     streamText,
     type UIMessage,
+    type UserModelMessage,
 } from 'ai';
 import { z } from 'zod';
 import type { ForegroundRunner } from '../agent/foreground-runner';
@@ -118,6 +121,7 @@ export interface WebServerAddress {
 /** 同一 Runtime 中的 Web 通信入口与静态文件服务 */
 export class WebServer {
     private server?: Bun.Server<undefined>;
+    private readonly attachments: AttachmentStore;
 
     /**
      * 创建 Web 入口
@@ -137,7 +141,9 @@ export class WebServer {
         logger: Logger;
         staticDirectory: string;
         onRestart: () => void;
-    }) {}
+    }) {
+        this.attachments = new AttachmentStore(dependencies.paths.home);
+    }
 
     /**
      * 启动 HTTP 服务
@@ -156,6 +162,7 @@ export class WebServer {
         this.server = Bun.serve({
             hostname,
             port,
+            maxRequestBodySize: MAX_IMAGE_BYTES + 65536,
             fetch: request => this.fetch(request),
         });
         const address = this.address();
@@ -209,6 +216,29 @@ export class WebServer {
 
     /** 分发同源 API 请求 */
     private async handleApi (request: Request, url: URL): Promise<Response> {
+        if (request.method === 'POST' && url.pathname === '/api/attachments') {
+            const origin = request.headers.get('origin');
+            if (origin && origin !== url.origin) {
+                return new Response('不允许跨站上传', { status: 403 });
+            }
+            if (Number(request.headers.get('content-length')) > MAX_IMAGE_BYTES + 65536) {
+                return new Response('图片不能超过 10 MB', { status: 413 });
+            }
+            const form = await request.formData();
+            const file = form.get('file');
+            if (!(file instanceof File)) {
+                throw new Error('请选择图片');
+            }
+            return jsonResponse(await this.attachments.save(file));
+        }
+        if (request.method === 'GET' && url.pathname.startsWith('/api/attachments/')) {
+            const { bytes, mediaType } = this.attachments.read(url.pathname);
+            return new Response(new Uint8Array(bytes), { headers: {
+                'Content-Type': mediaType,
+                'Cache-Control': 'private, max-age=31536000, immutable',
+                'X-Content-Type-Options': 'nosniff',
+            } });
+        }
         if (request.method === 'GET' && url.pathname === '/api/bootstrap') {
             return jsonResponse(this.buildBootstrap());
         }
@@ -454,17 +484,18 @@ export class WebServer {
         if (!lastMessage || lastMessage.role !== 'user') {
             return new Response('最后一条消息必须来自用户', { status: 400 });
         }
-        const input = lastMessage.parts
-            .filter((part): part is { type: 'text'; text: string } => (
-                typeof part === 'object'
-                && part !== null
-                && (part as { type?: unknown }).type === 'text'
-                && typeof (part as { text?: unknown }).text === 'string'
-            ))
-            .map(part => part.text)
-            .join('\n')
-            .trim();
-        if (!input) {
+        const parts = z.array(z.discriminatedUnion('type', [
+            z.object({ type: z.literal('text'), text: z.string().max(100_000) }),
+            z.object({ type: z.literal('file'), url: z.string().max(256), mediaType: z.string(), filename: z.string().max(200).optional() }),
+        ])).max(20).parse(lastMessage.parts);
+        const files = parts.filter(part => part.type === 'file');
+        if (files.length > MAX_IMAGES) {
+            throw new Error('每条消息最多包含 4 张图片');
+        }
+        const input: UserModelMessage['content'] = files.length
+            ? parts.map(part => part.type === 'file' ? this.attachments.reference(part) : part)
+            : parts.filter(part => part.type === 'text').map(part => part.text).join('\n').trim();
+        if (!input || (Array.isArray(input) && !input.length)) {
             return new Response('消息不能为空', { status: 400 });
         }
 
@@ -634,7 +665,7 @@ interface WebConfigView {
 
 /** 把持久事件及同轮工具时间线转换为浏览器 UI 消息 */
 function toUIMessage (event: EventRecord, runEvents: EventRecord[]): SelfcraftUIMessage {
-    const payload = event.payload as { text?: unknown } | null;
+    const payload = event.payload as { text?: unknown; content?: UserModelMessage['content'] } | null;
     const presentation = event.type === 'assistant_message'
         ? buildRunPresentation(runEvents)
         : { activities: [], sources: [] };
@@ -656,8 +687,9 @@ function toUIMessage (event: EventRecord, runEvents: EventRecord[]): SelfcraftUI
             }] : []),
             {
                 type: 'text' as const,
-                text: typeof payload?.text === 'string' ? payload.text : '',
+                text: Array.isArray(payload?.content) ? payload.content.filter(part => part.type === 'text').map(part => part.text).join('\n') : typeof payload?.text === 'string' ? payload.text : '',
             },
+            ...(event.type === 'user_message' && payload?.content ? userContentFiles(payload.content) : []),
             ...presentation.sources.map(source => ({
                 type: 'source-url' as const,
                 sourceId: source.id,

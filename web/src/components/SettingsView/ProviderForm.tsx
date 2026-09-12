@@ -181,7 +181,7 @@ function ProviderCapabilities ({
             <label className="flex items-center justify-between gap-4 rounded-xl border border-border/75 px-3.5 py-3 text-sm">
                 <span>
                     <strong className="font-medium text-foreground">支持图片输入</strong>
-                    <small className="mt-0.5 block text-xs text-muted-foreground">只有模型真实支持视觉时才开启</small>
+                    <small className="mt-0.5 block text-xs text-muted-foreground">仅在模型支持视觉时开启；也会供当前模型按需分析图片</small>
                 </span>
                 <Switch ariaLabel="支持图片输入" checked={input.vision} onCheckedChange={vision => onChange(current => ({ ...current, vision }))} />
             </label>

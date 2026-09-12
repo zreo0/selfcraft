@@ -48,7 +48,7 @@ describe('ForegroundRunner', () => {
         const calls: string[] = [];
         const runner = new ForegroundRunner({
             async run (input) {
-                calls.push(input);
+                calls.push(typeof input === 'string' ? input : JSON.stringify(input));
                 if (input === 'first') {
                     await first.promise;
                 }

@@ -24,6 +24,26 @@ export interface ModelSnapshot {
 
 /** 将持久配置转换为 AI SDK 模型 */
 export class ModelFactory {
+    /** 优先使用当前视觉模型，否则按稳定顺序选择已配置且凭证可用的视觉模型 */
+    public static createVision (config: ConfigStore, logger?: Logger): ModelSnapshot | null {
+        const saved = config.read();
+        const candidates: ModelSelection[] = Object.entries(saved.providers).sort(([a], [b]) => a.localeCompare(b))
+            .flatMap(([providerId, provider]) => Object.keys(provider.models).sort().map(modelId => ({ providerId, modelId })));
+        if (saved.defaultModel) {
+            candidates.unshift(saved.defaultModel);
+        }
+        for (const selection of candidates) {
+            try {
+                if (config.getModel('agent', selection).model.vision) {
+                    return ModelFactory.create(config, 'agent', logger, selection);
+                }
+            } catch {
+                // 未配置完整的渠道不参与辅助模型选择
+            }
+        }
+        return null;
+    }
+
     /**
      * 按用途构建不可变模型快照，不改变配置
      *

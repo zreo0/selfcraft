@@ -1,3 +1,4 @@
+import { ModelFactory } from '../../model/model-factory';
 import { afterEach, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -212,4 +213,20 @@ describe('ConfigStore', () => {
         expect(fs.existsSync(path.join(directory, 'backups'))).toBeFalse();
         expect(fs.existsSync(path.join(directory, 'secrets.json'))).toBeFalse();
     });
+});
+
+
+test('视觉辅助只选择已配置的视觉模型，优先当前模型且不改写默认选择', () => {
+    const store = new ConfigStore(createTemporaryDirectory());
+    expect(ModelFactory.createVision(store)).toBeNull();
+    store.addProvider({ providerId: 'local', type: 'openai-compatible', baseURL: 'http://localhost:3000/v1', apiKey: '',
+        models: {
+            text: { vision: false, contextWindow: 32000, maxOutputTokens: 4096 },
+            visionA: { vision: true, contextWindow: 64000, maxOutputTokens: 4096 },
+            visionB: { vision: true, contextWindow: 64000, maxOutputTokens: 4096 },
+        } });
+    expect(ModelFactory.createVision(store)?.modelId).toBe('visionA');
+    expect(store.getModel().selection.modelId).toBe('text');
+    store.useModel({ providerId: 'local', modelId: 'visionB' });
+    expect(ModelFactory.createVision(store)?.modelId).toBe('visionB');
 });

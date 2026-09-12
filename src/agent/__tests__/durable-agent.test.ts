@@ -1,3 +1,4 @@
+import { AttachmentStore } from '../../attachment/attachment-store';
 import { WorkRunner } from '../../work/work-runner';
 import { afterEach, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
@@ -39,7 +40,7 @@ function response (call?: { name: string; input: unknown }, text = '已完成') 
     };
 }
 /** 创建与 Runtime 相同的持久 Agent 组装 */
-function fixture (model: MockLanguageModelV4) {
+function fixture (model: MockLanguageModelV4, vision = false, auxiliary?: MockLanguageModelV4) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'selfcraft-durable-agent-'));
     roots.push(root);
     const paths = resolvePaths('development', root);
@@ -54,12 +55,13 @@ function fixture (model: MockLanguageModelV4) {
     const skills = new SkillRegistry(path.join(paths.workspace, 'skills'));
     const evolution = new EvolutionService(paths, new ReleaseStore(paths.supervisor, paths.evolution), logger);
     const jobs = new JobManager(paths.state, paths.jobs, new PathGuard(paths.workspace), notifications, logger);
-    const tools = createTools(paths.workspace, skills, notifications, evolution, jobs, memory, undefined, undefined, executions, works);
+    const attachments = new AttachmentStore(paths.home);
+    const tools = createTools(paths.workspace, skills, notifications, evolution, jobs, memory, undefined, undefined, executions, works, [attachments, () => auxiliary ? ({ model: auxiliary, providerId: 'test', modelId: 'vision', contextWindow: 128000, maxOutputTokens: 2048, vision: true }) : null]);
     const session = new SessionStore(paths.sessions);
     const agent = new AgentRuntime(config, workspace, skills, session, new ContextManager(), evolution, memory,
         { beginAgentActivity: () => undefined, endAgentActivity: () => undefined, enqueue: () => 'reflection' }, tools, logger,
-        () => ({ model, providerId: 'test', modelId: 'test', contextWindow: 128000, maxOutputTokens: 4096, vision: false }), executions, works);
-    return { paths, agent, executions, session, works, memory, jobs, notifications, logger };
+        () => ({ model, providerId: 'test', modelId: 'test', contextWindow: 128000, maxOutputTokens: 4096, vision }), executions, works, attachments);
+    return { paths, agent, executions, session, works, memory, jobs, notifications, logger, attachments };
 }
 afterEach(() => roots.splice(0).forEach(root => fs.rmSync(root, { recursive: true, force: true })));
 
@@ -141,4 +143,63 @@ test('跨重启等待的事项在用户改变要求后由同一个助理自动�
         runner.stop();
         await Bun.sleep(30);
     }
+});
+
+
+test('原生视觉请求读取持久原图，下一轮从磁盘历史再次物化，不向模型泄露本地 URL', async () => {
+    const model = new MockLanguageModelV4({ doStream: async () => response() });
+    const { agent, attachments, session, memory } = fixture(model, true);
+    const uploaded = await attachments.save(new File([new Uint8Array([255, 216, 255, 224])], 'photo.jpg'));
+    await agent.run([attachments.reference(uploaded)]);
+    await agent.run('再看一下刚才的图片');
+    for (const call of model.doStreamCalls) {
+        const prompt = JSON.stringify(call.prompt);
+        expect(prompt).toContain('image/jpeg');
+        expect(prompt).toContain('"type":"data"');
+        expect(prompt).not.toContain('"type":"url"');
+    }
+    expect(JSON.stringify(session.loadTranscript())).toContain(uploaded.url);
+    expect(JSON.stringify(session.loadTranscript())).not.toContain('"type":"data"');
+    expect(JSON.stringify(memory.listConversationEvents(10))).toContain(uploaded.url);
+});
+
+test('纯文本主模型通过真实工具包装调用视觉模型，保留问题和分析证据供后续追问', async () => {
+    const auxiliary = new MockLanguageModelV4({ doGenerate: {
+        content: [{ type: 'text', text: '右上角显示测试环境' }],
+        finishReason: { unified: 'stop', raw: undefined },
+        usage: {
+            inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
+            outputTokens: { total: 1, text: 1, reasoning: undefined },
+        }, warnings: [],
+    } });
+    let url = '';
+    let calls = 0;
+    const model = new MockLanguageModelV4({ doStream: async () => ++calls === 1
+        ? response({ name: 'image_analyze', input: { url, question: '右上角是什么环境？' } }) : response(undefined, '当前是测试环境') });
+    const { agent, attachments, executions, memory } = fixture(model, false, auxiliary);
+    const uploaded = await attachments.save(new File([new Uint8Array([255, 216, 255, 224])], 'screen.jpg'));
+    url = uploaded.url;
+    await agent.run([{ type: 'text', text: '右上角是什么环境？' }, attachments.reference(uploaded)], () => undefined, { executionId: 'image-run' });
+    expect(auxiliary.doGenerateCalls).toHaveLength(1);
+    expect(JSON.stringify(auxiliary.doGenerateCalls[0]!.prompt)).toContain('image/jpeg');
+    expect(JSON.stringify(auxiliary.doGenerateCalls[0]!.prompt)).toContain('右上角是什么环境');
+    expect(model.doStreamCalls.every(call => !JSON.stringify(call.prompt).includes('"type":"file"'))).toBeTrue();
+    expect(JSON.stringify(model.doStreamCalls[1]!.prompt)).toContain('右上角显示测试环境');
+    expect(executions.get('image-run')?.status).toBe('completed');
+    expect(memory.listEventsByRun('image-run').some(event => event.type === 'tool_result')).toBeTrue();
+});
+
+test('没有视觉模型时图片仍被接收，工具返回能力缺失且后续文字对话继续', async () => {
+    let url = '';
+    let calls = 0;
+    const model = new MockLanguageModelV4({ doStream: async () => ++calls === 1
+        ? response({ name: 'image_analyze', input: { url, question: '这是什么？' } }) : response(undefined, '图片已收到，暂时无法理解') });
+    const { agent, attachments } = fixture(model);
+    const uploaded = await attachments.save(new File([new Uint8Array([255, 216, 255, 224])], 'photo.jpg'));
+    url = uploaded.url;
+    await agent.run([attachments.reference(uploaded)]);
+    expect(JSON.stringify(model.doStreamCalls[1]!.prompt)).toContain('没有可用的视觉模型');
+    await agent.run('继续聊其他事情');
+    expect(model.doStreamCalls).toHaveLength(3);
+    expect(attachments.read(url).bytes.length).toBe(4);
 });

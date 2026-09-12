@@ -1,3 +1,4 @@
+import { AttachmentStore } from './attachment/attachment-store';
 import { acquireRuntimeLease } from './supervisor/runtime-lease';
 import { ExecutionStore } from './execution/execution-store';
 import { WorkStore } from './work/work-store';
@@ -62,6 +63,7 @@ async function main (): Promise<void> {
         return;
     }
     const webProvider = new TavilyWebProvider(() => config.getWebAccess().apiKey);
+    const attachments = new AttachmentStore(paths.home);
     const tools = createTools(
         paths.workspace,
         skills,
@@ -73,6 +75,7 @@ async function main (): Promise<void> {
         webProvider,
         executions,
         works,
+        [attachments, () => ModelFactory.createVision(config, logger)],
     );
     const agent = new AgentRuntime(
         config,
@@ -88,6 +91,7 @@ async function main (): Promise<void> {
         undefined,
         executions,
         works,
+        attachments,
     );
     const foreground = new ForegroundRunner(agent, executions, () => requestShutdown(RESTART_EXIT_CODE));
     jobs.setAgentExecutor((job, signal, onLog) => agent.runBackground(job, signal, onLog),

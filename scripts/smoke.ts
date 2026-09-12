@@ -1,3 +1,5 @@
+import { AttachmentStore } from '../src/attachment/attachment-store';
+import { ModelFactory } from '../src/model/model-factory';
 import { ExecutionStore } from '../src/execution/execution-store';
 import { WorkStore } from '../src/work/work-store';
 import * as fs from 'node:fs';
@@ -52,6 +54,11 @@ async function main (): Promise<void> {
                 },
             },
         });
+        const visionModelId = process.env.SELFCRAFT_TEST_VISION_MODEL_ID;
+        if (visionModelId) {
+            config.addProvider({ providerId: 'smoke-vision', type: 'openai-compatible', baseURL: model.baseURL, apiKey: model.apiKey,
+                models: { [visionModelId]: { vision: true, contextWindow: 128000, maxOutputTokens: 4096 } } });
+        }
         const logger = new Logger(paths.logs, 'debug');
         const skills = new SkillRegistry(path.join(paths.workspace, 'skills'));
         const notifications = new NotificationInbox(paths.notifications);
@@ -70,7 +77,8 @@ async function main (): Promise<void> {
             notifications,
             logger,
         );
-        const tools = createTools(paths.workspace, skills, notifications, evolution, jobs, memory, undefined, undefined, executions, works);
+        const attachments = new AttachmentStore(home);
+        const tools = createTools(paths.workspace, skills, notifications, evolution, jobs, memory, undefined, undefined, executions, works, [attachments, () => ModelFactory.createVision(config, logger)]);
         const createAgent = () => new AgentRuntime(
             config,
             workspace,
@@ -89,6 +97,7 @@ async function main (): Promise<void> {
             undefined,
             executions,
             works,
+            attachments,
         );
         let firstReply = '';
         await createAgent().run(
@@ -113,11 +122,45 @@ async function main (): Promise<void> {
         if (!secondReply.includes('SC-2718')) {
             throw new Error(`会话恢复验收失败: ${secondReply}`);
         }
+        if (visionModelId) {
+            // 自包含的红蓝色块用于验证真实像素输入，不依赖文件名或远程图片
+            const pixels = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAKAAAABQCAIAAAARP+ljAAABgklEQVR4nOXNMQ0AMBADsfAn/WVxHip59277iv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pP6f/mv5z+q/pv/YAJjLQ4BedFxwAAAAASUVORK5CYII=', 'base64');
+            const uploaded = await attachments.save(new File([pixels], 'sample.png', { type: 'image/png' }));
+            config.useModel({ providerId: 'smoke-vision', modelId: visionModelId });
+            let native = '';
+            await createAgent().run([{ type: 'text', text: '直接观察图片：左半边和右半边各是什么颜色？用英文颜色名按左右顺序回答。不要调用工具。' }, attachments.reference(uploaded)], event => {
+                if (event.type === 'text-delta') {
+                    native += event.delta;
+                }
+            }, { executionId: 'image-native' });
+            if (!/red[\s\S]*blue/i.test(native) || memory.listEventsByRun('image-native').some(event => event.type === 'tool_call')) {
+                throw new Error('原生图片理解验收失败');
+            }
+            config.useModel({ providerId: 'smoke', modelId: model.modelId });
+            let assisted = '';
+            await createAgent().run(`请用 image_analyze 重新读取刚才的图片 ${uploaded.url}，核实左右颜色，不要只引用上一轮回答。用英文颜色名按左右顺序回答。`, event => {
+                if (event.type === 'text-delta') {
+                    assisted += event.delta;
+                }
+            }, { executionId: 'image-assisted' });
+            const evidence = memory.listEventsByRun('image-assisted');
+            const analysis = evidence.filter(event => event.type === 'tool_result').map(event => event.payload as {
+                toolName?: string; result?: { analysis?: string; error?: string };
+            }).find(payload => payload.toolName === 'image_analyze')?.result;
+            if (!/red[\s\S]*blue/i.test(assisted) || analysis?.error || !analysis?.analysis
+                || !/(?:red|红)[\s\S]*(?:blue|蓝)/i.test(analysis.analysis)) {
+                throw new Error('辅助视觉与切换模型后的历史追问验收失败');
+            }
+            if (!new AttachmentStore(home).read(uploaded.url).bytes.equals(pixels)) {
+                throw new Error('图片原件恢复验收失败');
+            }
+        }
         console.log(JSON.stringify({
             healthy: true,
             model: model.modelId,
             toolRoundTrip: true,
             sessionRestore: true,
+            ...(visionModelId && { nativeImage: true, auxiliaryVision: true, imageRestore: true }),
         }, null, 4));
     } finally {
         if (process.env.SELFCRAFT_KEEP_SMOKE !== '1') {

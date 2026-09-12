@@ -1,7 +1,9 @@
+import type { AttachmentStore } from '../attachment/attachment-store';
+import { userContentText } from '../model/user-content';
 import type { ExecutionStore } from '../execution/execution-store';
 import type { WorkStore } from '../work/work-store';
 import { randomUUID } from 'node:crypto';
-import { isStepCount, ToolLoopAgent, type ModelMessage, type Tool } from 'ai';
+import { isStepCount, ToolLoopAgent, type ModelMessage, type UserModelMessage, type Tool } from 'ai';
 import { prepareMessages } from '../model/prepare-messages';
 import type { ConfigStore } from '../config/config-store';
 import type { ContextManager } from '../context/context-manager';
@@ -85,6 +87,7 @@ export class AgentRuntime {
         private readonly resolveModel: () => ModelSnapshot = () => ModelFactory.create(this.config, 'agent', this.logger),
         private readonly executions?: ExecutionStore,
         private readonly works?: WorkStore,
+        private readonly attachments?: AttachmentStore,
     ) {}
 
     /**
@@ -96,12 +99,13 @@ export class AgentRuntime {
      * @returns 是否需要 Supervisor 重启
      */
     public async run (
-        input: string,
+        input: UserModelMessage['content'],
         onEvent: (event: AgentRunEvent) => void = () => undefined,
         options: AgentRunOptions = {},
     ): Promise<AgentRunResult> {
         const runId = options.executionId || randomUUID();
         this.executions?.accept(runId, input, 'foreground', options.retry);
+        const inputText = userContentText(input);
         const now = new Date().toISOString();
         const timezone = this.config.read().timezone;
         let snapshot = this.session.load();
@@ -111,7 +115,7 @@ export class AgentRuntime {
             ? this.memory.recordEvent({
                 actor: 'system',
                 type: 'run_retry_started',
-                payload: { text: input, channel: 'foreground', retryOf: retrySource.runId },
+                payload: { text: inputText, content: input, channel: 'foreground', retryOf: retrySource.runId },
                 occurredFrom: now,
                 recordedAt: now,
                 precision: 'instant',
@@ -123,7 +127,7 @@ export class AgentRuntime {
             : this.memory.recordEvent({
                 actor: 'user',
                 type: 'user_message',
-                payload: { text: input, channel: 'foreground' },
+                payload: { text: inputText, content: input, channel: 'foreground' },
                 occurredFrom: now,
                 recordedAt: now,
                 precision: 'instant',
@@ -148,7 +152,7 @@ export class AgentRuntime {
         try {
             onEvent({ type: 'status', phase: 'preparing', label: '正在整理上下文' });
             active = this.resolveModel();
-            const reservedContext = this.buildInstructions('', input, instructionContext);
+            const reservedContext = this.buildInstructions('', inputText, instructionContext);
             try {
                 const compacted = await this.context.compactIfNeeded(
                     snapshot,
@@ -172,7 +176,7 @@ export class AgentRuntime {
                 this.session.appendOnce(`run:${runId}:user`, userMessage);
             }
             let messages = retrySource || inputRecorded ? [...snapshot.messages] : [...snapshot.messages, userMessage];
-            const instructions = this.buildInstructions(snapshot.summary, input, instructionContext);
+            const instructions = this.buildInstructions(snapshot.summary, inputText, instructionContext);
             this.logger.info('Agent run started', {
                 runId,
                 providerId: active.providerId,
@@ -211,7 +215,7 @@ export class AgentRuntime {
                 execution = await this.executeAgent(
                     'selfcraft-main-recovery',
                     active,
-                    this.buildInstructions(recovered.summary, input, instructionContext),
+                    this.buildInstructions(recovered.summary, inputText, instructionContext),
                     recovered.messages,
                     runtimeContext,
                     onEvent,
@@ -276,15 +280,15 @@ export class AgentRuntime {
      * @param messages 当前持久会话
      * @returns 原始用户事件
      */
-    private resolveRetrySource (input: string, messages: ModelMessage[]): EventRecord {
+    private resolveRetrySource (input: UserModelMessage['content'], messages: ModelMessage[]): EventRecord {
         const lastMessage = messages.at(-1);
         const lastEvent = this.memory.listConversationEvents(1).at(-1);
         const eventText = (lastEvent?.payload as { text?: unknown } | null)?.text;
         if (
             lastMessage?.role !== 'user'
-            || lastMessage.content !== input
+            || JSON.stringify(lastMessage.content) !== JSON.stringify(input)
             || lastEvent?.type !== 'user_message'
-            || eventText !== input
+            || eventText !== userContentText(input)
             || !lastEvent.runId
         ) {
             throw new Error('最后一轮对话已经变化，请重新发送消息');
@@ -421,6 +425,7 @@ export class AgentRuntime {
             '首要目标是理解意图并尽可能完成任务。工具调用不需要逐步申请批准。',
             '文件工具只访问 workspace。Shell 保留完整能力，但不要执行会破坏宿主机、泄露凭证或冒充用户对外表态的操作。',
             '能在当前轮次快速完成的操作直接使用工具；只有需要长时间运行、可独立进行或不应阻塞用户的工作才用 job_start。',
+            '图片附件保留原件。能直接看见图片时直接回答；只有附件引用时，必须通过 image_analyze 按当前问题读取，不得猜测图片内容。缺少视觉模型时说明附件已收到但暂时无法理解；追问旧图可按引用再次读取。',
             '持续工作使用 work_create 记录目标、用户授权、完成条件和下一步。长时间执行交给 job_start，关联 workId 和最新 workRevision；你负责验收结果，不让用户管理 Job 或 session。',
             '用户补充资料、改变要求或取消工作时，先 work_list 找到原事项，再 work_update 更新最新版本。等待用户只在收到相关信息后恢复；时间等待使用绝对时间。',
             '后台推进结束前必须 work_update 明确完成、等待、阻塞或下一步；完成要记录结果和验证依据。不要把模型输出结束当成目标完成。',
@@ -508,7 +513,7 @@ export class AgentRuntime {
         });
         let streamError: unknown;
         const result = await agent.stream({
-            messages: prepareMessages([...messages, ...recovered], active.vision),
+            messages: prepareMessages([...messages, ...recovered], active.vision, part => this.attachments?.materialize(part) ?? part),
             abortSignal,
             onToolExecutionStart: ({ toolCall }) => {
                 this.logger.info('Tool execution started', { toolName: toolCall.toolName });

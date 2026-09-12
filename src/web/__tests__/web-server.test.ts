@@ -49,7 +49,7 @@ function createServer () {
     const retryCalls: boolean[] = [];
     const agent = new ForegroundRunner({
         async run (input, onEvent, options) {
-            calls.push(input);
+            calls.push(typeof input === 'string' ? input : JSON.stringify(input));
             retryCalls.push(options?.retry === true);
             if (input === '触发失败') {
                 onEvent?.({
@@ -520,4 +520,32 @@ describe('WebServer', () => {
             server.stop();
         }
     });
+});
+
+
+test('图片上传与图片单独发送共用 Runtime，历史返回标准 file 部分', async () => {
+    const { server, config, calls, memory } = createServer();
+    config.addProvider({ providerId: 'local', type: 'openai-compatible', baseURL: 'http://127.0.0.1:3000/v1', apiKey: 'not-a-real-credential',
+        models: { assistant: { vision: false, contextWindow: 128000, maxOutputTokens: 4096 } } });
+    const body = new FormData();
+    body.append('file', new File([new Uint8Array([255, 216, 255, 224])], 'photo.jpg', { type: 'image/jpeg' }));
+    const upload = await server.fetch(new Request('http://selfcraft.local/api/attachments', { method: 'POST', body }));
+    expect(upload.status).toBe(200);
+    const file = await upload.json() as any;
+    const download = await server.fetch(new Request(`http://selfcraft.local${file.url}`));
+    expect(download.headers.get('content-type')).toBe('image/jpeg');
+    expect((await download.arrayBuffer()).byteLength).toBe(4);
+    const sent = await server.fetch(jsonRequest('/api/chat', 'POST', { messages: [{ role: 'user', parts: [file] }] }));
+    await sent.text();
+    expect(sent.status).toBe(200);
+    const content = JSON.parse(calls.at(-1)!);
+    expect(content[0].type).toBe('file');
+    expect(content[0].data.url).toContain(file.url);
+    memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '图片', content, channel: 'foreground' } });
+    const history = await (await server.fetch(new Request('http://selfcraft.local/api/messages'))).json() as any;
+    expect(history.items.at(-1).parts.find((part: any) => part.type === 'file')).toEqual(file);
+    const invalid = await server.fetch(jsonRequest('/api/chat', 'POST', { messages: [{ role: 'user', parts: [{ ...file, url: 'https://example.com/photo.jpg' }] }] }));
+    expect(invalid.status).toBe(400);
+    const tooMany = await server.fetch(jsonRequest('/api/chat', 'POST', { messages: [{ role: 'user', parts: Array(5).fill(file) }] }));
+    expect(tooMany.status).toBe(400);
 });

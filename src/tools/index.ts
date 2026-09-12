@@ -1,3 +1,4 @@
+import { createImageTools } from './image-tools';
 import type { ExecutionStore } from '../execution/execution-store';
 import type { WorkStore } from '../work/work-store';
 import { createWorkTools } from './work-tools';
@@ -66,10 +67,12 @@ export function createTools (
     webProvider?: WebProvider,
     executions?: ExecutionStore,
     works?: WorkStore,
+    images?: Parameters<typeof createImageTools>,
 ) {
     const guard = new PathGuard(workspacePath);
     const tools = {
         ...createFileTools(guard),
+        ...(images ? createImageTools(...images) : {}),
         ...(executions ? {
             execution_status: tool({
                 description: '检查中断执行的完整工具参数与已知结果；未知结果必须查询实际状态，不能直接重放',
