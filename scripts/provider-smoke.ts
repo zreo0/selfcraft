@@ -1,3 +1,9 @@
+import { ForegroundRunner } from '../src/agent/foreground-runner';
+import { RuntimeClient } from '../src/cli/runtime-client';
+import { ExecutionStore } from '../src/execution/execution-store';
+import { HealthChecker } from '../src/health/health-checker';
+import { ScheduledTaskManager } from '../src/task/scheduled-task-manager';
+import { WebServer } from '../src/web/web-server';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -33,6 +39,7 @@ function createTestServer () {
     let requestCount = 0;
     const server = Bun.serve({
         port: 0,
+        idleTimeout: 30,
         async fetch (request) {
             if (new URL(request.url).pathname !== '/v1/chat/completions') {
                 return new Response('not found', { status: 404 });
@@ -88,6 +95,8 @@ function createTestServer () {
                     },
                 ]);
             }
+            // 模拟工具之后模型长时间思考，覆盖浏览器流超过 Bun 默认十秒空闲期的情况
+            await Bun.sleep(13_000);
             return createStreamResponse([
                 {
                     ...base,
@@ -113,6 +122,7 @@ async function main (): Promise<void> {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'selfcraft-provider-smoke-'));
     const { server, getRequestCount } = createTestServer();
     const paths = resolvePaths('development', path.join(root, 'home'));
+    let web: WebServer | undefined;
     try {
         const workspace = new WorkspaceService(paths.workspace, path.join(paths.project, 'workspace-template'));
         workspace.initialize();
@@ -147,6 +157,7 @@ async function main (): Promise<void> {
             notifications,
             logger,
         );
+        const executions = new ExecutionStore(paths.state);
         const agent = new AgentRuntime(
             config,
             workspace,
@@ -160,11 +171,17 @@ async function main (): Promise<void> {
                 endAgentActivity: () => undefined,
                 enqueue: () => 'provider-smoke-reflection',
             },
-            createTools(paths.workspace, skills, notifications, evolution, jobs, memory),
+            createTools(paths.workspace, skills, notifications, evolution, jobs, memory, undefined, undefined, executions),
             logger,
+            undefined,
+            executions,
         );
+        web = new WebServer({ paths, config, agent: new ForegroundRunner(agent, executions), memory, skills, notifications, jobs,
+            scheduledTasks: new ScheduledTaskManager(paths.state, notifications, memory), health: new HealthChecker(), logger,
+            staticDirectory: path.join(paths.project, 'web', 'dist'), onRestart: () => undefined });
+        const address = web.start('127.0.0.1', 0);
         let reply = '';
-        await agent.run('创建 provider 验收文件', event => {
+        await new RuntimeClient(address.url).chat('创建 provider 验收文件', event => {
             if (event.type === 'text-delta') {
                 reply += event.delta;
             }
@@ -180,9 +197,11 @@ async function main (): Promise<void> {
             healthy: true,
             openAICompatibleHTTP: true,
             toolLoop: true,
+            webStreamSurvivesIdle: true,
             requests: getRequestCount(),
         }, null, 4));
     } finally {
+        web?.stop();
         server.stop(true);
         fs.rmSync(root, { recursive: true, force: true });
     }

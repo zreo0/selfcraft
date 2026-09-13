@@ -1,3 +1,4 @@
+import { canRepeatTool } from '../tools/tool-safety';
 import type { AttachmentStore } from '../attachment/attachment-store';
 import { userContentText } from '../model/user-content';
 import type { ExecutionStore } from '../execution/execution-store';
@@ -111,6 +112,19 @@ export class AgentRuntime {
         let snapshot = this.session.load();
         const inputRecorded = this.session.hasAppend(`run:${runId}:user`);
         const retrySource = options.retry ? this.resolveRetrySource(input, snapshot.messages) : null;
+        if (retrySource && this.executions) {
+            const previousRun = this.memory.listInteractionRunEvents(retrySource.id)
+                .filter(event => event.type === 'run_failed').at(-1)?.runId;
+            if (previousRun && this.executions.get(previousRun)) {
+                const previous = this.executions.begin(previousRun);
+                if (previous.status === 'blocked') {
+                    throw new Error('这轮已经执行过操作，请确认结果后重新发送');
+                }
+                // 安全重试继承已完成的读取结果，不为模型最后一步失败重复支付视觉调用
+                this.executions.checkpoint(runId, previous.messages, previous.result ?? undefined);
+                this.executions.setStatus(previousRun, 'failed', '已通过新的安全重试接续');
+            }
+        }
         const userEvent = retrySource
             ? this.memory.recordEvent({
                 actor: 'system',
@@ -274,7 +288,7 @@ export class AgentRuntime {
     }
 
     /**
-     * 校验重试仍对应最后一轮失败输入，且旧运行没有产生工具副作用
+     * 校验重试仍对应最后一轮失败输入，且旧运行只包含可安全重复的工具
      *
      * @param input 准备重试的用户输入
      * @param messages 当前持久会话
@@ -297,7 +311,7 @@ export class AgentRuntime {
         if (!runEvents.some(event => event.type === 'run_failed')) {
             throw new Error('最后一轮对话没有失败，无需重试');
         }
-        if (runEvents.some(event => event.type === 'tool_call')) {
+        if (runEvents.some(event => event.type === 'tool_call' && !canRepeatTool(String((event.payload as { toolName?: string })?.toolName)))) {
             throw new Error('这轮已经执行过操作，请确认结果后重新发送');
         }
         return lastEvent;

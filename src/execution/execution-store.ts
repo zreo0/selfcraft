@@ -1,3 +1,4 @@
+import { canRepeatTool } from '../tools/tool-safety';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Database } from 'bun:sqlite';
@@ -88,11 +89,19 @@ export class ExecutionStore {
                 WHERE execution_id = ? AND checkpointed = 0 ORDER BY rowid`).all(id) as {
                     call_id: string; name: string; input: string; output: string; settled: number;
                 }[];
+            const interruptedReads = tools.filter(tool => !tool.settled && canRepeatTool(tool.name));
+            for (const read of interruptedReads) {
+                // 中断读取的结果未知，但不会改变用户状态；记录未收到结果，允许模型重新读取
+                const result = { error: '上次只读工具的结果未收到，可以重新调用' };
+                this.finishTool(id, read.call_id, result);
+                read.settled = 1;
+                read.output = JSON.stringify({ type: 'json', value: result });
+            }
             if (tools.some(tool => !tool.settled)) {
                 this.setStatus(id, 'blocked', '外部操作结果未知，需要检查实际状态后通过新请求处理');
                 return this.get(id)!;
             }
-            if (record.status === 'blocked' || record.status === 'completed') {
+            if ((record.status === 'blocked' && interruptedReads.length === 0) || record.status === 'completed') {
                 return record;
             }
             if (tools.length > 0) {

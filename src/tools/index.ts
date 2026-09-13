@@ -1,3 +1,4 @@
+import { canRepeatTool } from './tool-safety';
 import { createImageTools } from './image-tools';
 import type { ExecutionStore } from '../execution/execution-store';
 import type { WorkStore } from '../work/work-store';
@@ -142,6 +143,9 @@ function wrapToolsWithTimeline (
                     result = await definition.execute(input, options);
                     executions?.finishTool(context.runId, options.toolCallId, result);
                 } catch (error) {
+                    if (canRepeatTool(name)) {
+                        executions?.finishTool(context.runId, options.toolCallId, { error: '只读工具未完成，可在重试时重新调用' });
+                    }
                     try {
                         memory.recordEvent({
                             actor: `tool:${name}`,

@@ -544,6 +544,15 @@ test('图片上传与图片单独发送共用 Runtime，历史返回标准 file 
     memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '图片', content, channel: 'foreground' } });
     const history = await (await server.fetch(new Request('http://selfcraft.local/api/messages'))).json() as any;
     expect(history.items.at(-1).parts.find((part: any) => part.type === 'file')).toEqual(file);
+    expect(history.items.at(-1).parts).toEqual([file]);
+    const mixedParts = [file, { type: 'text', text: '这是什么？' }];
+    await (await server.fetch(jsonRequest('/api/chat', 'POST', { messages: [{ role: 'user', parts: mixedParts }] }))).text();
+    const originalInput = calls.at(-1)!;
+    memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '这是什么？', content: JSON.parse(originalInput), channel: 'foreground' } });
+    const refreshed = await (await server.fetch(new Request('http://selfcraft.local/api/messages'))).json() as any;
+    expect(refreshed.items.at(-1).parts).toEqual(mixedParts);
+    await (await server.fetch(jsonRequest('/api/chat', 'POST', { trigger: 'regenerate-message', messages: [refreshed.items.at(-1)] }))).text();
+    expect(calls.at(-1)).toBe(originalInput);
     const invalid = await server.fetch(jsonRequest('/api/chat', 'POST', { messages: [{ role: 'user', parts: [{ ...file, url: 'https://example.com/photo.jpg' }] }] }));
     expect(invalid.status).toBe(400);
     const tooMany = await server.fetch(jsonRequest('/api/chat', 'POST', { messages: [{ role: 'user', parts: Array(5).fill(file) }] }));

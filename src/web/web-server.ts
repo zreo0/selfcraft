@@ -163,7 +163,13 @@ export class WebServer {
             hostname,
             port,
             maxRequestBodySize: MAX_IMAGE_BYTES + 65536,
-            fetch: request => this.fetch(request),
+            fetch: (request, server) => {
+                if (request.method === 'POST' && new URL(request.url).pathname === '/api/chat') {
+                    // 图片读取期间可能没有流式输出，执行预算由 ForegroundRunner 控制
+                    server.timeout(request, 0);
+                }
+                return this.fetch(request);
+            },
         });
         const address = this.address();
         this.dependencies.logger.info('Web entry started', { ...address });
@@ -685,11 +691,11 @@ function toUIMessage (event: EventRecord, runEvents: EventRecord[]): SelfcraftUI
                     items: presentation.activities,
                 },
             }] : []),
-            {
-                type: 'text' as const,
-                text: Array.isArray(payload?.content) ? payload.content.filter(part => part.type === 'text').map(part => part.text).join('\n') : typeof payload?.text === 'string' ? payload.text : '',
-            },
-            ...(event.type === 'user_message' && payload?.content ? userContentFiles(payload.content) : []),
+            // 历史必须保留图片与文字的原始顺序，刷新后重试才能对应同一份输入
+            ...(event.type === 'user_message' && Array.isArray(payload?.content)
+                ? payload.content.flatMap<SelfcraftUIMessage['parts'][number]>(part => part.type === 'text'
+                    ? [part] : userContentFiles([part]))
+                : [{ type: 'text' as const, text: typeof payload?.text === 'string' ? payload.text : '' }]),
             ...presentation.sources.map(source => ({
                 type: 'source-url' as const,
                 sourceId: source.id,
@@ -851,6 +857,14 @@ function publicError (error: unknown): string {
 function publicChatError (error: unknown): string {
     if (error instanceof DOMException && error.name === 'AbortError') {
         return '本轮回应已停止';
+    }
+    if (error instanceof Error && [
+        '前台执行超时，步骤已保留',
+        '这轮已经执行过操作，请确认结果后重新发送',
+        '最后一轮对话已经变化，请重新发送消息',
+        '最后一轮对话没有失败，无需重试',
+    ].includes(error.message)) {
+        return error.message;
     }
     return '回应没有完成，请稍后重试或查看 Runtime 日志';
 }

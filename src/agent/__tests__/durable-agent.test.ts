@@ -203,3 +203,75 @@ test('没有视觉模型时图片仍被接收，工具返回能力缺失且后�
     expect(model.doStreamCalls).toHaveLength(3);
     expect(attachments.read(url).bytes.length).toBe(4);
 });
+
+
+test('图片分析被取消后显式重试成功，不重复用户消息且保留中断证据', async () => {
+    const controller = new AbortController();
+    let analysisCalls = 0;
+    const auxiliary = new MockLanguageModelV4({ doGenerate: async () => {
+        if (++analysisCalls === 1) {
+            controller.abort(new Error('模拟图片读取超时'));
+            throw controller.signal.reason;
+        }
+        return {
+            content: [{ type: 'text' as const, text: '右侧是蓝色' }],
+            finishReason: { unified: 'stop' as const, raw: undefined },
+            usage: { inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: 1, text: 1, reasoning: undefined } }, warnings: [],
+        };
+    } });
+    let url = '';
+    let modelCalls = 0;
+    const model = new MockLanguageModelV4({ doStream: async () => ++modelCalls <= 2
+        ? response({ name: 'image_analyze', input: { url, question: '右侧是什么颜色？' } }) : response(undefined, '右侧是蓝色') });
+    const { agent, attachments, session, executions } = fixture(model, false, auxiliary);
+    url = (await attachments.save(new File([new Uint8Array([255, 216, 255, 224])], 'image.jpg'))).url;
+    const input = `查看图片 ${url}`;
+    await expect(agent.run(input, () => undefined, { executionId: 'interrupted-image', signal: controller.signal })).rejects.toThrow();
+    expect(executions.begin('interrupted-image').status).not.toBe('blocked');
+    await agent.run(input, () => undefined, { executionId: 'retry-image', retry: true });
+    expect(analysisCalls).toBe(2);
+    expect(executions.get('retry-image')?.status).toBe('completed');
+    expect(session.loadTranscript().filter(message => message.role === 'user')).toHaveLength(1);
+});
+
+test('图片已分析但最终模型失败时，显式重试复用检查点而不重复视觉调用', async () => {
+    let calls = 0;
+    let url = '';
+    const auxiliary = new MockLanguageModelV4({ doGenerate: {
+        content: [{ type: 'text', text: '图片中的右侧是蓝色' }],
+        finishReason: { unified: 'stop', raw: undefined },
+        usage: { inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: 1, text: 1, reasoning: undefined } }, warnings: [],
+    } });
+    const model = new MockLanguageModelV4({ doStream: async options => {
+        calls += 1;
+        if (calls === 1) {
+            return response({ name: 'image_analyze', input: { url, question: '图里是什么？' } });
+        }
+        if (calls === 2) {
+            throw new Error('模型临时不可用');
+        }
+        expect(JSON.stringify(options.prompt)).toContain('图片中的右侧是蓝色');
+        return response();
+    } });
+    const { agent, session, attachments } = fixture(model, false, auxiliary);
+    url = (await attachments.save(new File([new Uint8Array([255, 216, 255, 224])], 'image.jpg'))).url;
+    await expect(agent.run('读取图片', () => undefined, { executionId: 'read-failed' })).rejects.toThrow();
+    await agent.run('读取图片', () => undefined, { executionId: 'read-retry', retry: true });
+    expect(calls).toBe(3);
+    expect(auxiliary.doGenerateCalls).toHaveLength(1);
+    expect(session.loadTranscript().filter(message => message.role === 'user')).toHaveLength(1);
+});
+
+test('写入成功后模型失败，显式重试仍拒绝重复有副作用的操作', async () => {
+    let calls = 0;
+    const model = new MockLanguageModelV4({ doStream: async () => {
+        if (++calls === 1) {
+            return response({ name: 'write', input: { path: 'files/once.txt', content: '保留' } });
+        }
+        throw new Error('模型暂不可用');
+    } });
+    const { agent } = fixture(model);
+    await expect(agent.run('保存文件', () => undefined, { executionId: 'write-once' })).rejects.toThrow();
+    await expect(agent.run('保存文件', () => undefined, { executionId: 'write-retry', retry: true })).rejects.toThrow('这轮已经执行过操作');
+    expect(calls).toBe(2);
+});

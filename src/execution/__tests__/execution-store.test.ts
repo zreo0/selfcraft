@@ -60,3 +60,23 @@ test('最终文本检查点在交付前崩溃仍可恢复', () => {
     first.checkpoint('run', [{ role: 'assistant', content: 'done' }], 'done');
     expect(new ExecutionStore(file).begin('run').result).toBe('done');
 });
+
+
+test('旧版误阻塞的图片读取恢复为已知中断，其他未知操作仍然阻止重放', () => {
+    const file = fixture();
+    const first = new ExecutionStore(file);
+    first.accept('read', '查看图片', 'foreground');
+    first.begin('read');
+    first.startTool('read', 'image', 'image_analyze', { url: '/api/attachments/image.png' });
+    first.setStatus('read', 'blocked', '旧版认为所有工具都有副作用');
+    const restored = new ExecutionStore(file);
+    const read = restored.begin('read');
+    expect(read.status).toBe('running');
+    expect(JSON.stringify(read.messages)).toContain('上次只读工具的结果未收到');
+    expect(restored.begin('read').messages).toHaveLength(2);
+    first.accept('mixed', '同时操作', 'foreground');
+    first.begin('mixed');
+    first.startTool('mixed', 'read', 'image_analyze', {});
+    first.startTool('mixed', 'write', 'write', {});
+    expect(restored.begin('mixed').status).toBe('blocked');
+});

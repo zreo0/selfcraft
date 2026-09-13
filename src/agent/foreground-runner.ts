@@ -80,7 +80,8 @@ export class ForegroundRunner {
             }
             const controller = new AbortController();
             this.active = controller;
-            const deadline = this.executions ? setTimeout(() => controller.abort(new Error('前台执行超时，步骤已保留')), 60_000) : undefined;
+            // 视觉分析可能超过一分钟，前台预算需覆盖主模型、辅助读取与最终回答
+            const deadline = this.executions ? setTimeout(() => controller.abort(new Error('前台执行超时，步骤已保留')), 180_000) : undefined;
             const executionOptions = this.executions ? { ...options, signal: controller.signal } : options;
             if (options.signal?.aborted) {
                 throw new DOMException('对话已取消', 'AbortError');
