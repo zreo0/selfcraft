@@ -1,14 +1,18 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Database } from 'bun:sqlite';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { assertStateVersion } from '../supervisor/state-version';
 import { modelMessageSchema, type ModelMessage } from 'ai';
 
 /** 持久会话快照 */
 export interface SessionSnapshot {
-    /** 已压缩的早期对话摘要 */
+    /** 最近一次交接的工作笔记，原文和旧笔记另存 */
     summary: string;
+    /** 当前快照版本，用于交接时核对原文是否变化 */
+    revision?: number;
+    /** 活跃消息在原文表中的稳定 ID */
+    messageIds?: number[];
     /** 仍保留原文的近期消息 */
     messages: ModelMessage[];
 }
@@ -25,7 +29,7 @@ export class SessionStore {
      * @param sessionsPath 会话根目录
      * @param sessionId 会话标识
      */
-    constructor (sessionsPath: string, sessionId = 'main') {
+    constructor (private readonly sessionsPath: string, sessionId = 'main') {
         if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(sessionId)) {
             throw new Error('会话标识无效');
         }
@@ -40,6 +44,11 @@ export class SessionStore {
             CREATE TABLE IF NOT EXISTS session_context (id INTEGER PRIMARY KEY, snapshot TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS session_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS session_appends (id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS context_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                first_message_id INTEGER NOT NULL, last_message_id INTEGER NOT NULL,
+                content TEXT NOT NULL, created_at TEXT NOT NULL
+            );
         `);
         if (!this.database.query('SELECT id FROM session_context WHERE id = 1').get()) {
             this.migrateLegacy(sessionPath);
@@ -79,6 +88,11 @@ export class SessionStore {
         const row = this.database.query('SELECT snapshot FROM session_context WHERE id = 1').get() as { snapshot: string };
         const snapshot = JSON.parse(row.snapshot) as SessionSnapshot;
         snapshot.messages.forEach(message => modelMessageSchema.parse(message));
+        // 旧快照的活跃消息是原文后缀，首次读取补出 ID 即可，不重写旧数据
+        snapshot.messageIds ??= (this.database.query(`SELECT id FROM (
+            SELECT id FROM session_messages ORDER BY id DESC LIMIT ?
+        ) ORDER BY id`).all(snapshot.messages.length) as { id: number }[]).map(row => row.id);
+        snapshot.revision ??= 0;
         return snapshot;
     }
 
@@ -100,17 +114,12 @@ export class SessionStore {
                 return;
             }
             const snapshot = this.load();
+            const ids = messages.map(message => Number(this.database.query('INSERT INTO session_messages (message) VALUES (?)')
+                .run(JSON.stringify(message)).lastInsertRowid));
             this.database.query('UPDATE session_context SET snapshot = ? WHERE id = 1')
-                .run(JSON.stringify({ ...snapshot, messages: [...snapshot.messages, ...messages] }));
-            for (const message of messages) {
-                this.database.query('INSERT INTO session_messages (message) VALUES (?)').run(JSON.stringify(message));
-            }
+                .run(JSON.stringify({ ...snapshot, revision: snapshot.revision! + 1,
+                    messages: [...snapshot.messages, ...messages], messageIds: [...snapshot.messageIds!, ...ids] }));
         }).immediate();
-    }
-
-    /** 判断稳定提交是否已经写入，避免恢复时重复组装用户输入 */
-    public hasAppend (id: string): boolean {
-        return Boolean(this.database.query('SELECT id FROM session_appends WHERE id = ?').get(id));
     }
 
     /**
@@ -124,14 +133,80 @@ export class SessionStore {
             modelMessageSchema.parse(message);
         }
         this.database.query('UPDATE session_context SET snapshot = ? WHERE id = 1')
-            .run(JSON.stringify({ summary: summary.trim(), messages }));
+            .run(JSON.stringify({ summary: summary.trim(), messages, revision: this.load().revision! + 1 }));
+    }
+
+    /** 释放短期工作窗口的数据库连接 */
+    public [Symbol.dispose] (): void {
+        this.database.close();
+    }
+
+    /** 为后台执行提供独立工作窗口，前台对话仍使用 main */
+    public forExecution (executionId: string): SessionStore {
+        return new SessionStore(this.sessionsPath, `execution-${createHash('sha256').update(executionId).digest('hex').slice(0, 32)}`);
+    }
+
+    /** 以原请求和响应序号去重保存每个完整步骤，执行重试共用同一来源 */
+    public appendResponses (sourceRunId: string, messages: ModelMessage[]): void {
+        this.database.transaction(() => {
+            messages.forEach((message, index) => this.appendOnce(`run:${sourceRunId}:response:${index}`, message));
+        }).immediate();
+    }
+
+    /** 保存笔记并原子替换工作窗口；失败或过期提交均保留原快照 */
+    public handoff (expected: SessionSnapshot, content: string, retainedIds: number[]): SessionSnapshot {
+        return this.database.transaction(() => {
+            const current = this.load();
+            if (current.revision !== expected.revision) {
+                throw new Error('上下文已变化，请在下一步骤重新整理');
+            }
+            const ids = current.messageIds!;
+            if (!content.trim() || !ids.length || retainedIds.some(id => !ids.includes(id))) {
+                throw new Error('工作笔记或保留消息无效');
+            }
+            const references = [...content.matchAll(/\[message:(\d+)\]/g)].map(match => Number(match[1]));
+            if (!references.length || references.some(id => !this.database.query('SELECT id FROM session_messages WHERE id = ?').get(id))) {
+                throw new Error('工作笔记缺少有效的原文引用');
+            }
+            this.database.query(`INSERT INTO context_notes (first_message_id, last_message_id, content, created_at)
+                VALUES (?, ?, ?, ?)`).run(Math.min(...ids), Math.max(...ids), content.trim(), new Date().toISOString());
+            const retained = new Set(retainedIds);
+            const snapshot: SessionSnapshot = { summary: content.trim(), revision: current.revision! + 1,
+                messages: current.messages.filter((_, index) => retained.has(ids[index]!)),
+                messageIds: ids.filter(id => retained.has(id)) };
+            this.database.query('UPDATE session_context SET snapshot = ? WHERE id = 1').run(JSON.stringify(snapshot));
+            return snapshot;
+        }).immediate();
+    }
+
+    /** 搜索原文或笔记，返回稳定引用和有限预览，before 用于向前翻页 */
+    public searchHistory (kind: 'message' | 'note', query = '', before?: number, limit = 10): { id: number; preview: string }[] {
+        const table = kind === 'message' ? 'session_messages' : 'context_notes';
+        const column = kind === 'message' ? 'message' : 'content';
+        return this.database.query(`SELECT id, substr(${column}, 1, 600) AS preview FROM ${table}
+            WHERE instr(${column}, ?) > 0 AND id < ? ORDER BY id DESC LIMIT ?`)
+            .all(query, before ?? Number.MAX_SAFE_INTEGER, Math.min(20, Math.max(1, limit))) as { id: number; preview: string }[];
+    }
+
+    /** 按稳定引用分页读取原文或笔记，原文包含完整 AI SDK 内容和附件引用 */
+    public readHistory (kind: 'message' | 'note', id: number, offset = 0, limit = 4000): { id: number; content: string; totalCharacters: number; nextOffset: number | null; firstMessageId?: number; lastMessageId?: number } {
+        const table = kind === 'message' ? 'session_messages' : 'context_notes';
+        const column = kind === 'message' ? 'message' : 'content';
+        const sourceColumns = kind === 'note' ? ', first_message_id AS firstMessageId, last_message_id AS lastMessageId' : '';
+        const row = this.database.query(`SELECT ${column} AS content${sourceColumns} FROM ${table} WHERE id = ?`).get(id) as { content: string; firstMessageId?: number; lastMessageId?: number } | null;
+        if (!row) {
+            throw new Error('历史引用不存在');
+        }
+        const content = row.content.slice(offset, offset + Math.min(8000, limit));
+        return { ...row, id, content, totalCharacters: row.content.length,
+            nextOffset: offset + content.length < row.content.length ? offset + content.length : null };
     }
 
     /** 清空当前会话但保留目录 */
     public clear (): void {
         this.database.transaction(() => {
             this.replace('', []);
-            this.database.run('DELETE FROM session_messages; DELETE FROM session_appends');
+            this.database.run('DELETE FROM session_messages; DELETE FROM session_appends; DELETE FROM context_notes');
         }).immediate();
     }
 

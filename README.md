@@ -168,7 +168,7 @@ Task ──到期──> Notification + Event
 - **Topic** 是跨多轮、跨月份甚至跨年份的稳定事项 ID；允许同名，不靠标题强行合并
 - **Episode** 不是另一张表，而是按文本、时间、日历日期或 Topic 临时重建的一段经历
 
-`transcript.jsonl` 仍保存模型会话原文；`context.json` 和会话摘要只是可重建的工作缓存，不是事实来源。
+`session.sqlite` 保存模型会话原文、历次工作笔记与当前工作窗口。笔记只是可回查的派生数据，不是事实来源；旧 JSONL 仅一次性导入。
 
 用户明确要求“记住”时，Agent 使用 `memory_remember` 写入 active Memory；普通对话结束后只进入持久 Reflection 队列。Runtime 在所有 Agent 工作结束并持续空闲一分钟后，才把尚未回看的连续经历合并为一次 Reflection，由当前模型提取 candidate；如果用户或后台 Agent 在反思期间开始工作，Reflection 会主动中断、放回队列，等下一次空闲继续：
 
@@ -296,7 +296,13 @@ Web 支持选择或粘贴 PNG、JPEG、GIF、WebP 图片，每张最多 10 MB，
 SELFCRAFT_ENV=development SELFCRAFT_HOME=/custom/data bun run start
 ```
 
-上下文摘要保存在 `context.json`，它是可以重建的派生数据；原始会话仍持续追加。超过 8 KiB 的工具结果会写入 `workspace/files/tool-results/`，上下文只保留路径和预览。
+普通对话持续追加到当前工作窗口，不逐轮生成摘要。Runtime 在每个模型请求前检查指令、工具和消息的估算预算；达到工作预算时生成带 `[message:ID]` 原文引用的笔记，原子保存笔记与较小窗口，再继续执行。用户不需要新建会话。
+
+默认工作预算约 48,000 tokens，小窗口模型会提前触发；交接尽量降至触发预算的一半，固定指令与笔记决定最低开销。保留近期完整工具交互并尽量保留当前用户原话。笔记失败保留原窗口，超出安全预算则暂停，不静默丢弃历史。Token 使用字符估算并预留余量，无法保证所有模型的精确上限。
+
+`history_search` 按字面文本检索当前会话的原文或旧笔记，`history_read` 按稳定 ID 分页读取，包括附件引用。它们按需调用，不引入每轮额外检索模型。后台执行有各自内部工作窗口；承诺、取消和执行结果仍以 Work、Execution 等持久状态为准。完整步骤先保存执行检查点再去重追加原文，交接不会清除恢复依据。
+
+超过 8 KiB 的工具结果会写入 `workspace/files/tool-results/`，上下文只保留路径和预览。模型仍使用 AI SDK 标准消息；图片保持持久引用，请求时再读取原件。
 
 ## 开发与验证
 

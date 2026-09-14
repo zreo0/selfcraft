@@ -74,6 +74,8 @@ export interface AgentToolCompletion {
 const TOOL_LABELS: Record<string, string> = {
     read: '读取文件',
     image_analyze: '查看图片',
+    history_search: '查找历史',
+    history_read: '读取历史',
     list: '查看目录',
     search: '搜索工作区',
     write: '写入文件',

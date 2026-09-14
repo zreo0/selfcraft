@@ -40,7 +40,7 @@ function response (call?: { name: string; input: unknown }, text = '已完成') 
     };
 }
 /** 创建与 Runtime 相同的持久 Agent 组装 */
-function fixture (model: MockLanguageModelV4, vision = false, auxiliary?: MockLanguageModelV4) {
+function fixture (model: MockLanguageModelV4, vision = false, auxiliary?: MockLanguageModelV4, context = new ContextManager(), compression = model) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'selfcraft-durable-agent-'));
     roots.push(root);
     const paths = resolvePaths('development', root);
@@ -58,10 +58,13 @@ function fixture (model: MockLanguageModelV4, vision = false, auxiliary?: MockLa
     const attachments = new AttachmentStore(paths.home);
     const tools = createTools(paths.workspace, skills, notifications, evolution, jobs, memory, undefined, undefined, executions, works, [attachments, () => auxiliary ? ({ model: auxiliary, providerId: 'test', modelId: 'vision', contextWindow: 128000, maxOutputTokens: 2048, vision: true }) : null]);
     const session = new SessionStore(paths.sessions);
-    const agent = new AgentRuntime(config, workspace, skills, session, new ContextManager(), evolution, memory,
+    /** 使用相同持久目录重新创建助理，验证恢复不依赖内存状态 */
+    const restore = () => new AgentRuntime(config, workspace, skills, new SessionStore(paths.sessions), context, evolution, memory,
         { beginAgentActivity: () => undefined, endAgentActivity: () => undefined, enqueue: () => 'reflection' }, tools, logger,
-        () => ({ model, providerId: 'test', modelId: 'test', contextWindow: 128000, maxOutputTokens: 4096, vision }), executions, works, attachments);
-    return { paths, agent, executions, session, works, memory, jobs, notifications, logger, attachments };
+        () => ({ model, providerId: 'test', modelId: 'test', contextWindow: 128000, maxOutputTokens: 4096, vision }), executions, works, attachments,
+        () => ({ model: compression, providerId: 'test', modelId: 'compression', contextWindow: 128000, maxOutputTokens: 4096 }));
+    const agent = restore();
+    return { paths, agent, restore, executions, session, works, memory, jobs, notifications, logger, attachments };
 }
 afterEach(() => roots.splice(0).forEach(root => fs.rmSync(root, { recursive: true, force: true })));
 
@@ -274,4 +277,59 @@ test('写入成功后模型失败，显式重试仍拒绝重复有副作用的�
     await expect(agent.run('保存文件', () => undefined, { executionId: 'write-once' })).rejects.toThrow();
     await expect(agent.run('保存文件', () => undefined, { executionId: 'write-retry', retry: true })).rejects.toThrow('这轮已经执行过操作');
     expect(calls).toBe(2);
+});
+
+
+test('工具循环内交接后模型中断，重建助理只读取笔记而不重放已写入的文件', async () => {
+    let calls = 0;
+    const model = new MockLanguageModelV4({ doStream: async options => {
+        calls += 1;
+        if (calls === 1) return response({ name: 'write', input: { path: 'files/evidence.txt', content: 'A'.repeat(70000) } });
+        expect(JSON.stringify(options.prompt)).toContain('文件已写入');
+        expect(JSON.stringify(options.prompt)).not.toContain('A'.repeat(10000));
+        if (calls === 2) throw new Error('交接后模型中断');
+        return response(undefined, '验证完成');
+    } });
+    const compression = new MockLanguageModelV4({ doGenerate: {
+        content: [{ type: 'text', text: '当前任务：保存并验证证据 [message:1]。文件已写入 files/evidence.txt [message:3]，不要重复写入，继续验证。' }],
+        finishReason: { unified: 'stop', raw: undefined },
+        usage: { inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: 1, text: 1, reasoning: undefined } }, warnings: [],
+    } });
+    const f = fixture(model, false, undefined, new ContextManager(30000), compression);
+    await expect(f.agent.run('保存并验证证据', () => undefined, { executionId: 'handoff-restart' })).rejects.toThrow('交接后模型中断');
+    expect(f.session.searchHistory('note')).toHaveLength(1);
+    const originalCount = f.session.loadTranscript().length;
+    await f.restore().run('保存并验证证据', () => undefined, { executionId: 'handoff-restart' });
+    expect(compression.doGenerateCalls).toHaveLength(1);
+    expect(f.session.loadTranscript()).toHaveLength(originalCount + 1);
+    expect(f.memory.listEventsByRun('handoff-restart').filter(event => event.type === 'tool_call')).toHaveLength(1);
+    expect(fs.readFileSync(path.join(f.paths.workspace, 'files/evidence.txt'), 'utf8')).toHaveLength(70000);
+    expect(f.executions.get('handoff-restart')?.status).toBe('completed');
+});
+
+test('正常短对话只追加消息，不调用整理模型', async () => {
+    const model = new MockLanguageModelV4({ doStream: async () => response() });
+    const f = fixture(model);
+    await f.agent.run('你好');
+    await f.agent.run('继续');
+    expect(model.doGenerateCalls).toHaveLength(0);
+    expect(f.session.searchHistory('note')).toHaveLength(0);
+    expect(f.session.load().messages).toHaveLength(4);
+});
+
+
+test('笔记无效且超出安全预算时停止请求，原文和窗口不被丢弃', async () => {
+    const model = new MockLanguageModelV4({ doStream: async () => response(), doGenerate: {
+        content: [{ type: 'text', text: '没有引用的无效笔记' }],
+        finishReason: { unified: 'stop', raw: undefined },
+        usage: { inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: 1, text: 1, reasoning: undefined } }, warnings: [],
+    } });
+    const f = fixture(model);
+    f.session.append({ role: 'user', content: 'A'.repeat(240000) });
+    const runner = new ForegroundRunner(f.agent, f.executions);
+    await expect(runner.run('继续', () => undefined, { executionId: 'over-budget' })).rejects.toThrow('超过安全预算');
+    expect(model.doStreamCalls).toHaveLength(0);
+    expect(f.session.load().messages).toEqual(f.session.loadTranscript());
+    expect(f.session.searchHistory('note')).toHaveLength(0);
+    expect(f.executions.get('over-budget')?.status).toBe('failed');
 });

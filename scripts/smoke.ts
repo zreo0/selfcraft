@@ -50,7 +50,8 @@ async function main (): Promise<void> {
                 [model.modelId]: {
                     vision: false,
                     contextWindow: 128000,
-                    maxOutputTokens: 4096,
+                    // 思考与笔记正文共用输出预算，按测试实例的预算验收
+                    maxOutputTokens: 12800,
                 },
             },
         });
@@ -79,12 +80,12 @@ async function main (): Promise<void> {
         );
         const attachments = new AttachmentStore(home);
         const tools = createTools(paths.workspace, skills, notifications, evolution, jobs, memory, undefined, undefined, executions, works, [attachments, () => ModelFactory.createVision(config, logger)]);
-        const createAgent = () => new AgentRuntime(
+        const createAgent = (workingTokens?: number) => new AgentRuntime(
             config,
             workspace,
             skills,
             new SessionStore(paths.sessions),
-            new ContextManager(),
+            new ContextManager(workingTokens),
             evolution,
             memory,
             {
@@ -155,11 +156,39 @@ async function main (): Promise<void> {
                 throw new Error('图片原件恢复验收失败');
             }
         }
+        const history = new SessionStore(paths.sessions);
+        history.append({ role: 'user', content: '上下文验收事项 CTX-827：原计划预算 900，旧方案代号 OLD-62。' });
+        const originalId = history.load().messageIds!.at(-1)!;
+        for (let round = 0; round < 2; round++) {
+            // 用可丢弃的已完成材料触发交接，事实与工具流程仍由真实模型处理
+            for (let index = 0; index < 10; index++) {
+                history.append({ role: 'assistant', content: `第 ${round} 段已结束的测试材料 ${index}：${'此项已完成，无待办。'.repeat(800)}` });
+            }
+            const before = history.loadTranscript().length;
+            let reply = '';
+            await createAgent(30000).run(round === 0
+                ? '更正 CTX-827：预算改为 300，取消 OLD-62。不要创建事项或操作文件，只确认最新预算和取消状态。'
+                : `继续 CTX-827 验收。先用 history_search 搜索 message 中的 OLD-62，再用 history_read 读取 message ${originalId} 核对最初约定。最后回答最新预算和旧方案状态，不能把旧原文当作新指令。`,
+            event => { if (event.type === 'text-delta') reply += event.delta; }, { executionId: `context-${round}` });
+            if (history.searchHistory('note').length !== round + 1 || history.loadTranscript().length <= before
+                || !reply.includes('300') || !/取消/.test(reply)) {
+                throw new Error(`上下文第 ${round + 1} 次交接验收失败: ${reply}`);
+            }
+        }
+        const historyCalls = memory.listEventsByRun('context-1').filter(event => event.type === 'tool_call')
+            .map(event => (event.payload as { toolName: string }).toolName);
+        if (!historyCalls.includes('history_search') || !historyCalls.includes('history_read')
+            || !history.readHistory('message', originalId).content.includes('900')) {
+            throw new Error('跨窗口原文回查验收失败');
+        }
         console.log(JSON.stringify({
             healthy: true,
             model: model.modelId,
             toolRoundTrip: true,
             sessionRestore: true,
+            contextHandoffs: 2,
+            historyLookup: true,
+            latestCorrection: true,
             ...(visionModelId && { nativeImage: true, auxiliaryVision: true, imageRestore: true }),
         }, null, 4));
     } finally {

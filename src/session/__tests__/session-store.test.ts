@@ -67,3 +67,27 @@ test('旧实例一次性迁移保留原文，后续稳定提交跨重启去重',
     expect(restored.load().summary).toBe('摘要');
     expect(fs.readFileSync(path.join(directory, 'transcript.jsonl'), 'utf8')).toBe(original);
 });
+
+
+test('历史按稳定 ID 分页，窗口交接后仍能读取完整消息与附件引用', () => {
+    const store = new SessionStore(createTemporaryDirectory());
+    const first = { role: 'user' as const, content: [
+        { type: 'text' as const, text: '验收关键词' + 'A'.repeat(9000) },
+        { type: 'file' as const, data: '/api/attachments/example.png', mediaType: 'image/png' },
+    ] };
+    store.append(first, { role: 'assistant', content: '已处理验收关键词' });
+    const snapshot = store.load();
+    store.handoff(snapshot, '已处理 [message:1]', [2]);
+    expect(store.searchHistory('message', '验收关键词', undefined, 1)[0]?.id).toBe(2);
+    expect(store.searchHistory('message', '验收关键词', 2)[0]?.id).toBe(1);
+    let content = '';
+    let offset: number | null = 0;
+    while (offset !== null) {
+        const page = store.readHistory('message', 1, offset, 1000);
+        content += page.content;
+        offset = page.nextOffset;
+    }
+    expect(JSON.parse(content)).toEqual(first);
+    expect(store.load().messageIds).toEqual([2]);
+    expect(store.searchHistory('message', '%')).toHaveLength(0);
+});

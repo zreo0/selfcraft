@@ -102,7 +102,7 @@ export function createTools (
  * @param memory 事件时间线
  * @returns 保持原工具 schema 的包装工具
  */
-function wrapToolsWithTimeline (
+export function wrapToolsWithTimeline (
     tools: Record<string, any>,
     memory: MemoryStore,
     executions?: ExecutionStore,
