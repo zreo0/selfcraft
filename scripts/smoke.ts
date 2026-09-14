@@ -80,12 +80,12 @@ async function main (): Promise<void> {
         );
         const attachments = new AttachmentStore(home);
         const tools = createTools(paths.workspace, skills, notifications, evolution, jobs, memory, undefined, undefined, executions, works, [attachments, () => ModelFactory.createVision(config, logger)]);
-        const createAgent = (workingTokens?: number) => new AgentRuntime(
+        const createAgent = () => new AgentRuntime(
             config,
             workspace,
             skills,
             new SessionStore(paths.sessions),
-            new ContextManager(workingTokens),
+            new ContextManager(),
             evolution,
             memory,
             {
@@ -102,16 +102,20 @@ async function main (): Promise<void> {
         );
         let firstReply = '';
         await createAgent().run(
-            '记住验收代号 SC-2718。使用 write 工具创建 files/smoke.txt，内容必须是 SC-2718；再读取确认，最后只回复 SELFCRAFT_SMOKE_OK。',
+            '记住验收代号 SC-2718。先用 read 读取尚不存在的 files/missing.txt，收到错误后继续：使用 write 工具创建 files/smoke.txt，内容必须是 SC-2718；再读取确认，最后只回复 SELFCRAFT_SMOKE_OK。',
             event => {
                 if (event.type === 'text-delta') {
                     firstReply += event.delta;
                 }
             },
+            { executionId: 'smoke-tools' },
         );
         const artifact = fs.readFileSync(path.join(paths.workspace, 'files', 'smoke.txt'), 'utf8').trim();
         if (artifact !== 'SC-2718' || !firstReply.includes('SELFCRAFT_SMOKE_OK')) {
             throw new Error(`工具闭环验收失败: artifact=${artifact}, reply=${firstReply}`);
+        }
+        if (!memory.listEventsByRun('smoke-tools').some(event => event.type === 'tool_error' && (event.payload as { toolName?: string }).toolName === 'read')) {
+            throw new Error('未实际覆盖只读工具失败后的接续');
         }
 
         let secondReply = '';
@@ -161,12 +165,14 @@ async function main (): Promise<void> {
         const originalId = history.load().messageIds!.at(-1)!;
         for (let round = 0; round < 2; round++) {
             // 用可丢弃的已完成材料触发交接，事实与工具流程仍由真实模型处理
-            for (let index = 0; index < 10; index++) {
+            for (let index = 0; index < 14; index++) {
                 history.append({ role: 'assistant', content: `第 ${round} 段已结束的测试材料 ${index}：${'此项已完成，无待办。'.repeat(800)}` });
             }
             const before = history.loadTranscript().length;
             let reply = '';
-            await createAgent(30000).run(round === 0
+            const restored = createAgent();
+            await restored.maintainIdleContext(AbortSignal.timeout(180000));
+            await restored.run(round === 0
                 ? '更正 CTX-827：预算改为 300，取消 OLD-62。不要创建事项或操作文件，只确认最新预算和取消状态。'
                 : `继续 CTX-827 验收。先用 history_search 搜索 message 中的 OLD-62，再用 history_read 读取 message ${originalId} 核对最初约定。最后回答最新预算和旧方案状态，不能把旧原文当作新指令。`,
             event => { if (event.type === 'text-delta') reply += event.delta; }, { executionId: `context-${round}` });
@@ -186,6 +192,7 @@ async function main (): Promise<void> {
             model: model.modelId,
             toolRoundTrip: true,
             sessionRestore: true,
+            readFailureRecovery: true,
             contextHandoffs: 2,
             historyLookup: true,
             latestCorrection: true,

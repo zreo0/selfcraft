@@ -99,6 +99,7 @@ async function main (): Promise<void> {
     jobs.start();
     scheduledTasks.start();
     reflection.start();
+    agent.startContextMaintenance();
     let resolveShutdown: (exitCode: number) => void = () => undefined;
     let shuttingDown = false;
     const shutdown = new Promise<number>(resolve => {
@@ -153,6 +154,7 @@ async function main (): Promise<void> {
         web.stop();
         scheduledTasks.stop();
         reflection.stop();
+        context.stop();
     }
 }
 

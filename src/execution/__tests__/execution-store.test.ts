@@ -80,3 +80,21 @@ test('旧版误阻塞的图片读取恢复为已知中断，其他未知操作�
     first.startTool('mixed', 'write', 'write', {});
     expect(restored.begin('mixed').status).toBe('blocked');
 });
+
+test('旧版误阻塞的网页读取可恢复，已完成搜索不重放', () => {
+    const file = fixture();
+    const first = new ExecutionStore(file);
+    first.accept('web', '搜索研究', 'foreground');
+    first.begin('web');
+    first.startTool('web', 'search', 'web_search', { query: '研究' });
+    first.finishTool('web', 'search', { results: ['已找到的来源'] });
+    first.startTool('web', 'fetch', 'web_fetch', { url: 'https://example.com/study' });
+    first.setStatus('web', 'blocked', '外部操作结果未知');
+    const restored = new ExecutionStore(file);
+    const record = restored.begin('web');
+    expect(record.status).toBe('running');
+    expect(JSON.stringify(record.messages)).toContain('已找到的来源');
+    expect(JSON.stringify(record.messages)).toContain('上次只读工具的结果未收到');
+    expect(restored.begin('web').messages).toHaveLength(2);
+    expect(restored.inspect('web').tools).toHaveLength(2);
+});

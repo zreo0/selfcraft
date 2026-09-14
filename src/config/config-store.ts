@@ -97,6 +97,13 @@ export class ConfigStore {
         const raw = JSON.parse(fs.readFileSync(this.configPath, 'utf8'));
         // 旧配置只做字段迁移，不丢弃已保存的渠道与凭证
         const parsed = configSchema.parse({ ...raw, defaultModel: raw.defaultModel ?? raw.activeModel ?? null });
+        // 已移除模型的用途引用恢复继承，避免对话可用而整理永久指向不存在的模型
+        for (const purpose of ['reflection', 'compression'] as const) {
+            const selection = parsed.modelOverrides[purpose];
+            if (selection && !parsed.providers[selection.providerId]?.models[selection.modelId]) {
+                delete parsed.modelOverrides[purpose];
+            }
+        }
         return structuredClone(parsed) as SelfcraftConfig;
     }
 

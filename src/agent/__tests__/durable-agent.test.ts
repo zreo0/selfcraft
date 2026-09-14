@@ -24,13 +24,14 @@ import { PathGuard } from '../../tools/path-guard';
 import { WorkspaceService } from '../../workspace/workspace-service';
 import { ExecutionStore } from '../../execution/execution-store';
 import { WorkStore } from '../../work/work-store';
+import type { WebProvider } from '../../web-access/web-provider';
 
 const roots: string[] = [];
 /** 创建协议层模拟响应，工具执行仍经过真实生产包装器 */
-function response (call?: { name: string; input: unknown }, text = '已完成') {
+function response (call?: { name: string; input: unknown; id?: string }, text = '已完成') {
     return {
         stream: simulateReadableStream({ chunks: [
-            ...(call ? [{ type: 'tool-call' as const, toolCallId: 'call-write', toolName: call.name, input: JSON.stringify(call.input) }]
+            ...(call ? [{ type: 'tool-call' as const, toolCallId: call.id || 'call-write', toolName: call.name, input: JSON.stringify(call.input) }]
                 : [{ type: 'text-start' as const, id: 'text' }, { type: 'text-delta' as const, id: 'text', delta: text }, { type: 'text-end' as const, id: 'text' }]),
             { type: 'finish' as const, finishReason: { unified: call ? 'tool-calls' as const : 'stop' as const, raw: undefined }, usage: {
                 inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
@@ -40,7 +41,7 @@ function response (call?: { name: string; input: unknown }, text = '已完成') 
     };
 }
 /** 创建与 Runtime 相同的持久 Agent 组装 */
-function fixture (model: MockLanguageModelV4, vision = false, auxiliary?: MockLanguageModelV4, context = new ContextManager(), compression = model) {
+function fixture (model: MockLanguageModelV4, vision = false, auxiliary?: MockLanguageModelV4, context = new ContextManager(), compression = model, contextWindow = 128000, webProvider?: WebProvider) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'selfcraft-durable-agent-'));
     roots.push(root);
     const paths = resolvePaths('development', root);
@@ -56,15 +57,15 @@ function fixture (model: MockLanguageModelV4, vision = false, auxiliary?: MockLa
     const evolution = new EvolutionService(paths, new ReleaseStore(paths.supervisor, paths.evolution), logger);
     const jobs = new JobManager(paths.state, paths.jobs, new PathGuard(paths.workspace), notifications, logger);
     const attachments = new AttachmentStore(paths.home);
-    const tools = createTools(paths.workspace, skills, notifications, evolution, jobs, memory, undefined, undefined, executions, works, [attachments, () => auxiliary ? ({ model: auxiliary, providerId: 'test', modelId: 'vision', contextWindow: 128000, maxOutputTokens: 2048, vision: true }) : null]);
+    const tools = createTools(paths.workspace, skills, notifications, evolution, jobs, memory, undefined, webProvider, executions, works, [attachments, () => auxiliary ? ({ model: auxiliary, providerId: 'test', modelId: 'vision', contextWindow: 128000, maxOutputTokens: 2048, vision: true }) : null]);
     const session = new SessionStore(paths.sessions);
     /** 使用相同持久目录重新创建助理，验证恢复不依赖内存状态 */
     const restore = () => new AgentRuntime(config, workspace, skills, new SessionStore(paths.sessions), context, evolution, memory,
         { beginAgentActivity: () => undefined, endAgentActivity: () => undefined, enqueue: () => 'reflection' }, tools, logger,
-        () => ({ model, providerId: 'test', modelId: 'test', contextWindow: 128000, maxOutputTokens: 4096, vision }), executions, works, attachments,
+        () => ({ model, providerId: 'test', modelId: 'test', contextWindow, maxOutputTokens: 4096, vision }), executions, works, attachments,
         () => ({ model: compression, providerId: 'test', modelId: 'compression', contextWindow: 128000, maxOutputTokens: 4096 }));
     const agent = restore();
-    return { paths, agent, restore, executions, session, works, memory, jobs, notifications, logger, attachments };
+    return { paths, agent, restore, config, context, executions, session, works, memory, jobs, notifications, logger, attachments };
 }
 afterEach(() => roots.splice(0).forEach(root => fs.rmSync(root, { recursive: true, force: true })));
 
@@ -295,7 +296,7 @@ test('工具循环内交接后模型中断，重建助理只读取笔记而不�
         finishReason: { unified: 'stop', raw: undefined },
         usage: { inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: 1, text: 1, reasoning: undefined } }, warnings: [],
     } });
-    const f = fixture(model, false, undefined, new ContextManager(30000), compression);
+    const f = fixture(model, false, undefined, new ContextManager(), compression, 50000);
     await expect(f.agent.run('保存并验证证据', () => undefined, { executionId: 'handoff-restart' })).rejects.toThrow('交接后模型中断');
     expect(f.session.searchHistory('note')).toHaveLength(1);
     const originalCount = f.session.loadTranscript().length;
@@ -327,9 +328,170 @@ test('笔记无效且超出安全预算时停止请求，原文和窗口不被�
     const f = fixture(model);
     f.session.append({ role: 'user', content: 'A'.repeat(240000) });
     const runner = new ForegroundRunner(f.agent, f.executions);
-    await expect(runner.run('继续', () => undefined, { executionId: 'over-budget' })).rejects.toThrow('超过安全预算');
+    await expect(runner.run('继续', () => undefined, { executionId: 'over-budget' })).rejects.toThrow('上下文整理未完成');
+    expect(model.doGenerateCalls).toHaveLength(4);
     expect(model.doStreamCalls).toHaveLength(0);
     expect(f.session.load().messages).toEqual(f.session.loadTranscript());
     expect(f.session.searchHistory('note')).toHaveLength(0);
     expect(f.executions.get('over-budget')?.status).toBe('failed');
+});
+
+/** 等待可观察的模型请求开始 */
+async function until (condition: () => boolean): Promise<void> {
+    const deadline = Date.now() + 1500;
+    while (!condition() && Date.now() < deadline) await Bun.sleep(5);
+    expect(condition()).toBeTrue();
+}
+
+test('超过旧 48K 触发线但仍能装入模型时，前台保守追加', async () => {
+    const model = new MockLanguageModelV4({ doStream: async () => response() });
+    const f = fixture(model);
+    f.session.append({ role: 'user', content: 'A'.repeat(100000) });
+    await f.agent.run('继续');
+    expect(model.doGenerateCalls).toHaveLength(0);
+    expect(f.session.searchHistory('note')).toHaveLength(0);
+    expect(f.session.load().messages).toHaveLength(3);
+});
+
+test('后台整理尚未返回时新输入直接执行，晚到的笔记不覆盖新对话', async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let captured: AbortSignal | undefined;
+    const compression = new MockLanguageModelV4({ doGenerate: async options => {
+        captured = options.abortSignal;
+        await gate;
+        return {
+            content: [{ type: 'text' as const, text: '已经过时的笔记 [message:1]' }],
+            finishReason: { unified: 'stop' as const, raw: undefined },
+            usage: { inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: 1, text: 1, reasoning: undefined } }, warnings: [],
+        };
+    } });
+    const model = new MockLanguageModelV4({ doStream: async () => response(undefined, '及时回复') });
+    const f = fixture(model, false, undefined, new ContextManager(20), compression);
+    f.session.append({ role: 'user', content: 'A'.repeat(120000) });
+    f.agent.startContextMaintenance();
+    try {
+        await until(() => compression.doGenerateCalls.length === 1);
+        const runner = new ForegroundRunner(f.agent, f.executions);
+        await runner.run('新要求：取消旧计划', () => undefined, { executionId: 'interrupt-maintenance' });
+        expect(captured?.aborted).toBeTrue();
+        expect(model.doStreamCalls).toHaveLength(1);
+        expect(f.executions.get('interrupt-maintenance')?.status).toBe('completed');
+    } finally {
+        f.context.stop();
+        release();
+        await Bun.sleep(30);
+    }
+    expect(f.session.searchHistory('note')).toHaveLength(0);
+    expect(f.session.load().messages.some(message => message.content === '新要求：取消旧计划')).toBeTrue();
+});
+
+test('空闲时不足半窗口不调用整理模型，整理期间配置改变则放弃提交', async () => {
+    const model = new MockLanguageModelV4({ doStream: async () => response() });
+    let change: () => void = () => undefined;
+    const compression = new MockLanguageModelV4({ doGenerate: async () => {
+        change();
+        return {
+            content: [{ type: 'text' as const, text: '工作已完成 [message:1]' }],
+            finishReason: { unified: 'stop' as const, raw: undefined },
+            usage: { inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: 1, text: 1, reasoning: undefined } }, warnings: [],
+        };
+    } });
+    const f = fixture(model, false, undefined, new ContextManager(), compression);
+    f.session.append({ role: 'user', content: '你好' });
+    await f.agent.maintainIdleContext(new AbortController().signal);
+    expect(compression.doGenerateCalls).toHaveLength(0);
+    f.session.append({ role: 'assistant', content: 'A'.repeat(120000) });
+    const before = f.session.load();
+    change = () => f.config.addProvider({ providerId: 'new', type: 'openai-compatible', baseURL: 'http://localhost:1234/v1', apiKey: '',
+        models: { small: { vision: false, contextWindow: 200000, maxOutputTokens: 4096 } } });
+    await expect(f.agent.maintainIdleContext(new AbortController().signal)).rejects.toThrow('模型配置已变化');
+    expect(f.session.load()).toEqual(before);
+});
+
+test('空闲整理失败不立即重试，下一完整周期才再次检查', async () => {
+    const model = new MockLanguageModelV4({ doStream: async () => response(), doGenerate: async () => { throw new Error('模拟整理失败'); } });
+    const f = fixture(model, false, undefined, new ContextManager(40));
+    f.session.append({ role: 'user', content: 'A'.repeat(120000) });
+    const before = f.session.load();
+    f.agent.startContextMaintenance();
+    try {
+        await until(() => model.doGenerateCalls.length === 1);
+        await Bun.sleep(10);
+        expect(model.doGenerateCalls).toHaveLength(1);
+        await until(() => model.doGenerateCalls.length === 2);
+    } finally {
+        f.context.stop();
+    }
+    expect(f.session.load()).toEqual(before);
+});
+
+test('空闲整理成功后窗口降至一半以下，没有新增内容不重复整理', async () => {
+    const model = new MockLanguageModelV4({ doGenerate: {
+        content: [{ type: 'text', text: '历史材料已结束，等待下一条请求 [message:1]' }],
+        finishReason: { unified: 'stop', raw: undefined },
+        usage: { inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: 1, text: 1, reasoning: undefined } }, warnings: [],
+    } });
+    const f = fixture(model);
+    for (let index = 0; index < 20; index++) f.session.append({ role: 'user', content: 'A'.repeat(6000) });
+    const original = f.session.loadTranscript();
+    await f.agent.maintainIdleContext(new AbortController().signal);
+    expect(f.session.searchHistory('note')).toHaveLength(1);
+    await f.agent.maintainIdleContext(new AbortController().signal);
+    expect(model.doGenerateCalls).toHaveLength(1);
+    expect(f.session.loadTranscript()).toEqual(original);
+});
+
+test('网页抓取失败进入下一步上下文，模型可以换来源完成搜索', async () => {
+    const prompts: string[] = [];
+    const model = new MockLanguageModelV4({ doStream: async options => {
+        prompts.push(JSON.stringify(options.prompt));
+        if (prompts.length === 1) return response({ name: 'web_search', input: { query: '研究' }, id: 'search' });
+        if (prompts.length === 2) return response({ name: 'web_fetch', input: { url: 'https://example.com/missing' }, id: 'missing' });
+        if (prompts.length === 3) return response({ name: 'web_fetch', input: { url: 'https://example.com/study' }, id: 'study' });
+        return response(undefined, '研究已核对');
+    } });
+    const provider: WebProvider = {
+        search: async ({ query }) => ({ provider: 'test', query, searchedAt: new Date().toISOString(),
+            results: [{ title: '研究', url: 'https://example.com/study', snippet: '候选来源' }] }),
+        fetchPage: async url => {
+            if (url.endsWith('/missing')) throw new Error('Tavily 无法读取这个网页');
+            return { provider: 'test', url, fetchedAt: new Date().toISOString(), content: '已核实的研究正文' };
+        },
+    };
+    const f = fixture(model, false, undefined, new ContextManager(), model, 128000, provider);
+    f.config.configureWebAccess('test-only');
+    await f.agent.run('搜索并阅读相关研究', () => undefined, { executionId: 'web-failure' });
+    expect(prompts).toHaveLength(4);
+    expect(prompts[2]).toContain('Tavily 无法读取这个网页');
+    expect(prompts[3]).toContain('已核实的研究正文');
+    expect(f.executions.get('web-failure')?.status).toBe('completed');
+    expect(f.executions.inspect('web-failure').tools).toHaveLength(3);
+    expect(f.executions.inspect('web-failure').tools.every(tool => (tool as { settled: number }).settled === 1)).toBeTrue();
+    expect(JSON.stringify(f.session.loadTranscript())).toContain('Tavily 无法读取这个网页');
+});
+
+test('步骤持久化失败立即终止循环，不继续用旧上下文调用模型', async () => {
+    let calls = 0;
+    const model = new MockLanguageModelV4({ doStream: async () => {
+        calls += 1;
+        return calls === 1 ? response({ name: 'write', input: { path: 'files/saved.txt', content: '已写入' } }) : response();
+    } });
+    const f = fixture(model);
+    f.executions.checkpoint = () => { throw new Error('模拟检查点写入失败'); };
+    await expect(f.agent.run('写入文件', () => undefined, { executionId: 'checkpoint-failure' })).rejects.toThrow('模拟检查点写入失败');
+    expect(calls).toBe(1);
+    expect(fs.readFileSync(path.join(f.paths.workspace, 'files/saved.txt'), 'utf8')).toBe('已写入');
+});
+
+test('有副作用的工具结果未知时停止循环，不让模型继续执行', async () => {
+    let calls = 0;
+    const model = new MockLanguageModelV4({ doStream: async () => {
+        calls += 1;
+        return calls === 1 ? response({ name: 'write', input: { path: '../outside.txt', content: '拒绝越界' } }) : response();
+    } });
+    const f = fixture(model);
+    await expect(f.agent.run('测试未知操作', () => undefined, { executionId: 'unknown-write' })).rejects.toThrow('工具结果未知');
+    expect(calls).toBe(1);
+    expect(f.executions.begin('unknown-write').status).toBe('blocked');
 });

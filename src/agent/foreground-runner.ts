@@ -6,6 +6,8 @@ import type { AgentRunEvent } from './run-events';
 
 /** 前台 Agent 需要提供的最小执行接口 */
 export interface ForegroundAgent {
+    /** 新输入接收后立即中断后台整理 */
+    onInputAccepted?(): void;
     /** 执行一轮前台对话 */
     run (
         input: UserModelMessage['content'],
@@ -58,6 +60,7 @@ export class ForegroundRunner {
             options = { ...options, executionId: options.executionId || randomUUID(), signal: undefined };
             this.executions.accept(options.executionId!, input, 'foreground', options.retry);
         }
+        this.agent.onInputAccepted?.();
         const observer = onEvent;
         onEvent = event => {
             try {

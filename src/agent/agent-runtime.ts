@@ -94,6 +94,60 @@ export class AgentRuntime {
         private readonly resolveCompression: () => ModelSnapshot = () => ModelFactory.create(this.config, 'compression', this.logger),
     ) {}
 
+    /** 接收新输入时及时让空闲整理让路 */
+    public onInputAccepted (): void {
+        this.context.interruptIdle();
+    }
+
+    /** 启动独立于 Reflection 的空闲上下文检查 */
+    public startContextMaintenance (): void {
+        this.context.start(async signal => {
+            try {
+                await this.maintainIdleContext(AbortSignal.any([signal, AbortSignal.timeout(180_000)]));
+            } catch (error) {
+                if (!signal.aborted) this.logger.warn('空闲整理失败，保留当前窗口并等待下一周期', { error: String(error) });
+            }
+        });
+    }
+
+    /** 在空闲检查中仅整理超过一半预算的主对话，提交前校验模型配置 */
+    public async maintainIdleContext (signal: AbortSignal): Promise<void> {
+        const snapshot = this.session.load();
+        if (!snapshot.messages.length) return;
+        signal.throwIfAborted();
+        const configSnapshot = JSON.stringify(this.config.read());
+        const active = this.resolveModel();
+        const instructions = this.buildInstructions('', {
+            now: new Date().toISOString(), timezone: this.config.read().timezone,
+            sourceEventId: '', channel: 'foreground',
+        });
+        const reservedTokens = await this.estimateInstructions(instructions,
+            { ...this.getAvailableTools(), ...createHistoryTools(this.session) });
+        const tokens = reservedTokens + this.context.estimate(snapshot.summary)
+            + this.context.estimateMessages(prepareMessages(snapshot.messages, active.vision));
+        if (tokens <= this.context.budgets(active).idle) return;
+        const next = await this.context.handoff(this.session, active, reservedTokens, this.resolveCompression,
+            signal, () => this.assertContextConfig(configSnapshot));
+        this.logger.info('Context handoff completed', { mode: 'idle', previousMessages: snapshot.messages.length,
+            retainedMessages: next.messages.length });
+    }
+
+    /** 指令和工具定义共享同一预算算法，避免后台检查漏算工具 */
+    private async estimateInstructions (instructions: string, tools: Record<string, Pick<Tool, 'description' | 'inputSchema'>>): Promise<number> {
+        return this.context.estimate(instructions) + this.context.estimate(JSON.stringify(
+            await Promise.all(Object.entries(tools).map(async ([name, definition]) => ({
+                name, description: definition.description, parameters: await asSchema(definition.inputSchema).jsonSchema,
+            }))),
+        ));
+    }
+
+    /** 模型或预算变化后放弃旧条件下的整理，下次按新配置处理 */
+    private assertContextConfig (expected: string): void {
+        if (JSON.stringify(this.config.read()) !== expected) {
+            throw new DOMException('模型配置已变化，请按新配置接续', 'AbortError');
+        }
+    }
+
     /**
      * 执行一轮对话并输出统一的结构化运行事件
      *
@@ -163,6 +217,7 @@ export class AgentRuntime {
             channel: 'foreground',
         };
         let active: ModelSnapshot | undefined;
+        this.context.beginActivity();
         this.reflection.beginAgentActivity();
         try {
             onEvent({ type: 'status', phase: 'preparing', label: '正在整理上下文' });
@@ -226,6 +281,7 @@ export class AgentRuntime {
             throw error;
         } finally {
             this.reflection.endAgentActivity();
+            this.context.endActivity();
         }
     }
 
@@ -309,6 +365,7 @@ export class AgentRuntime {
             '这是独立后台任务。持续执行到可验证终点，把重要进度和最终结果写入输出。',
             '</background-job>',
         ].join('\n');
+        this.context.beginActivity();
         this.reflection.beginAgentActivity();
         try {
             const active = this.resolveModel();
@@ -359,6 +416,7 @@ export class AgentRuntime {
             throw error;
         } finally {
             this.reflection.endAgentActivity();
+            this.context.endActivity();
         }
     }
 
@@ -431,6 +489,7 @@ export class AgentRuntime {
         abortSignal?: AbortSignal,
         sourceRunId = runtimeContext.runId,
     ): Promise<{ text: string, responseMessages: ModelMessage[] }> {
+        const configSnapshot = JSON.stringify(this.config.read());
         // 输出预算必须留出输入空间，配置的大窗口不能全部用于输出
         active = { ...active, maxOutputTokens: Math.min(active.maxOutputTokens, Math.floor(active.contextWindow * 0.2)) };
         using backgroundHistory = runtimeContext.channel === 'background' ? this.session.forExecution(runtimeContext.runId) : null;
@@ -457,11 +516,9 @@ export class AgentRuntime {
         const tools = runtimeContext.taskId && !runtimeContext.taskId.startsWith('work:')
             ? Object.fromEntries(Object.entries(available).filter(([name]) => !['work_create', 'work_update', 'job_start', 'evolve_runtime'].includes(name)))
             : available;
-        const schemaTokens = this.context.estimate(JSON.stringify(await Promise.all(Object.entries(tools).map(async ([name, definition]) => ({
-            name, description: definition.description, parameters: await asSchema(definition.inputSchema).jsonSchema,
-        })))));
-        let handoffFailed = false;
+        const reservedTokens = await this.estimateInstructions(instructions, tools);
         const activities = new Map<string, AgentActivity>();
+        let checkpointError: unknown;
         const agent = new ToolLoopAgent<
             never,
             Record<string, Tool<any, any, ToolRuntimeContext>>,
@@ -476,25 +533,23 @@ export class AgentRuntime {
             stopWhen: isStepCount(this.config.read().maxSteps),
             maxOutputTokens: active.maxOutputTokens,
             prepareStep: async () => {
+                if (checkpointError) throw checkpointError;
                 abortSignal?.throwIfAborted();
                 let snapshot = history.load();
-                const reservedTokens = this.context.estimate(instructions) + schemaTokens;
                 const estimate = () => reservedTokens + this.context.estimate(snapshot.summary)
                     + this.context.estimateMessages(prepareMessages(snapshot.messages, active.vision));
-                if (!handoffFailed && estimate() >= this.context.budgets(active).trigger) {
+                if (estimate() > this.context.budgets(active).hard) {
                     onEvent({ type: 'status', phase: 'preparing', label: '正在保存工作笔记' });
-                    const previousMessages = snapshot.messages.length;
                     try {
-                        snapshot = await this.context.handoff(history, active, reservedTokens,
-                            this.resolveCompression, abortSignal);
-                        this.logger.info('Context handoff completed', { runId: runtimeContext.runId, previousMessages,
-                            retainedMessages: snapshot.messages.length, estimatedTokens: estimate() });
+                        snapshot = await this.context.handoffRequired(history, active, reservedTokens,
+                            this.resolveCompression, abortSignal, () => this.assertContextConfig(configSnapshot));
                     } catch (error) {
-                        abortSignal?.throwIfAborted();
-                        // 一轮内不反复请求失败的整理模型，仍在每个步骤检查安全预算
-                        handoffFailed = true;
-                        this.logger.warn('工作笔记生成失败，保留当前窗口', { error: String(error) });
+                        if (abortSignal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
+                        this.logger.warn('必要整理失败，停止本次模型请求', { error: String(error) });
+                        throw new Error('上下文整理未完成，原文和步骤已保留');
                     }
+                    this.logger.info('Context handoff completed', { runId: runtimeContext.runId,
+                        mode: 'required', retainedMessages: snapshot.messages.length, estimatedTokens: estimate() });
                 }
                 this.context.assertFits(estimate(), active);
                 const windowMessages = prepareMessages(snapshot.messages, active.vision,
@@ -540,11 +595,17 @@ export class AgentRuntime {
                 onEvent({ type: 'activity', activity: failed });
             },
             onStepEnd: ({ toolCalls, usage, response, text: stepText, finishReason }) => {
-                completedSteps.push(...response.messages);
-                this.executions?.checkpoint(runtimeContext.runId, completedSteps,
-                    finishReason === 'stop' && toolCalls.length === 0 ? stepText : undefined);
-                // 执行检查点先保存；若原文追加前崩溃，下次恢复按相同序号补齐
-                history.appendResponses(sourceRunId, completedSteps);
+                try {
+                    completedSteps.push(...response.messages);
+                    this.executions?.checkpoint(runtimeContext.runId, completedSteps,
+                        finishReason === 'stop' && toolCalls.length === 0 ? stepText : undefined);
+                    // 执行检查点先保存；若原文追加前崩溃，下次恢复按相同序号补齐
+                    history.appendResponses(sourceRunId, completedSteps);
+                } catch (error) {
+                    // AI SDK 会忽略观察回调的异常，必须在下一步准备和最终交付前显式终止
+                    checkpointError = error;
+                    return;
+                }
                 this.logger.info('Agent step finished', {
                     providerId: active.providerId,
                     modelId: active.modelId,
@@ -563,6 +624,7 @@ export class AgentRuntime {
             }
         }
         const responseMessages = await result.responseMessages;
+        if (checkpointError) throw checkpointError;
         if (streamError) {
             throw streamError;
         }

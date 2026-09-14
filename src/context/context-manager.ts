@@ -1,25 +1,101 @@
-import { generateText, type ModelMessage } from 'ai';
+import { APICallError, generateText, type ModelMessage } from 'ai';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { SessionSnapshot, SessionStore } from '../session/session-store';
 import type { ModelSnapshot } from '../model/model-factory';
 
-/** 正常工作窗口的预算独立于模型最大容量 */
-const WORKING_TOKENS = 48_000;
+/** 空闲整理的默认等待时间 */
+const IDLE_DELAY_MS = 20 * 60_000;
 
-/** 管理工作窗口预算，仅在需要交接时生成可回查的笔记 */
+/** 管理工作窗口预算和可让路的空闲整理 */
 export class ContextManager {
-    /** 设置工作窗口预算；较小预算用于回放验证交接行为 */
-    constructor (private readonly workingTokens = WORKING_TOKENS) {}
+    private activeRuns = 0;
+    private timer?: ReturnType<typeof setTimeout>;
+    private idleRequest?: AbortController;
+    private maintain?: (signal: AbortSignal) => Promise<void>;
 
-    /** 计算包含指令、工具和消息的触发线、交接目标与请求安全上限 */
-    public budgets (active: ModelSnapshot): { trigger: number; target: number; hard: number } {
-        const hard = Math.floor(active.contextWindow * 0.9) - active.maxOutputTokens;
-        const trigger = Math.min(this.workingTokens, Math.floor(hard * 0.75));
-        return { trigger, target: Math.floor(trigger * 0.5), hard };
+    /** 设置连续空闲等待时间；测试可缩短计时 */
+    constructor (private readonly idleDelayMs = IDLE_DELAY_MS) {}
+
+    /** 启动空闲检查，失败由调用方记录，不立即重试 */
+    public start (maintain: (signal: AbortSignal) => Promise<void>): void {
+        this.maintain = maintain;
+        this.schedule();
+    }
+
+    /** 停止维护并放弃尚未提交的笔记 */
+    public stop (): void {
+        this.maintain = undefined;
+        this.interruptIdle();
+    }
+
+    /** 新输入在排队时就让后台整理让路，并重新计算空闲时间 */
+    public interruptIdle (): void {
+        clearTimeout(this.timer);
+        this.timer = undefined;
+        this.idleRequest?.abort();
+        this.schedule();
+    }
+
+    /** 标记正在使用工作窗口，后台整理不能与其竞争 */
+    public beginActivity (): void {
+        this.activeRuns += 1;
+        this.interruptIdle();
+    }
+
+    /** 当前执行结束后重新等待完整空闲周期 */
+    public endActivity (): void {
+        this.activeRuns -= 1;
+        this.schedule();
+    }
+
+    /** 同一时刻至多一个后台请求，结束后再等待一个完整周期 */
+    private schedule (): void {
+        if (!this.maintain || this.timer || this.idleRequest || this.activeRuns > 0) return;
+        this.timer = setTimeout(async () => {
+            this.timer = undefined;
+            const request = new AbortController();
+            this.idleRequest = request;
+            try {
+                await this.maintain!(request.signal);
+            } finally {
+                this.idleRequest = undefined;
+                this.schedule();
+            }
+        }, this.idleDelayMs);
+        this.timer.unref();
+    }
+
+    /** 预留输出和估算余量，空闲超过一半才整理，目标降至四成 */
+    public budgets (active: ModelSnapshot): { idle: number; target: number; hard: number } {
+        const output = Math.min(active.maxOutputTokens, Math.floor(active.contextWindow * 0.2));
+        const hard = Math.floor(active.contextWindow * 0.9) - output;
+        return { idle: Math.floor(hard * 0.5), target: Math.floor(hard * 0.4), hard };
+    }
+
+    /** 必要交接最多额外重试三次，取消与明确不可重试的错误立即结束 */
+    public async handoffRequired (
+        store: SessionStore, active: ModelSnapshot, reservedTokens: number,
+        resolveCompression: () => ModelSnapshot, abortSignal?: AbortSignal, beforeCommit?: () => void,
+    ): Promise<SessionSnapshot> {
+        // 配置错误不能靠重试恢复，先解析并固定本次整理模型
+        const compression = resolveCompression();
+        for (let attempt = 0; ; attempt++) {
+            abortSignal?.throwIfAborted();
+            beforeCommit?.();
+            try {
+                return await this.handoff(store, active, reservedTokens, () => compression, abortSignal, beforeCommit);
+            } catch (error) {
+                if (abortSignal?.aborted || (error instanceof Error && error.name === 'AbortError')
+                    || error instanceof RangeError || (APICallError.isInstance(error) && !error.isRetryable) || attempt === 3) throw error;
+                await delay(500 * (attempt + 1), undefined, { signal: abortSignal });
+            }
+        }
     }
 
     /** 以字符估计文本 token，用于提供方没有精确统计时的预算预留 */
     public estimate (value: string): number {
-        return Math.ceil(value.length / 2);
+        // 中文等非 ASCII 文本不能沿用英文字符比例，否则换到小窗口时容易低估
+        return Math.ceil((value.length + (value.match(/[^\x00-\x7F]/g)?.length || 0)) / 2);
     }
 
     /** 估算消息，包括图片输入；请求前应传入已去除旧推理的消息 */
@@ -34,7 +110,7 @@ export class ContextManager {
     /** 超过安全上限时暂停当前执行，不能通过删除尚未交接的内容继续 */
     public assertFits (tokens: number, active: ModelSnapshot): void {
         if (tokens > this.budgets(active).hard) {
-            throw new Error('上下文超过安全预算，当前步骤已保留，需要整理后接续');
+            throw new RangeError('上下文超过安全预算，当前步骤已保留，需要整理后接续');
         }
     }
 
@@ -45,6 +121,7 @@ export class ContextManager {
         reservedTokens: number,
         resolveCompression: () => ModelSnapshot,
         abortSignal?: AbortSignal,
+        beforeCommit?: () => void,
     ): Promise<SessionSnapshot> {
         const snapshot = store.load();
         const compression = resolveCompression();
@@ -70,10 +147,11 @@ export class ContextManager {
                 tokens += this.estimate(entry);
             }
             if (!chunk.length) {
-                throw new Error('上下文整理模型的窗口不足以生成工作笔记');
+                throw new RangeError('上下文整理模型的窗口不足以生成工作笔记');
             }
             const result = await generateText({
                 model: compression.model,
+                maxRetries: 0,
                 abortSignal,
                 maxOutputTokens: outputBudget,
                 instructions: [
@@ -97,8 +175,9 @@ export class ContextManager {
         const nextTokens = reservedTokens + this.estimate(note) + this.estimateMessages(retained.messages);
         this.assertFits(nextTokens, active);
         if (nextTokens >= reservedTokens + this.estimate(snapshot.summary) + this.estimateMessages(snapshot.messages)) {
-            throw new Error('工作笔记未缩小上下文，保留当前窗口');
+            throw new RangeError('工作笔记未缩小上下文，保留当前窗口');
         }
+        beforeCommit?.();
         return store.handoff(snapshot, note, retained.ids);
     }
 

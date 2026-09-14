@@ -230,3 +230,24 @@ test('视觉辅助只选择已配置的视觉模型，优先当前模型且不�
     store.useModel({ providerId: 'local', modelId: 'visionB' });
     expect(ModelFactory.createVision(store)?.modelId).toBe('visionB');
 });
+
+test('大模型被移除后，失效的整理和反思用途引用恢复跟随新模型', () => {
+    const directory = createTemporaryDirectory();
+    const store = new ConfigStore(directory);
+    store.addProvider({ providerId: 'local', type: 'openai-compatible', baseURL: 'http://localhost:1234/v1', apiKey: '', models: {
+        large: { vision: false, contextWindow: 1000000, maxOutputTokens: 4096 },
+        small: { vision: false, contextWindow: 200000, maxOutputTokens: 4096 },
+    } });
+    store.useModel({ providerId: 'local', modelId: 'large' }, 'compression');
+    store.useModel({ providerId: 'local', modelId: 'large' }, 'reflection');
+    const previous = ModelFactory.create(store);
+    store.useModel({ providerId: 'local', modelId: 'small' });
+    const config = store.read();
+    delete config.providers.local!.models.large;
+    fs.writeFileSync(path.join(directory, 'config.json'), JSON.stringify(config));
+    expect(store.getModel('compression').selection.modelId).toBe('small');
+    expect(store.getModel('reflection').model.contextWindow).toBe(200000);
+    expect(store.read().modelOverrides).toEqual({});
+    expect(previous.contextWindow).toBe(1000000);
+    expect(() => store.assertValid()).not.toThrow();
+});
