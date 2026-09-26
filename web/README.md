@@ -86,3 +86,9 @@ bun run build:web
 ```
 
 构建产物写入 `web/dist`，由 Bun WebServer 与 Runtime 一起提供。
+
+## 持续对话通信
+
+输入框在生成期间仍可提交文字或图片。有新输入时按钮为发送，输入为空且正在生成时按钮为停止；停止仅影响主脑当前回应。
+
+`useConversation` 继续使用 AI SDK `UIMessage`，通过 `POST /api/conversation/messages` 提交本轮消息、通过 `/api/conversation/events` 订阅持久消息快照。按消息 ID 合并、按 `metadata.seq` 排序；SSE 自动重连携带版本游标。`/api/messages` 提供历史分页与正在生成的部分文字。关闭页面不取消 Runtime 执行，也不要求逐 token 重放。旧 `/api/chat` 流式接口保留给现有协议客户端。

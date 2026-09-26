@@ -35,7 +35,7 @@ describe('ForegroundRunner', () => {
         await Bun.sleep(0);
 
         expect(order).toEqual(['start:cli']);
-        expect(statuses).toEqual(['正在等待上一轮对话结束']);
+        expect(statuses).toEqual([]);
         expect(runner.getPendingCount()).toBe(2);
         first.resolve();
         await Promise.all([cli, web]);

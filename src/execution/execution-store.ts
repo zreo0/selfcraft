@@ -20,6 +20,10 @@ export interface ExecutionRecord {
     messages: ModelMessage[];
     /** 模型最终输出，空字符串也是有效结果 */
     result: string | null;
+    /** 内部事项事件不冒充用户消息 */
+    kind: 'user' | 'event';
+    /** 合并处理这条输入的主脑执行 */
+    parentId: string | null;
     /** 是否为用户明确重试 */
     retry: boolean;
 }
@@ -48,17 +52,21 @@ export class ExecutionStore {
             );
         `);
         const columns = this.database.query('PRAGMA table_info(executions)').all() as { name: string }[];
+        if (!columns.some(column => column.name === 'kind')) {
+            this.database.run("ALTER TABLE executions ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'");
+            this.database.run('ALTER TABLE executions ADD COLUMN parent_id TEXT');
+        }
         if (!columns.some(column => column.name === 'input_content')) {
             this.database.run('ALTER TABLE executions ADD COLUMN input_content TEXT');
         }
     }
 
     /** 持久接收输入；相同标识只允许相同内容，返回原记录 */
-    public accept (id: string, input: UserModelMessage['content'], channel: ExecutionRecord['channel'], retry = false): ExecutionRecord {
-        this.database.query(`INSERT OR IGNORE INTO executions (id, input, channel, status, retry, created_at, input_content)
-            VALUES (?, ?, ?, 'queued', ?, ?, ?)`).run(id, userContentText(input), channel, Number(retry), new Date().toISOString(), typeof input === 'string' ? null : JSON.stringify(input));
+    public accept (id: string, input: UserModelMessage['content'], channel: ExecutionRecord['channel'], retry = false, kind: ExecutionRecord['kind'] = 'user'): ExecutionRecord {
+        this.database.query(`INSERT OR IGNORE INTO executions (id, input, channel, status, retry, created_at, input_content, kind)
+            VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)`).run(id, userContentText(input), channel, Number(retry), new Date().toISOString(), typeof input === 'string' ? null : JSON.stringify(input), kind);
         const record = this.get(id)!;
-        if (JSON.stringify(record.input) !== JSON.stringify(input) || record.channel !== channel) {
+        if (JSON.stringify(record.input) !== JSON.stringify(input) || record.channel !== channel || record.kind !== kind || record.retry !== retry) {
             throw new Error('执行标识已被其他输入使用');
         }
         return record;
@@ -67,15 +75,36 @@ export class ExecutionStore {
     /** 按标识读取执行，不存在返回 null */
     public get (id: string): ExecutionRecord | null {
         const row = this.database.query('SELECT * FROM executions WHERE id = ?').get(id) as
-            (Omit<ExecutionRecord, 'messages' | 'retry'> & { messages: string; retry: number; input_content: string | null }) | null;
-        return row ? { ...row, input: row.input_content ? JSON.parse(row.input_content) : row.input, messages: JSON.parse(row.messages), retry: Boolean(row.retry) } : null;
+            (Omit<ExecutionRecord, 'messages' | 'retry'> & { messages: string; retry: number; input_content: string | null; parent_id: string | null }) | null;
+        return row ? { ...row, parentId: row.parent_id, input: row.input_content ? JSON.parse(row.input_content) : row.input, messages: JSON.parse(row.messages), retry: Boolean(row.retry) } : null;
     }
 
     /** 按接收顺序读取未完成前台输入，供启动恢复 */
     public pending (): ExecutionRecord[] {
         const rows = this.database.query(`SELECT id FROM executions WHERE channel = 'foreground'
-            AND status IN ('queued', 'running') ORDER BY created_at, rowid`).all() as { id: string }[];
+            AND parent_id IS NULL AND status IN ('queued', 'running') ORDER BY created_at, rowid`).all() as { id: string }[];
         return rows.map(row => this.get(row.id)!);
+    }
+
+    /** 把新输入归入正在运行的主脑；恢复时一并返回已归入但尚未交付的输入 */
+    public collect (parentId: string): ExecutionRecord[] {
+        return this.database.transaction(() => {
+            const changed = this.database.query(`UPDATE executions SET parent_id = ?, status = 'running'
+                WHERE channel = 'foreground' AND status = 'queued' AND parent_id IS NULL AND id != ?`).run(parentId, parentId);
+            if (changed.changes) this.database.query('UPDATE executions SET result = NULL WHERE id = ?').run(parentId);
+            return (this.database.query('SELECT id FROM executions WHERE parent_id = ? ORDER BY created_at, rowid').all(parentId) as { id: string }[])
+                .map(row => this.get(row.id)!);
+        }).immediate();
+    }
+
+    /** 判断当前主脑是否收到新的输入，不调用模型 */
+    public hasQueued (): boolean {
+        return Boolean(this.database.query("SELECT 1 FROM executions WHERE channel = 'foreground' AND status = 'queued' AND parent_id IS NULL LIMIT 1").get());
+    }
+
+    /** 同一答复承接的消息一起结束，重复投递不会再运行 */
+    public finishGroup (id: string, status: 'completed' | 'failed', error?: string): void {
+        this.database.query('UPDATE executions SET status = ?, error = ? WHERE parent_id = ?').run(status, error ?? null, id);
     }
 
     /** 准备恢复步骤；未落入检查点的完整工具结果重建为消息，未知结果阻止执行 */

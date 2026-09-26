@@ -1,3 +1,4 @@
+import { ConversationStore } from './conversation/conversation-store';
 import { AttachmentStore } from './attachment/attachment-store';
 import { acquireRuntimeLease } from './supervisor/runtime-lease';
 import { ExecutionStore } from './execution/execution-store';
@@ -47,7 +48,9 @@ async function main (): Promise<void> {
     const memory = new MemoryStore(paths.state);
     const executions = new ExecutionStore(paths.state);
     const works = new WorkStore(paths.state);
-    const scheduledTasks = new ScheduledTaskManager(paths.state, notifications, memory);
+    const conversation = new ConversationStore(paths.state);
+    const scheduledTasks = new ScheduledTaskManager(paths.state, notifications, memory, 1000,
+        (id, title, message) => foreground.notify(id, title, message));
     const reflection = new ReflectionWorker(memory, () => ModelFactory.create(config, 'reflection', logger), logger);
     const jobs = new JobManager(
         paths.state,
@@ -93,7 +96,7 @@ async function main (): Promise<void> {
         works,
         attachments,
     );
-    const foreground = new ForegroundRunner(agent, executions, () => requestShutdown(RESTART_EXIT_CODE));
+    const foreground = new ForegroundRunner(agent, executions, () => requestShutdown(RESTART_EXIT_CODE), conversation);
     jobs.setAgentExecutor((job, signal, onLog) => agent.runBackground(job, signal, onLog),
         job => Boolean(executions.get(`job:${job.id}`)));
     jobs.start();
@@ -112,7 +115,7 @@ async function main (): Promise<void> {
         shuttingDown = true;
         resolveShutdown(exitCode);
     };
-    const workRunner = new WorkRunner(works, agent, foreground, jobs, memory, notifications, logger,
+    const workRunner = new WorkRunner(works, agent, foreground, jobs, memory, logger,
         () => requestShutdown(RESTART_EXIT_CODE), () => evolution.hasPendingRelease(), () => config.isConfigured());
     foreground.recover((id, error, result) => {
         notifications.pushOnce(`recovered:${id}`, error ? '中断的请求需要处理' : '中断的请求已完成',
@@ -126,6 +129,7 @@ async function main (): Promise<void> {
         paths,
         config,
         agent: foreground,
+        conversation,
         memory,
         skills,
         notifications,

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { ConversationStore } from '../../conversation/conversation-store';
 import { ForegroundRunner } from '../../agent/foreground-runner';
 import { RuntimeClient } from '../../cli/runtime-client';
 import { ConfigStore } from '../../config/config-store';
@@ -26,7 +27,7 @@ function createTemporaryDirectory (): string {
 }
 
 /** 创建不监听端口的 WebServer 测试实例 */
-function createServer () {
+function createServer (afterText?: () => Promise<void>) {
     const root = createTemporaryDirectory();
     const paths = resolvePaths('development', path.join(root, 'home'));
     paths.project = path.resolve(import.meta.dir, '../../..');
@@ -47,6 +48,7 @@ function createServer () {
     const scheduledTasks = new ScheduledTaskManager(paths.state, notifications, memory);
     const calls: string[] = [];
     const retryCalls: boolean[] = [];
+    const conversation = new ConversationStore(paths.state);
     const agent = new ForegroundRunner({
         async run (input, onEvent, options) {
             calls.push(typeof input === 'string' ? input : JSON.stringify(input));
@@ -87,10 +89,12 @@ function createServer () {
                 },
             });
             onEvent?.({ type: 'text-delta', delta: '我记得。' });
+            await afterText?.();
             return { restartRequired: false };
         },
-    });
+    }, undefined, undefined, conversation);
     const server = new WebServer({
+        conversation,
         paths,
         config,
         agent,
@@ -543,18 +547,61 @@ test('图片上传与图片单独发送共用 Runtime，历史返回标准 file 
     expect(content[0].data.url).toContain(file.url);
     memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '图片', content, channel: 'foreground' } });
     const history = await (await server.fetch(new Request('http://selfcraft.local/api/messages'))).json() as any;
-    expect(history.items.at(-1).parts.find((part: any) => part.type === 'file')).toEqual(file);
-    expect(history.items.at(-1).parts).toEqual([file]);
+    expect(history.items.findLast((item: any) => item.role === 'user').parts.find((part: any) => part.type === 'file')).toEqual(file);
+    expect(history.items.findLast((item: any) => item.role === 'user').parts).toEqual([file]);
     const mixedParts = [file, { type: 'text', text: '这是什么？' }];
     await (await server.fetch(jsonRequest('/api/chat', 'POST', { messages: [{ role: 'user', parts: mixedParts }] }))).text();
     const originalInput = calls.at(-1)!;
     memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '这是什么？', content: JSON.parse(originalInput), channel: 'foreground' } });
     const refreshed = await (await server.fetch(new Request('http://selfcraft.local/api/messages'))).json() as any;
-    expect(refreshed.items.at(-1).parts).toEqual(mixedParts);
-    await (await server.fetch(jsonRequest('/api/chat', 'POST', { trigger: 'regenerate-message', messages: [refreshed.items.at(-1)] }))).text();
+    expect(refreshed.items.findLast((item: any) => item.role === 'user').parts).toEqual(mixedParts);
+    await (await server.fetch(jsonRequest('/api/chat', 'POST', { trigger: 'regenerate-message', messages: [refreshed.items.findLast((item: any) => item.role === 'user')] }))).text();
     expect(calls.at(-1)).toBe(originalInput);
     const invalid = await server.fetch(jsonRequest('/api/chat', 'POST', { messages: [{ role: 'user', parts: [{ ...file, url: 'https://example.com/photo.jpg' }] }] }));
     expect(invalid.status).toBe(400);
     const tooMany = await server.fetch(jsonRequest('/api/chat', 'POST', { messages: [{ role: 'user', parts: Array(5).fill(file) }] }));
     expect(tooMany.status).toBe(400);
+});
+
+
+test('收件与订阅分离：关闭流不停止运行，重开读取已有部分并继续收到完成状态', async () => {
+    const release = Promise.withResolvers<void>();
+    const { server, config } = createServer(() => release.promise);
+    config.addProvider({ providerId: 'local', type: 'openai-compatible', baseURL: 'http://127.0.0.1:3000/v1', apiKey: 'not-a-real-credential',
+        models: { assistant: { vision: false, contextWindow: 128000, maxOutputTokens: 4096 } } });
+    const accepted = await server.fetch(jsonRequest('/api/conversation/messages', 'POST', {
+        id: 'detached', messages: [{ role: 'user', parts: [{ type: 'text', text: '持续执行' }] }],
+    }));
+    expect(accepted.status).toBe(202);
+    const first = await server.fetch(new Request('http://selfcraft.local/api/conversation/events'));
+    const reader = first.body!.getReader();
+    const initial = new TextDecoder().decode((await reader.read()).value);
+    expect(initial).toContain('我记得。');
+    expect(initial).toContain('streaming');
+    await reader.cancel();
+    const page = await (await server.fetch(new Request('http://selfcraft.local/api/messages'))).json() as any;
+    expect(page.items.at(-1).metadata.state).toBe('streaming');
+    const reopened = await server.fetch(new Request('http://selfcraft.local/api/conversation/events'));
+    const next = reopened.body!.getReader();
+    expect(new TextDecoder().decode((await next.read()).value)).toContain('我记得。');
+    release.resolve();
+    const completed = new TextDecoder().decode((await next.read()).value);
+    expect(completed).toContain('completed');
+    expect(completed).not.toContain('streaming');
+    await next.cancel();
+    const rejected = await server.fetch(jsonRequest('/api/conversation/messages', 'POST', {
+        messages: [{ role: 'user', parts: [{ type: 'text', text: '跨站请求' }] }],
+    }, 'https://untrusted.example'));
+    expect(rejected.status).toBe(400);
+    expect(await rejected.text()).toContain('拒绝跨站请求');
+});
+
+
+test('停止 Runtime 会关闭长订阅，不阻止自我升级重启', async () => {
+    const { server } = createServer();
+    const response = await server.fetch(new Request('http://selfcraft.local/api/conversation/events'));
+    const reader = response.body!.getReader();
+    await reader.read();
+    server.stop();
+    expect((await reader.read()).done).toBeTrue();
 });

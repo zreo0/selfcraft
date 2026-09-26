@@ -49,6 +49,10 @@ export interface ConfigView {
 
 /** Web 消息附带的持久时间线信息 */
 export interface MessageMetadata {
+    /** Runtime 中的生成状态，页面重连后继续追加同一消息 */
+    state?: 'streaming' | 'completed' | 'failed';
+    /** 对应主脑执行 */
+    executionId?: string;
     /** 持久消息的时间线序号，乐观消息尚未分配 */
     seq?: number;
     /** 消息发生时间 */

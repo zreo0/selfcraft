@@ -61,6 +61,8 @@ export type AgentRunEvent =
     | {
         type: 'text-delta';
         delta: string;
+        /** 已存在于执行检查点的文字，持久交付视图无需再次追加 */
+        replay?: boolean;
     };
 
 /** 一次工具成功结束后得到的活动与来源 */

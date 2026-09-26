@@ -1,5 +1,5 @@
-import { useChat } from '@ai-sdk/react';
-import { DefaultChatTransport, type FileUIPart } from 'ai';
+import { useConversation } from '@/hooks/useConversation';
+import { type FileUIPart } from 'ai';
 import { ArrowDown, Compass, History, RotateCcw, Settings2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import {
@@ -30,13 +30,6 @@ import type {
     MessagePage,
     SelfcraftMessage,
 } from '@/types/api.types';
-
-const chatTransport = new DefaultChatTransport<SelfcraftMessage>({
-    api: '/api/chat',
-    prepareSendMessagesRequest: ({ messages, trigger }) => ({
-        body: { messages: messages.filter(message => message.role === 'user').slice(-1), trigger },
-    }),
-});
 
 /** 从 AI SDK 消息中读取所有文本内容 */
 function messageText (message: SelfcraftMessage): string {
@@ -128,21 +121,11 @@ export function ChatView ({
         stop,
         clearError,
         regenerate,
-    } = useChat<SelfcraftMessage>({
-        transport: chatTransport,
-        onData: part => {
-            if (
-                part.type === 'data-status'
-                && typeof part.data === 'object'
-                && part.data !== null
-                && typeof (part.data as { label?: unknown }).label === 'string'
-            ) {
-                setStatusText((part.data as { label: string }).label);
-            }
-        },
-        onFinish: () => setStatusText(null),
-        onError: () => setStatusText(null),
-    });
+    } = useConversation();
+
+    useEffect(() => {
+        if (status === 'ready') setStatusText(null);
+    }, [status]);
 
     useEffect(() => {
         if (initialized.current) {
@@ -170,7 +153,7 @@ export function ChatView ({
     /** 提交本轮新输入，历史上下文仍由服务端持有 */
     function handleSubmit (value: string): void {
         const text = value.trim();
-        if ((!text && files.length === 0) || uploadInFlight.current || status === 'submitted' || status === 'streaming') {
+        if ((!text && files.length === 0) || uploadInFlight.current) {
             return;
         }
         if (!config?.configured) {
@@ -191,7 +174,7 @@ export function ChatView ({
 
     /** 上传图片后保留标准附件，失败不清空文字和已上传图片 */
     async function handleFilesAdded (selected: File[]): Promise<void> {
-        if (uploadInFlight.current || status === 'submitted' || status === 'streaming' || !selected.length) {
+        if (uploadInFlight.current || !selected.length) {
             return;
         }
         setUploadError(null);
@@ -273,9 +256,7 @@ export function ChatView ({
     const generating = status === 'submitted' || status === 'streaming';
     const lastMessage = messages.at(-1);
     const lastMessageId = lastMessage?.id;
-    const pendingAssistantId = generating && lastMessage?.role === 'assistant'
-        ? lastMessage.id
-        : null;
+    const pendingAssistantId = messages.findLast(message => message.role === 'assistant' && message.metadata?.state === 'streaming')?.id || null;
     return (
         <section className="chat-view">
             <h1 className="sr-only">持续对话</h1>

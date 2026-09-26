@@ -71,7 +71,7 @@ export function PromptInput ({
     const fileInputRef = useRef<HTMLInputElement>(null);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const measurementRef = useRef<HTMLDivElement>(null);
-    const canSubmit = (Boolean(value.trim()) || files.length > 0) && !disabled && !loading && !uploading;
+    const canSubmit = (Boolean(value.trim()) || files.length > 0) && !disabled && !uploading;
 
     /** 按真实文本高度调整输入区，避免固定大文本框 */
     const resizeTextarea = useCallback(() => {
@@ -147,7 +147,7 @@ export function PromptInput ({
                     {files.map((file, index) => (
                         <li className="relative rounded-lg border border-border bg-card p-1" key={`${file.url}:${index}`}>
                             <img alt={file.filename || '待发送图片'} className="h-20 w-24 rounded-md object-contain" src={file.url} />
-                            <Button aria-label={`移除${file.filename || '图片'}`} className="absolute -right-1 -top-1 rounded-full" disabled={loading} onClick={() => onRemoveFile?.(index)} size="icon-sm" type="button" variant="secondary">
+                            <Button aria-label={`移除${file.filename || '图片'}`} className="absolute -right-1 -top-1 rounded-full" disabled={uploading} onClick={() => onRemoveFile?.(index)} size="icon-sm" type="button" variant="secondary">
                                 <X aria-hidden="true" className="size-3.5" />
                             </Button>
                         </li>
@@ -164,7 +164,7 @@ export function PromptInput ({
                 onKeyDown={handleKeyDown}
                 onPaste={event => {
                     onPaste?.(event);
-                    if (event.defaultPrevented || !onFilesAdded || disabled || loading || uploading) {
+                    if (event.defaultPrevented || !onFilesAdded || disabled || uploading) {
                         return;
                     }
                     const images = Array.from(event.clipboardData.files).filter(file => file.type.startsWith('image/'));
@@ -187,7 +187,7 @@ export function PromptInput ({
                             event.target.value = '';
                             onFilesAdded(selected);
                         }} ref={fileInputRef} tabIndex={-1} type="file" />
-                        <Button aria-label="添加图片" disabled={disabled || loading || uploading || files.length >= 4} onClick={() => fileInputRef.current?.click()} size="icon-sm" type="button" variant="ghost">
+                        <Button aria-label="添加图片" disabled={disabled || uploading || files.length >= 4} onClick={() => fileInputRef.current?.click()} size="icon-sm" type="button" variant="ghost">
                             <ImagePlus aria-hidden="true" className="size-4" />
                         </Button>
                     </>
@@ -197,12 +197,12 @@ export function PromptInput ({
                     <span className="sm:hidden">输入消息</span>
                 </span>
                 <Button
-                    aria-label={loading ? '停止回应' : '发送消息'}
+                    aria-label={loading && !canSubmit ? '停止回应' : '发送消息'}
                     className="ml-auto rounded-full"
-                    disabled={loading ? !onStop : !canSubmit}
-                    onClick={loading ? onStop : undefined}
+                    disabled={!canSubmit && !(loading && onStop)}
+                    onClick={loading && !canSubmit ? onStop : undefined}
                     size="icon-sm"
-                    type={loading ? 'button' : 'submit'}
+                    type={loading && !canSubmit ? 'button' : 'submit'}
                 >
                     <AnimatePresence initial={false} mode="popLayout">
                         <motion.span
@@ -210,10 +210,10 @@ export function PromptInput ({
                             className="grid place-items-center"
                             exit={reduce ? { opacity: 0 } : { opacity: 0, y: -3, scale: 0.8 }}
                             initial={reduce ? { opacity: 1 } : { opacity: 0, y: 3, scale: 0.8 }}
-                            key={loading ? 'stop' : 'send'}
+                            key={loading && !canSubmit ? 'stop' : 'send'}
                             transition={reduce ? { duration: 0 } : SPRING_SWAP}
                         >
-                            {loading
+                            {loading && !canSubmit
                                 ? <Square aria-hidden="true" className="size-3 fill-current" />
                                 : <ArrowUp aria-hidden="true" className="size-4" />}
                         </motion.span>

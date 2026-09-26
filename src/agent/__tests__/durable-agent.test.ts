@@ -1,3 +1,4 @@
+import { ConversationStore } from '../../conversation/conversation-store';
 import { AttachmentStore } from '../../attachment/attachment-store';
 import { WorkRunner } from '../../work/work-runner';
 import { afterEach, expect, test } from 'bun:test';
@@ -127,8 +128,9 @@ test('跨重启等待的事项在用户改变要求后由同一个助理自动�
     workId = work.id;
     works.update(work.id, 1, { status: 'waiting', waitFor: 'user' });
     const restored = new WorkStore(f.paths.state);
-    const runner = new WorkRunner(restored, f.agent, new ForegroundRunner(f.agent, f.executions),
-        f.jobs, f.memory, f.notifications, f.logger, () => undefined, () => false);
+    const foreground = new ForegroundRunner(f.agent, f.executions);
+    const runner = new WorkRunner(restored, f.agent, foreground,
+        f.jobs, f.memory, f.logger, () => undefined, () => false);
     runner.start();
     try {
         runner.tick();
@@ -141,8 +143,10 @@ test('跨重启等待的事项在用户改变要求后由同一个助理自动�
         }
         runner.tick();
         expect(restored.get(work.id)?.status).toBe('completed');
-        expect(f.notifications.list().some(item => item.message.includes('三个要点'))).toBeTrue();
-        expect(f.session.loadTranscript()).toHaveLength(0);
+        while (foreground.getPendingCount() && Date.now() < deadline) await Bun.sleep(10);
+        expect(JSON.stringify(f.session.loadTranscript())).toContain('三个要点');
+        expect(JSON.stringify(f.session.loadTranscript())).toContain('新的简报已完成');
+        expect(f.notifications.list()).toHaveLength(0);
     } finally {
         runner.stop();
         await Bun.sleep(30);
@@ -494,4 +498,231 @@ test('有副作用的工具结果未知时停止循环，不让模型继续执�
     await expect(f.agent.run('测试未知操作', () => undefined, { executionId: 'unknown-write' })).rejects.toThrow('工具结果未知');
     expect(calls).toBe(1);
     expect(f.executions.begin('unknown-write').status).toBe('blocked');
+});
+
+test('主脑调用期间可以插话和改口，下一步先处理收件且不执行旧决定', async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let calls = 0;
+    const model = new MockLanguageModelV4({ doStream: async options => {
+        if (++calls === 1) {
+            entered.resolve();
+            await release.promise;
+            return response({ name: 'write', input: { path: 'files/stale.txt', content: '旧决定' } });
+        }
+        expect(JSON.stringify(options.prompt)).toContain('天气');
+        expect(JSON.stringify(options.prompt)).toContain('改为前年');
+        return response(undefined, '年报已改为前年，天气也已收到');
+    } });
+    const f = fixture(model);
+    const conversation = new ConversationStore(f.paths.state);
+    const foreground = new ForegroundRunner(f.agent, f.executions, undefined, conversation);
+    const first = foreground.run('查去年的年报', undefined, { executionId: 'first' });
+    await entered.promise;
+    const second = foreground.run('看看天气', undefined, { executionId: 'second' });
+    const third = foreground.run('年报改为前年', undefined, { executionId: 'third' });
+    expect(foreground.run('看看天气', undefined, { executionId: 'second' })).toBe(second);
+    expect(conversation.page().items.filter(item => item.role === 'user')).toHaveLength(3);
+    release.resolve();
+    await Promise.all([first, second, third]);
+    expect(calls).toBe(2);
+    expect(fs.existsSync(path.join(f.paths.workspace, 'files/stale.txt'))).toBeFalse();
+    expect(f.executions.get('second')?.parentId).toBe('first');
+    expect(f.executions.get('third')?.status).toBe('completed');
+    expect(foreground.getPendingCount()).toBe(0);
+    expect(conversation.get('assistant:first')?.metadata?.state).toBe('completed');
+});
+
+test('最终文字生成时收到新消息仍继续处理，恢复同轮收件不会丢失或重复原文', async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let calls = 0;
+    const model = new MockLanguageModelV4({ doStream: async options => {
+        expect(JSON.stringify(options.prompt)).toContain('已接收的补充');
+        if (++calls === 1) {
+            entered.resolve();
+            await release.promise;
+            return response(undefined, '前一部分回答');
+        }
+        expect(JSON.stringify(options.prompt)).toContain('生成时插话');
+        return response(undefined, '继续回应插话');
+    } });
+    const f = fixture(model);
+    f.executions.accept('root', '最初请求', 'foreground');
+    f.executions.begin('root');
+    f.executions.accept('child', '已接收的补充', 'foreground');
+    f.executions.collect('root');
+    const foreground = new ForegroundRunner(f.restore(), f.executions);
+    const recovered = Promise.withResolvers<void>();
+    foreground.recover((_id, error) => error ? recovered.reject(error) : recovered.resolve());
+    await entered.promise;
+    const next = foreground.run('生成时插话', undefined, { executionId: 'next' });
+    release.resolve();
+    await Promise.all([next, recovered.promise]);
+    const users = f.session.loadTranscript().filter(message => message.role === 'user');
+    expect(users.map(message => message.content)).toEqual(['最初请求', '已接收的补充', '生成时插话']);
+    expect(f.executions.get('child')?.status).toBe('completed');
+    expect(calls).toBe(2);
+});
+
+test('分身继承上下文、读取途中更新、隔离写入并禁止嵌套和直接通知', async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let calls = 0;
+    let f: ReturnType<typeof fixture>;
+    let workId = '';
+    const model = new MockLanguageModelV4({ doStream: async options => {
+        const prompt = JSON.stringify(options.prompt);
+        expect(prompt).toContain('用户习惯：中文简报');
+        expect(options.tools?.some(tool => ['work_create', 'job_start', 'notify'].includes(tool.name))).toBeFalse();
+        const work = f.works.get(workId)!;
+        if (++calls === 1) {
+            entered.resolve();
+            await release.promise;
+            return response({ name: 'work_update', input: { id: workId, revision: work.revision,
+                status: 'completed', next: '', evidence: '旧年报结果' } });
+        }
+        expect(prompt).toContain('前年年报');
+        if (calls === 2) return response({ id: 'outside', name: 'write', input: { path: 'IDENTITY.md', content: '不可覆盖' } });
+        if (calls === 3) return response({ id: 'artifact', name: 'write', input: { path: `files/works/${workId}/report.txt`, content: '前年年报' } });
+        return response({ id: 'done', name: 'work_update', input: { id: workId, revision: work.revision,
+            status: 'completed', next: '', evidence: '前年年报已写入独立产物并核对' } });
+    } });
+    f = fixture(model);
+    f.session.append({ role: 'user', content: '用户习惯：中文简报' });
+    const work = f.works.create({ goal: '去年年报', acceptance: '交付文件', authority: '本地整理', sourceEventId: 'user:1', next: '查询' });
+    workId = work.id;
+    using fork = f.session.forWork(workId);
+    f.session.append({ role: 'user', content: '主脑后续独立聊天' });
+    const claimed = f.works.claim()!;
+    const job = { id: claimed.executionId!, title: work.goal, type: 'agent' as const, status: 'running' as const,
+        attempts: 1, payload: { prompt: '完成当前事项' }, logPath: '', createdAt: new Date().toISOString(),
+        timeoutSeconds: 600, workId, workRevision: claimed.revision };
+    const running = f.agent.runBackground(job, new AbortController().signal, () => undefined);
+    await entered.promise;
+    f.works.update(workId, claimed.revision, { goal: '前年年报', status: 'running', next: '改查前年' }, true);
+    release.resolve();
+    await running;
+    expect(f.works.get(workId)?.status).toBe('completed');
+    expect(f.works.notifications()).toHaveLength(1);
+    expect(fs.readFileSync(path.join(f.paths.workspace, `files/works/${workId}/report.txt`), 'utf8')).toBe('前年年报');
+    expect(fs.readFileSync(path.join(f.paths.workspace, 'IDENTITY.md'), 'utf8')).not.toBe('不可覆盖');
+    expect(JSON.stringify(fork.loadTranscript())).not.toContain('主脑后续独立聊天');
+    expect(f.session.loadTranscript()).toHaveLength(2);
+    expect(fork.loadTranscript().some(message => message.role === 'tool')).toBeTrue();
+});
+
+test('分身执行片段达到上限会自动续接，同一事项累计预算而非每片段打扰主脑', async () => {
+    let calls = 0;
+    let f: ReturnType<typeof fixture>;
+    let workId = '';
+    const model = new MockLanguageModelV4({ doStream: async () => {
+        calls += 1;
+        if (calls < 20) return response({ id: `read:${calls}`, name: 'list', input: { path: 'files' } });
+        const work = f.works.get(workId)!;
+        return response({ id: 'done', name: 'work_update', input: { id: workId, revision: work.revision,
+            status: 'completed', next: '', evidence: '核实完毕' } });
+    } });
+    f = fixture(model);
+    workId = f.works.create({ goal: '持续核实', acceptance: '核实完毕', authority: '读取', sourceEventId: 'user:1', next: '读取资料' }).id;
+    /** 使用真实领取和执行链路推进一个片段 */
+    const advance = async () => {
+        const work = f.works.claim()!;
+        await f.agent.runBackground({ id: work.executionId!, title: work.goal, type: 'agent', status: 'running', attempts: 1,
+            payload: { prompt: '继续核实' }, logPath: '', createdAt: new Date().toISOString(), timeoutSeconds: 600,
+            workId, workRevision: work.revision }, new AbortController().signal, () => undefined);
+        f.works.release(workId);
+    };
+    await advance();
+    expect(f.works.get(workId)?.status).toBe('ready');
+    expect(f.works.get(workId)?.steps).toBe(16);
+    expect(f.works.notifications()).toHaveLength(0);
+    await advance();
+    expect(f.works.get(workId)?.steps).toBe(20);
+    expect(f.works.get(workId)?.status).toBe('completed');
+    expect(f.works.notifications()).toHaveLength(1);
+    using branch = f.session.forWork(workId);
+    expect(branch.loadTranscript().filter(message => message.role === 'tool')).toHaveLength(20);
+});
+
+test('合并输入后的只读失败可安全重试，沿用主执行结果且不重复用户补充', async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let calls = 0;
+    let retry = false;
+    const model = new MockLanguageModelV4({ doStream: async options => {
+        calls += 1;
+        if (calls === 1) {
+            entered.resolve();
+            await release.promise;
+            return response({ id: 'old-read', name: 'list', input: { path: 'files' } });
+        }
+        if (calls === 2) return response({ id: 'actual-read', name: 'list', input: { path: 'files' } });
+        if (!retry) throw new Error('暂时中断');
+        expect(JSON.stringify(options.prompt)).toContain('补充要求');
+        return response(undefined, '已继续完成');
+    } });
+    const f = fixture(model);
+    const foreground = new ForegroundRunner(f.agent, f.executions);
+    const first = foreground.run('读取资料', undefined, { executionId: 'group-root' }).catch(() => undefined);
+    await entered.promise;
+    const second = foreground.run('补充要求', undefined, { executionId: 'group-child' }).catch(() => undefined);
+    release.resolve();
+    await Promise.all([first, second]);
+    retry = true;
+    await foreground.run('补充要求', undefined, { executionId: 'retry-group', retry: true });
+    expect(f.session.loadTranscript().filter(message => message.role === 'user').map(message => message.content)).toEqual(['读取资料', '补充要求']);
+    expect(f.executions.inspect('group-root').tools).toHaveLength(1);
+    expect(f.executions.inspect('retry-group').tools).toHaveLength(0);
+});
+
+test('事项重启保留执行标识，即使进度变化也继续原工具检查点', async () => {
+    let interrupted = true;
+    let calls = 0;
+    let f: ReturnType<typeof fixture>;
+    let workId = '';
+    const model = new MockLanguageModelV4({ doStream: async options => {
+        if (++calls === 1) return response({ id: 'read-before-restart', name: 'list', input: { path: 'files' } });
+        if (interrupted) throw new Error('模拟进程退出');
+        expect(JSON.stringify(options.prompt)).toContain('重启后的补充');
+        const work = f.works.get(workId)!;
+        return response({ id: 'finish-after-restart', name: 'work_update', input: { id: workId, revision: work.revision,
+            status: 'completed', next: '', evidence: '读取结果仍在，已完成核实' } });
+    } });
+    f = fixture(model);
+    workId = f.works.create({ goal: '核实资料', acceptance: '核实完成', authority: '读取', sourceEventId: 'user:1', next: '读取' }).id;
+    const work = f.works.claim()!;
+    const job = { id: work.executionId!, title: work.goal, type: 'agent' as const, status: 'running' as const, attempts: 1,
+        payload: { prompt: '首次领取的要求' }, logPath: '', createdAt: new Date().toISOString(), timeoutSeconds: 600,
+        workId, workRevision: work.revision };
+    await expect(f.agent.runBackground(job, new AbortController().signal, () => undefined)).rejects.toThrow();
+    f.works.update(workId, work.revision, { next: '重启后的补充', status: 'running' }, true);
+    f.works.recover();
+    expect(f.works.claim()?.executionId).toBe(job.id);
+    interrupted = false;
+    await f.restore().runBackground({ ...job, payload: { prompt: '恢复时重新组装的进展' } }, new AbortController().signal, () => undefined);
+    expect(f.works.get(workId)?.status).toBe('completed');
+    expect(f.executions.inspect(`job:${job.id}`).tools).toHaveLength(2);
+});
+
+test('主脑修改期间分身推进版本，冲突作为正常工具结果返回而不污染执行检查点', async () => {
+    let calls = 0;
+    let f: ReturnType<typeof fixture>;
+    let workId = '';
+    const model = new MockLanguageModelV4({ doStream: async options => {
+        calls += 1;
+        if (calls === 1) {
+            f.works.update(workId, 1, { evidence: '分身刚刚取得新资料' });
+            return response({ id: 'stale-update', name: 'work_update', input: { id: workId, revision: 1, status: 'cancelled', next: '用户取消', evidence: '' } });
+        }
+        expect(JSON.stringify(options.prompt)).toContain('事项已有新进展');
+        if (calls === 2) return response({ id: 'latest-update', name: 'work_update', input: { id: workId, revision: 2, status: 'cancelled', next: '用户取消', evidence: '' } });
+        return response(undefined, '已取消');
+    } });
+    f = fixture(model);
+    workId = f.works.create({ goal: '资料查询', acceptance: '核实来源', authority: '读取', sourceEventId: 'user:1', next: '查询' }).id;
+    await new ForegroundRunner(f.agent, f.executions).run('取消原事项', undefined, { executionId: 'conflict' });
+    expect(f.works.get(workId)?.status).toBe('cancelled');
+    expect(f.executions.get('conflict')?.status).toBe('completed');
+    expect(f.works.notifications()).toHaveLength(0);
 });

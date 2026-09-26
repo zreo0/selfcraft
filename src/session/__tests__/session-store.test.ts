@@ -91,3 +91,18 @@ test('历史按稳定 ID 分页，窗口交接后仍能读取完整消息与附�
     expect(store.load().messageIds).toEqual([2]);
     expect(store.searchHistory('message', '%')).toHaveLength(0);
 });
+
+test('事项分支继承有效窗口和可追溯原文，后续各自推进且重新打开不再次复制', () => {
+    const root = createTemporaryDirectory();
+    const main = new SessionStore(root);
+    main.append({ role: 'user', content: '完整原始资料' }, { role: 'assistant', content: '已读取' });
+    main.handoff(main.load(), '资料见 [message:1]', [2]);
+    using branch = main.forWork('report');
+    expect(branch.load()).toEqual(main.load());
+    expect(branch.readHistory('message', 1).content).toContain('完整原始资料');
+    branch.append({ role: 'user', content: '主脑派发的要求' });
+    main.append({ role: 'user', content: '新的闲聊' });
+    using restored = new SessionStore(root).forWork('report');
+    expect(restored.loadTranscript().map(message => message.content)).toEqual(['完整原始资料', '已读取', '主脑派发的要求']);
+    expect(main.loadTranscript().at(-1)?.content).toBe('新的闲聊');
+});

@@ -2,6 +2,7 @@
 export function canRepeatTool (name: string): boolean {
     return [
         'read', 'list', 'search', 'skills', 'read_skill',
+        'work_list', 'execution_status',
         'web_search', 'web_fetch', 'image_analyze', 'history_search', 'history_read',
     ].includes(name);
 }

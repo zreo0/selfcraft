@@ -137,6 +137,7 @@ export class ScheduledTaskManager {
         private readonly notifications: NotificationInbox,
         private readonly memory: ScheduledTaskEventStore,
         scanIntervalMs = 1000,
+        private readonly onDue?: (id: string, title: string, message: string) => void,
     ) {
         fs.mkdirSync(path.dirname(databasePath), { recursive: true });
         this.database = new Database(databasePath, { create: true });
@@ -395,7 +396,8 @@ export class ScheduledTaskManager {
      */
     private deliver (task: ScheduledTaskRecord): void {
         try {
-            this.notifications.pushOnce(task.notificationId, task.title, task.message);
+            if (this.onDue) this.onDue(task.notificationId, task.title, task.message);
+            else this.notifications.pushOnce(task.notificationId, task.title, task.message);
         } catch (error) {
             this.fail(task, error);
             return;

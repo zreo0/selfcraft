@@ -1,3 +1,4 @@
+import { ConversationStore } from '../conversation/conversation-store';
 import { AttachmentStore, MAX_IMAGES, MAX_IMAGE_BYTES } from '../attachment/attachment-store';
 import { userContentFiles } from '../model/user-content';
 import * as path from 'node:path';
@@ -122,6 +123,8 @@ export interface WebServerAddress {
 export class WebServer {
     private server?: Bun.Server<undefined>;
     private readonly attachments: AttachmentStore;
+    private readonly conversation: ConversationStore;
+    private readonly subscriptions = new Set<() => void>();
 
     /**
      * 创建 Web 入口
@@ -132,6 +135,7 @@ export class WebServer {
         paths: SelfcraftPaths;
         config: ConfigStore;
         agent: ForegroundRunner;
+        conversation?: ConversationStore;
         memory: MemoryStore;
         skills: SkillRegistry;
         notifications: NotificationInbox;
@@ -143,6 +147,8 @@ export class WebServer {
         onRestart: () => void;
     }) {
         this.attachments = new AttachmentStore(dependencies.paths.home);
+        this.conversation = dependencies.conversation || new ConversationStore(dependencies.paths.state);
+        this.importHistory();
     }
 
     /**
@@ -178,7 +184,8 @@ export class WebServer {
 
     /** 停止接受新的 Web 请求 */
     public stop (): void {
-        this.server?.stop();
+        for (const close of this.subscriptions) close();
+        this.server?.stop(true);
         this.server = undefined;
     }
 
@@ -252,6 +259,25 @@ export class WebServer {
             const limit = parseOptionalInteger(url.searchParams.get('limit')) || 50;
             const before = parseOptionalInteger(url.searchParams.get('before'));
             return jsonResponse(this.buildMessages(limit, before));
+        }
+        if (request.method === 'GET' && url.pathname === '/api/conversation/events') {
+            return this.streamConversation(request);
+        }
+        if (request.method === 'POST' && url.pathname === '/api/conversation/stop') {
+            this.assertMutationRequest(request);
+            this.dependencies.agent.interrupt();
+            return jsonResponse({ stopped: true });
+        }
+        if (request.method === 'POST' && url.pathname === '/api/conversation/messages') {
+            this.assertMutationRequest(request);
+            if (!this.dependencies.config.isConfigured()) return new Response('请先完成模型配置', { status: 409 });
+            const body = chatRequestSchema.parse(await request.json());
+            const input = this.readInput(body);
+            const id = z.string().min(1).max(128).parse(body.id || randomUUID());
+            void this.dependencies.agent.run(input, () => undefined, {
+                executionId: id, retry: body.trigger === 'regenerate-message',
+            }).catch(error => this.dependencies.logger.warn('对话未完成，执行记录已保留', { error: publicChatError(error) }));
+            return jsonResponse({ id }, 202);
         }
         if (request.method === 'POST' && url.pathname === '/api/chat') {
             this.assertMutationRequest(request);
@@ -468,27 +494,70 @@ export class WebServer {
         } satisfies WebConfigView;
     }
 
-    /** 构造一页可直接交给 useChat 的历史消息 */
-    private buildMessages (limit: number, before?: number): object {
-        const events = this.dependencies.memory.listConversationEvents(limit, before);
-        return {
-            items: events.map(event => toUIMessage(
-                event,
-                event.runId ? this.dependencies.memory.listEventsByRun(event.runId) : [],
-            )),
-            nextCursor: events.length === limit ? events[0]?.seq || null : null,
-        };
+    /** 首次启用交付视图时保留既有对话 */
+    private importHistory (): void {
+        if (this.conversation.page(1).items.length === 0) {
+            const pages: SelfcraftUIMessage[][] = [];
+            let before: number | undefined;
+            do {
+                const events = this.dependencies.memory.listConversationEvents(100, before);
+                if (!events.length) break;
+                pages.unshift(events.map(event => ({ ...toUIMessage(event, event.runId ? this.dependencies.memory.listEventsByRun(event.runId) : []),
+                    id: event.runId ? `${event.type === 'user_message' ? 'user' : 'assistant'}:${event.runId}` : event.id })));
+                before = events[0]!.seq;
+                if (events.length < 100) break;
+            } while (before);
+            this.conversation.import(pages.flat());
+        }
     }
 
-    /** 把当前 Agent Runtime 的回调流适配为 AI SDK UI Message Stream */
-    private async handleChat (request: Request): Promise<Response> {
-        if (!this.dependencies.config.isConfigured()) {
-            return new Response('请先完成模型配置', { status: 409 });
-        }
-        const body = chatRequestSchema.parse(await request.json());
+    /** 构造一页可直接交给 useChat 的历史消息 */
+    private buildMessages (limit: number, before?: number): object {
+        this.importHistory();
+        return this.conversation.page(limit, before);
+    }
+
+    /** 持续订阅持久 UI 消息，重连按版本补齐；与任何单轮生成请求无关 */
+    private streamConversation (request: Request): Response {
+        let cursor = Number(request.headers.get('last-event-id') || new URL(request.url).searchParams.get('after') || 0);
+        if (!Number.isSafeInteger(cursor) || cursor < 0) cursor = 0;
+        const encoder = new TextEncoder();
+        let timer: ReturnType<typeof setInterval>;
+        let close = () => undefined;
+        const stream = new ReadableStream<Uint8Array>({
+            start: controller => {
+                let ticks = 0;
+                /** 发送最新快照；定时扫描不调用模型 */
+                const publish = (): void => {
+                    const changes = this.conversation.changes(cursor);
+                    if (changes.cursor > cursor || ticks++ % 50 === 0) {
+                        controller.enqueue(encoder.encode(`id: ${changes.cursor}\ndata: ${JSON.stringify(changes)}\n\n`));
+                        cursor = changes.cursor;
+                    }
+                };
+                close = () => {
+                    clearInterval(timer);
+                    request.signal.removeEventListener('abort', close);
+                    this.subscriptions.delete(close);
+                    try { controller.close(); } catch { /* 已断开的读者无需再次关闭 */ }
+                };
+                this.subscriptions.add(close);
+                timer = setInterval(publish, 200);
+                request.signal.addEventListener('abort', close, { once: true });
+                publish();
+                if (request.signal.aborted) close();
+            },
+            cancel: () => close(),
+        });
+        this.server?.timeout(request, 0);
+        return new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' } });
+    }
+
+    /** 所有入口只提交本轮标准 UI 消息，由 Runtime 校验并持久引用图片 */
+    private readInput (body: z.infer<typeof chatRequestSchema>): UserModelMessage['content'] {
         const lastMessage = body.messages.at(-1);
         if (!lastMessage || lastMessage.role !== 'user') {
-            return new Response('最后一条消息必须来自用户', { status: 400 });
+            throw new Error('最后一条消息必须来自用户');
         }
         const parts = z.array(z.discriminatedUnion('type', [
             z.object({ type: z.literal('text'), text: z.string().max(100_000) }),
@@ -502,9 +571,17 @@ export class WebServer {
             ? parts.map(part => part.type === 'file' ? this.attachments.reference(part) : part)
             : parts.filter(part => part.type === 'text').map(part => part.text).join('\n').trim();
         if (!input || (Array.isArray(input) && !input.length)) {
-            return new Response('消息不能为空', { status: 400 });
+            throw new Error('消息不能为空');
         }
 
+        return input;
+    }
+
+    /** 保留 CLI 协议适配，执行生命周期由共享主脑收件箱管理 */
+    private async handleChat (request: Request): Promise<Response> {
+        if (!this.dependencies.config.isConfigured()) return new Response('请先完成模型配置', { status: 409 });
+        const body = chatRequestSchema.parse(await request.json());
+        const input = this.readInput(body);
         let restartRequired = false;
         const textId = randomUUID();
         const activityId = `activity:${textId}`;

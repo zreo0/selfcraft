@@ -16,6 +16,15 @@ export interface WorkRecord {
     sourceEventId: string;
     /** 用于拒绝过期执行的版本 */
     revision: number;
+    /** 要求或唤醒条件的版本，普通进展不改变 */
+    instructionVersion: number;
+    /** 分身累计模型调用次数 */
+    steps: number;
+    /** 派发时明确允许修改的工作区文件 */
+    writablePaths: string[];
+    /** 创建和最近进展时间 */
+    createdAt: string;
+    updatedAt: string;
     /** 当前状态 */
     status: 'ready' | 'running' | 'waiting' | 'completed' | 'cancelled' | 'blocked';
     /** 下一步或等待的具体说明 */
@@ -28,9 +37,14 @@ export interface WorkRecord {
     wakeAt: string | null;
     /** 已关联执行的标识 */
     jobId: string | null;
+    /** 尚未结束的执行片段，重启继续复用工具检查点 */
+    executionId: string | null;
     /** 当前条件触发的累计思考次数 */
     turns: number;
 }
+
+/** 一次主脑授权下的累计模型调用预算 */
+export const WORK_STEP_BUDGET = 128;
 
 /** 持久事项及其版本；Job 和时间只是唤醒条件 */
 export class WorkStore {
@@ -48,10 +62,14 @@ export class WorkStore {
     }
 
     /** 保存有来源的目标，指定标识用于成长候选去重 */
-    public create (input: Pick<WorkRecord, 'goal' | 'acceptance' | 'authority' | 'sourceEventId' | 'next'>, id: string = randomUUID()): WorkRecord {
+    public create (input: Pick<WorkRecord, 'goal' | 'acceptance' | 'authority' | 'sourceEventId' | 'next'> & { writablePaths?: string[]; waitFor?: 'user' | 'time'; wakeAt?: string }, id: string = randomUUID()): WorkRecord {
+        if (input.waitFor === 'time' && (!input.wakeAt || !Number.isFinite(Date.parse(input.wakeAt)))) {
+            throw new Error('时间等待必须包含有效的绝对时间');
+        }
         const record: WorkRecord = {
-            ...input, id, revision: 1, status: 'ready', evidence: '', waitFor: null,
-            wakeAt: null, jobId: null, turns: 0,
+            ...input, id, revision: 1, instructionVersion: 1, steps: 0, writablePaths: input.writablePaths || [],
+            createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), status: input.waitFor ? 'waiting' : 'ready', evidence: '', waitFor: input.waitFor || null, executionId: null,
+            wakeAt: input.waitFor === 'time' ? input.wakeAt! : null, jobId: null, turns: 0,
         };
         this.database.query('INSERT OR IGNORE INTO works VALUES (?, ?, ?, ?)')
             .run(id, JSON.stringify(record), record.status, new Date().toISOString());
@@ -61,7 +79,7 @@ export class WorkStore {
     /** 获取事项，不存在返回 null */
     public get (id: string): WorkRecord | null {
         const row = this.database.query('SELECT record FROM works WHERE id = ?').get(id) as { record: string } | null;
-        return row ? JSON.parse(row.record) : null;
+        return row ? this.decode(row.record) : null;
     }
 
     /** 返回有界事项列表，默认只列未结束事项 */
@@ -69,19 +87,23 @@ export class WorkStore {
         const rows = this.database.query(`SELECT record FROM works
             ${includeFinished ? '' : "WHERE status NOT IN ('completed', 'cancelled')"}
             ORDER BY updated_at DESC LIMIT ?`).all(Math.max(1, Math.min(limit, 200))) as { record: string }[];
-        return rows.map(row => JSON.parse(row.record));
+        return rows.map(row => this.decode(row.record));
     }
 
     /** 按预期版本修改事项；完成必须带依据，等待必须有明确条件 */
     public update (
         id: string,
         revision: number,
-        patch: Partial<Pick<WorkRecord, 'goal' | 'acceptance' | 'authority' | 'status' | 'next' | 'evidence' | 'waitFor' | 'wakeAt' | 'jobId'>>,
+        patch: Partial<Pick<WorkRecord, 'goal' | 'acceptance' | 'authority' | 'status' | 'next' | 'evidence' | 'waitFor' | 'wakeAt' | 'jobId' | 'writablePaths'>>,
         userChange = false,
     ): WorkRecord {
         return this.database.transaction(() => {
-            const current = this.requireCurrent(id, revision);
-            const updated = { ...current, ...patch, revision: revision + 1, turns: userChange ? 0 : current.turns };
+            const current = this.get(id);
+            if (!current || current.revision !== revision) throw new Error('事项已改变，请读取最新状态后处理');
+            const updated = { ...current, ...patch, revision: revision + 1,
+                instructionVersion: current.instructionVersion + Number(userChange),
+                steps: userChange ? 0 : current.steps, turns: userChange ? 0 : current.turns,
+                updatedAt: new Date().toISOString() };
             if (updated.status === 'completed' && !updated.evidence.trim()) {
                 throw new Error('完成事项必须记录结果与验证依据');
             }
@@ -100,11 +122,11 @@ export class WorkStore {
                 updated.wakeAt = null;
             }
             this.save(updated);
-            if (['completed', 'blocked', 'cancelled'].includes(updated.status)
-                || (updated.status === 'waiting' && updated.waitFor === 'user')) {
+            if (!userChange && (['completed', 'blocked', 'cancelled'].includes(updated.status)
+                || (updated.status === 'waiting' && updated.waitFor === 'user'))) {
                 this.database.query('INSERT OR IGNORE INTO work_outbox (id, title, message) VALUES (?, ?, ?)')
                     .run(`work:${id}:${updated.revision}`, updated.goal.slice(0, 120),
-                        [updated.evidence, updated.next].filter(Boolean).join('\n') || updated.status);
+                        `事项 ${id}，要求版本 ${updated.instructionVersion}，状态 ${updated.status}：\n${[updated.evidence, updated.next].filter(Boolean).join('\n')}`);
             }
             return updated;
         }).immediate();
@@ -123,25 +145,25 @@ export class WorkStore {
     public recover (): void {
         const rows = this.database.query("SELECT record FROM works WHERE status = 'running'").all() as { record: string }[];
         for (const row of rows) {
-            const record = JSON.parse(row.record) as WorkRecord;
+            const record = this.decode(row.record);
             this.save({ ...record, status: 'ready' });
         }
     }
 
-    /** 原子领取一个就绪事项，每次条件变化最多自动思考八轮 */
-    public claim (): WorkRecord | null {
+    /** 原子领取一个就绪事项，累计预算用完后交回主脑 */
+    public claim (exclude: string[] = []): WorkRecord | null {
         return this.database.transaction(() => {
-            const row = this.database.query("SELECT record FROM works WHERE status = 'ready' ORDER BY updated_at, rowid LIMIT 1")
-                .get() as { record: string } | null;
+            const row = this.database.query(`SELECT record FROM works WHERE status = 'ready' AND id NOT IN (${exclude.map(() => '?').join(',') || "''"}) ORDER BY updated_at, rowid LIMIT 1`)
+                .get(...exclude) as { record: string } | null;
             if (!row) {
                 return null;
             }
-            const record = JSON.parse(row.record) as WorkRecord;
-            if (record.turns >= 8) {
-                this.update(record.id, record.revision, { status: 'blocked', next: '自动推进已达本轮预算，需要用户调整要求或确认继续' });
+            const record = this.decode(row.record);
+            if (record.steps >= WORK_STEP_BUDGET) {
+                this.update(record.id, record.revision, { status: 'blocked', next: '事项累计执行预算已用完，请主脑检查已有进展后调整要求或允许继续' });
                 return null;
             }
-            const claimed: WorkRecord = { ...record, status: 'running', turns: record.turns + 1 };
+            const claimed: WorkRecord = { ...record, status: 'running', turns: record.turns + Number(!record.executionId), executionId: record.executionId || `work:${record.id}:${randomUUID()}` };
             this.save(claimed);
             return claimed;
         }).immediate();
@@ -151,7 +173,7 @@ export class WorkStore {
     public wake (readJob: (id: string) => { status: string; evidence: string } | null, now = Date.now()): void {
         const rows = this.database.query("SELECT record FROM works WHERE status = 'waiting'").all() as { record: string }[];
         for (const row of rows) {
-            const record = JSON.parse(row.record) as WorkRecord;
+            const record = this.decode(row.record);
             const job = record.waitFor === 'job' && record.jobId ? readJob(record.jobId) : null;
             const due = record.waitFor === 'time' && record.wakeAt && Date.parse(record.wakeAt) <= now;
             if (due || (job && !['queued', 'running'].includes(job.status))) {
@@ -162,6 +184,30 @@ export class WorkStore {
                 }, true);
             }
         }
+    }
+
+    /** 执行片段结束后释放标识；停止进程时保留它以供恢复 */
+    public release (id: string): void {
+        const work = this.get(id)!;
+        this.save({ ...work, executionId: null });
+    }
+
+    /** 保存累计用量；不改变要求版本，也不产生通知 */
+    public recordStep (id: string): void {
+        const work = this.get(id)!;
+        this.save({ ...work, steps: work.steps + 1, updatedAt: new Date().toISOString() });
+    }
+
+    /** 主动向主脑报告重要进展，普通步骤不调用此方法 */
+    public report (id: string, message: string): void {
+        const work = this.get(id)!;
+        this.database.query('INSERT OR IGNORE INTO work_outbox (id, title, message) VALUES (?, ?, ?)')
+            .run(`work:${id}:${work.revision}`, work.goal.slice(0, 120), `事项 ${id}，要求版本 ${work.instructionVersion}：\n${message}`);
+    }
+
+    /** 恢复旧测试数据中未记录的事项元数据 */
+    private decode (value: string): WorkRecord {
+        return { executionId: null, instructionVersion: 1, steps: 0, writablePaths: [], createdAt: '', updatedAt: '', ...JSON.parse(value) };
     }
 
     /** 读取尚未投递的事项结果；状态与输出在同一事务中提交 */

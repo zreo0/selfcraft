@@ -99,3 +99,25 @@ export function uploadImage (file: File): Promise<FileUIPart> {
     body.append('file', file);
     return requestJson<FileUIPart>('/api/attachments', { method: 'POST', body });
 }
+
+/** 提交标准 AI SDK UI 消息；接收成功后不等待生成结束 */
+export async function submitConversation (message: import('@/types/api.types').SelfcraftMessage, retry = false): Promise<void> {
+    const response = await fetch('/api/conversation/messages', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: retry ? crypto.randomUUID() : message.id, messages: [message], trigger: retry ? 'regenerate-message' : 'submit-message' }),
+    });
+    if (!response.ok) throw new Error(await response.text());
+}
+
+/** 订阅共享消息视图；浏览器重连自动携带最后接收的版本 */
+export function subscribeConversation (receive: (items: import('@/types/api.types').SelfcraftMessage[]) => void): () => void {
+    const source = new EventSource('/api/conversation/events');
+    source.onmessage = event => receive((JSON.parse(event.data) as { items: import('@/types/api.types').SelfcraftMessage[] }).items);
+    return () => source.close();
+}
+
+/** 只停止主脑当前生成，独立事项继续保持原状态 */
+export async function stopConversation (): Promise<void> {
+    const response = await fetch('/api/conversation/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    if (!response.ok) throw new Error(await response.text());
+}

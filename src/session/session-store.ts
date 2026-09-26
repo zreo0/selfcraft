@@ -146,6 +146,20 @@ export class SessionStore {
         return new SessionStore(this.sessionsPath, `execution-${createHash('sha256').update(executionId).digest('hex').slice(0, 32)}`);
     }
 
+    /** 打开稳定事项分支；首次派发复制当前一致快照，保留笔记引用与原文 ID */
+    public forWork (workId: string): SessionStore {
+        const id = `work-${createHash('sha256').update(workId).digest('hex').slice(0, 32)}`;
+        const directory = path.join(this.sessionsPath, id);
+        const destination = path.join(directory, 'session.sqlite');
+        if (!fs.existsSync(destination)) {
+            fs.mkdirSync(directory, { recursive: true });
+            const temporary = `${destination}.tmp`;
+            fs.writeFileSync(temporary, this.database.serialize());
+            fs.renameSync(temporary, destination);
+        }
+        return new SessionStore(this.sessionsPath, id);
+    }
+
     /** 以原请求和响应序号去重保存每个完整步骤，执行重试共用同一来源 */
     public appendResponses (sourceRunId: string, messages: ModelMessage[]): void {
         this.database.transaction(() => {

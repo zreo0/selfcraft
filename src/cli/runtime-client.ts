@@ -1,3 +1,4 @@
+import type { ConversationMessage } from '../conversation/conversation-store';
 import { randomUUID } from 'node:crypto';
 import { DefaultChatTransport, type UIMessageChunk } from 'ai';
 import type { AgentActivity, AgentRunEvent } from '../agent/run-events';
@@ -130,6 +131,56 @@ export class RuntimeClient {
             method: 'POST',
             body: '{}',
         });
+    }
+
+    /** 持久提交输入，仅等待收件确认 */
+    public async submit (input: string): Promise<void> {
+        const id = randomUUID();
+        await this.request('/api/conversation/messages', { method: 'POST', body: JSON.stringify({
+            id, messages: [{ id, role: 'user', parts: [{ type: 'text', text: input }] }],
+        }) });
+    }
+
+    /** 停止当前回应，独立事项继续保留 */
+    public async stopConversation (): Promise<void> {
+        await this.request('/api/conversation/stop', { method: 'POST', body: '{}' });
+    }
+
+    /** 订阅持久消息，断线后从最后收到的版本继续 */
+    public async subscribe (onMessages: (messages: ConversationMessage[], initial: boolean) => void, signal: AbortSignal): Promise<void> {
+        let cursor = 0;
+        let initial = true;
+        while (!signal.aborted) {
+            try {
+                const response = await this.fetchFunction(`${this.baseURL}/api/conversation/events?after=${cursor}`, { signal });
+                if (!response.ok || !response.body) throw new Error(`订阅失败: ${response.status}`);
+                const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+                let buffer = '';
+                try {
+                    while (!signal.aborted) {
+                        const chunk = await reader.read();
+                        if (chunk.done) break;
+                        buffer += chunk.value;
+                        let boundary: number;
+                        while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+                            const frame = buffer.slice(0, boundary);
+                            buffer = buffer.slice(boundary + 2);
+                            const data = frame.split('\n').find(line => line.startsWith('data: '));
+                            if (!data) continue;
+                            const change = JSON.parse(data.slice(6)) as { items: ConversationMessage[]; cursor: number };
+                            onMessages(change.items, initial);
+                            cursor = change.cursor;
+                            initial = false;
+                        }
+                    }
+                } finally {
+                    await reader.cancel().catch(() => undefined);
+                }
+            } catch {
+                if (signal.aborted) return;
+            }
+            await Bun.sleep(1000);
+        }
     }
 
     /** 向 Runtime 发送一轮对话并还原统一的结构化运行事件 */

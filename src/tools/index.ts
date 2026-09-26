@@ -1,3 +1,4 @@
+import * as path from 'node:path';
 import { canRepeatTool } from './tool-safety';
 import { createImageTools } from './image-tools';
 import type { ExecutionStore } from '../execution/execution-store';
@@ -36,6 +37,12 @@ export type ToolRuntimeContext = {
     channel: 'foreground' | 'background';
     /** 关联的后台任务 */
     taskId?: string;
+    /** 主脑在完整步骤边界派生独立事项会话 */
+    forkWork?: (id: string) => void;
+    /** 新输入到达时让模型先更新决定，不派发旧决定的工具 */
+    hasInput?: () => boolean;
+    /** 文件授权按 PathGuard 解析后的工作区路径检查 */
+    workspacePath?: string;
     /** 当前运行已知的长期事项 */
     topicIds?: string[];
     /** 本轮承接的事项及其版本 */
@@ -120,8 +127,24 @@ export function wrapToolsWithTimeline (
                     return definition.execute(input, options);
                 }
                 options.abortSignal?.throwIfAborted();
-                if (context.workId && context.workRevision !== undefined) {
-                    works?.requireCurrent(context.workId, context.workRevision);
+                if (context.hasInput?.()) return { deferred: true, message: '有新消息已接收，请在下一轮结合新消息重新决定此操作' };
+                if (context.workId && works) {
+                    const work = works.get(context.workId)!;
+                    if (['cancelled', 'completed', 'waiting', 'blocked'].includes(work.status)) {
+                        return { deferred: true, message: '事项已暂停或结束，停止继续操作' };
+                    }
+                    if (name === 'work_update' && work.revision !== (input as { revision?: number }).revision) {
+                        return { updated: false, message: '事项已有新补充，请读取下一轮提供的最新状态后再报告' };
+                    }
+                    if (['write', 'edit'].includes(name) && context.workspacePath) {
+                        const guard = new PathGuard(context.workspacePath);
+                        const target = guard.resolveWrite((input as { path: string }).path);
+                        const ownDirectory = guard.resolveWrite(`files/works/${work.id}/artifact`);
+                        const ownRoot = path.dirname(ownDirectory);
+                        const permitted = target.startsWith(`${ownRoot}${path.sep}`)
+                            || work.writablePaths.some(file => guard.resolveWrite(file) === target);
+                        if (!permitted) return { error: '此文件不在当前事项写入范围，请向主脑报告所需改动' };
+                    }
                 }
                 executions?.startTool(context.runId, options.toolCallId, name, input);
                 const callEvent = memory.recordEvent({

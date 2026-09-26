@@ -1,3 +1,4 @@
+import { clearLine, cursorTo } from 'node:readline';
 import { createInterface } from 'node:readline/promises';
 import { OnboardingCancelledError, type Onboarding } from '../onboarding/onboarding';
 import type { RuntimeClient } from './runtime-client';
@@ -51,6 +52,24 @@ export class Cli {
         }
 
         let terminal = createInterface({ input: process.stdin, output: process.stdout });
+        const subscription = new AbortController();
+        const displayed = new Map<string, string>();
+        let configuring = false;
+        void this.dependencies.client.subscribe((messages, initial) => {
+            for (const message of messages) {
+                if (message.role !== 'assistant') continue;
+                const text = message.parts.filter(part => part.type === 'text').map(part => part.text).join('');
+                const previous = displayed.get(message.id) || '';
+                displayed.set(message.id, text);
+                if (configuring || (initial && message.metadata?.state !== 'streaming')) continue;
+                const delta = text.startsWith(previous) ? text.slice(previous.length) : text;
+                if (!delta && message.metadata?.state !== 'failed') continue;
+                clearLine(process.stdout, 0);
+                cursorTo(process.stdout, 0);
+                console.log(delta || '当前回复未完成，可继续补充要求；事项保持原状态');
+                terminal.prompt(true);
+            }
+        }, subscription.signal);
         try {
             console.log('Selfcraft CLI 已连接。输入 /help 查看命令。');
             while (true) {
@@ -66,6 +85,7 @@ export class Cli {
                     continue;
                 }
                 if (commandResult === MODEL_SETUP_RESULT) {
+                    configuring = true;
                     terminal.close();
                     try {
                         await this.dependencies.onboarding.configureModel();
@@ -75,10 +95,12 @@ export class Cli {
                         }
                     } finally {
                         terminal = createInterface({ input: process.stdin, output: process.stdout });
+                        configuring = false;
                     }
                     continue;
                 }
                 if (commandResult === WEB_SETUP_RESULT) {
+                    configuring = true;
                     terminal.close();
                     try {
                         await this.dependencies.onboarding.configureWebSearch();
@@ -88,6 +110,7 @@ export class Cli {
                         }
                     } finally {
                         terminal = createInterface({ input: process.stdin, output: process.stdout });
+                        configuring = false;
                     }
                     continue;
                 }
@@ -97,51 +120,15 @@ export class Cli {
                     }
                     continue;
                 }
-                await this.runConversation(input);
+                try {
+                    await this.dependencies.client.submit(input);
+                } catch (error) {
+                    console.error(`发送失败：${error instanceof Error ? error.message : String(error)}`);
+                }
             }
         } finally {
+            subscription.abort();
             terminal.close();
-        }
-    }
-
-    /** 把一轮 Runtime 流式响应写到终端 */
-    private async runConversation (input: string): Promise<void> {
-        let wroteText = false;
-        let lineOpen = false;
-        try {
-            await this.dependencies.client.chat(input, event => {
-                if (event.type === 'text-delta') {
-                    wroteText = true;
-                    process.stdout.write(event.delta);
-                    lineOpen = !event.delta.endsWith('\n');
-                    return;
-                }
-                if (lineOpen) {
-                    process.stdout.write('\n');
-                }
-                if (event.type === 'status') {
-                    console.log(`→ ${event.label}`);
-                } else if (event.type === 'activity') {
-                    const marker = event.activity.state === 'running'
-                        ? '→'
-                        : event.activity.state === 'success'
-                            ? '✓'
-                            : event.activity.state === 'error' ? '×' : '?';
-                    const target = event.activity.target ? ` · ${event.activity.target}` : '';
-                    console.log(`${marker} ${event.activity.label}${target}`);
-                } else {
-                    console.log(`↳ 已读取 ${event.source.title}`);
-                }
-                lineOpen = false;
-            });
-            if (wroteText && lineOpen) {
-                process.stdout.write('\n');
-            }
-        } catch (error) {
-            if (wroteText && lineOpen) {
-                process.stdout.write('\n');
-            }
-            console.error(`执行失败：${error instanceof Error ? error.message : String(error)}`);
         }
     }
 
@@ -158,6 +145,10 @@ export class Cli {
         const [command, ...args] = input.split(/\s+/);
         if (command === '/exit' || command === '/quit') {
             return 0;
+        }
+        if (command === '/stop') {
+            await this.dependencies.client.stopConversation();
+            return -1;
         }
         if (command === '/help') {
             this.printHelp();
@@ -262,6 +253,7 @@ export class Cli {
     /** 输出 CLI 命令帮助 */
     private printHelp (): void {
         console.log([
+            '/stop                        停止当前回应，事项继续保留',
             '/model list                  查看模型',
             '/model add                   新增渠道与模型',
             '/model use <provider/model>  切换模型',

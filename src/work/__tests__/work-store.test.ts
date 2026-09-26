@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { WorkStore } from '../work-store';
+import { WorkStore, WORK_STEP_BUDGET } from '../work-store';
 import { NotificationInbox } from '../../notification/notification-inbox';
 
 const roots: string[] = [];
@@ -65,12 +65,37 @@ test('没有验证依据不能完成；完成与通知在同一事务保留且�
 
 test('同一条件下自动推进有预算，等待用户不会自行循环', () => {
     const { works, work } = fixture();
-    for (let index = 0; index < 8; index += 1) {
-        const claimed = works.claim()!;
-        expect(claimed).not.toBeNull();
-        works.update(work.id, claimed.revision, { status: 'ready', next: '继续' });
+    const claimed = works.claim()!;
+    for (let index = 0; index < WORK_STEP_BUDGET; index += 1) {
+        works.recordStep(work.id);
     }
+    works.update(work.id, claimed.revision, { status: 'ready', next: '继续' });
     expect(works.claim()).toBeNull();
     expect(works.get(work.id)?.status).toBe('blocked');
     expect(works.notifications()).toHaveLength(1);
+});
+
+test('创建时即可等待，不会提前领取；要求版本与执行进度独立', () => {
+    const { works } = fixture();
+    const work = works.create({ goal: '下周整理周报', acceptance: '写完周报', authority: '本地写入', sourceEventId: 'user:2', next: '到时开始',
+        waitFor: 'time', wakeAt: '2099-01-01T00:00:00Z' });
+    expect(work.status).toBe('waiting');
+    works.recordStep(work.id);
+    expect(works.get(work.id)?.instructionVersion).toBe(1);
+    works.wake(() => null, Date.parse('2099-01-01'));
+    const ready = works.get(work.id)!;
+    expect(ready.status).toBe('ready');
+    const progress = works.update(work.id, ready.revision, { evidence: '已开始' });
+    expect(progress.instructionVersion).toBe(ready.instructionVersion);
+    expect(works.notifications()).toHaveLength(0);
+});
+
+test('主脑主动取消不会再通知自己，重新开启沿用事项且获得新预算', () => {
+    const { works, work } = fixture();
+    works.recordStep(work.id);
+    const cancelled = works.update(work.id, work.revision, { status: 'cancelled', next: '用户不再需要' }, true);
+    expect(works.notifications()).toHaveLength(0);
+    const reopened = works.update(work.id, cancelled.revision, { status: 'ready', next: '继续原事项' }, true);
+    expect(reopened.id).toBe(work.id);
+    expect(reopened.steps).toBe(0);
 });

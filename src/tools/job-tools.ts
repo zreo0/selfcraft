@@ -13,26 +13,16 @@ import type { JobManager } from '../job/job-manager';
 export function createJobTools (jobs: JobManager, works?: WorkStore) {
     return {
         job_start: tool({
-            description: '启动可独立运行的后台长任务。普通的短工具调用应当直接完成，不要滥用后台任务',
-            inputSchema: z.discriminatedUnion('type', [
-                z.object({
-                    type: z.literal('agent'),
-                    workId: z.string().optional(),
-                    workRevision: z.number().int().positive().optional(),
-                    title: z.string().min(1).max(120),
-                    prompt: z.string().min(1).max(30000),
-                    timeoutSeconds: z.number().int().min(1).max(86400).optional(),
-                }),
-                z.object({
-                    type: z.literal('shell'),
-                    workId: z.string().optional(),
-                    workRevision: z.number().int().positive().optional(),
-                    title: z.string().min(1).max(120),
-                    command: z.string().min(1).max(100000),
-                    cwd: z.string().optional(),
-                    timeoutSeconds: z.number().int().min(1).max(86400).optional(),
-                }),
-            ]),
+            description: '启动独立 Shell 后台进程；需要 Agent 分身时使用 work_create',
+            inputSchema: z.object({
+                type: z.literal('shell'),
+                workId: z.string().optional(),
+                workRevision: z.number().int().positive().optional(),
+                title: z.string().min(1).max(120),
+                command: z.string().min(1).max(100000),
+                cwd: z.string().optional(),
+                timeoutSeconds: z.number().int().min(1).max(86400).optional(),
+            }),
             execute: async (input, options) => {
                 const context = options.context as ToolRuntimeContext | undefined;
                 const workId = context?.workId || input.workId;
@@ -44,9 +34,7 @@ export function createJobTools (jobs: JobManager, works?: WorkStore) {
                     works!.requireCurrent(workId, revision!);
                 }
                 const owner = workId ? { workId, workRevision: revision! + 1 } : {};
-                const job = input.type === 'agent'
-                    ? jobs.createAgent(input.title, input.prompt, input.timeoutSeconds, owner)
-                    : jobs.createShell(input.title, input.command, input.cwd, input.timeoutSeconds, owner);
+                const job = jobs.createShell(input.title, input.command, input.cwd, input.timeoutSeconds, owner);
                 if (workId) {
                     works!.update(workId, revision!, {
                         status: 'waiting', waitFor: 'job', jobId: job.id,
