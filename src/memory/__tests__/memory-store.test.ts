@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -575,10 +575,11 @@ describe('MemoryStore 核心记忆内核', () => {
 
     test('Reflection Worker 只从本轮真实事件渲染并绑定来源', async () => {
         const store = createStore();
+        const search = spyOn(store, 'search');
         const event = store.recordEvent({
             actor: 'user',
             type: 'message',
-            payload: { text: '我长期偏好短而准确的回答' },
+            payload: { text: '我长期偏好短而准确的回答', channel: 'foreground', content: [{ type: 'text', text: '我长期偏好短而准确的回答' }] },
             runId: 'run-worker',
         });
         const model = new MockLanguageModelV4({
@@ -618,6 +619,8 @@ describe('MemoryStore 核心记忆内核', () => {
         await worker.waitForIdle();
         worker.stop();
 
+        expect(search).toHaveBeenCalledWith('我长期偏好短而准确的回答', 12);
+        search.mockRestore();
         const candidate = store.search('短而准确')[0];
         expect(candidate.status).toBe('candidate');
         expect(candidate.sourceEventIds).toEqual([event.id]);

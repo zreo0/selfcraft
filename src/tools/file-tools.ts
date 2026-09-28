@@ -109,6 +109,7 @@ export function createFileTools (guard: PathGuard) {
             }),
             execute: async ({ path: inputPath, content }) => {
                 const filePath = guard.resolveWrite(inputPath);
+                if (guard.relative(filePath) === 'USER.md') throw new Error('USER.md 是自动生成的档案，请使用记忆工具修改');
                 fs.mkdirSync(path.dirname(filePath), { recursive: true });
                 fs.writeFileSync(filePath, content, 'utf8');
                 return { path: guard.relative(filePath), bytesWritten: Buffer.byteLength(content) };
@@ -123,6 +124,7 @@ export function createFileTools (guard: PathGuard) {
             }),
             execute: async ({ path: inputPath, oldText, newText }) => {
                 const filePath = guard.resolveWrite(inputPath);
+                if (guard.relative(filePath) === 'USER.md') throw new Error('USER.md 是自动生成的档案，请使用记忆工具修改');
                 const content = fs.readFileSync(filePath, 'utf8');
                 const first = content.indexOf(oldText);
                 if (first === -1) {

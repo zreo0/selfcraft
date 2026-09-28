@@ -20,6 +20,7 @@ import { ScheduledTaskManager } from '../../task/scheduled-task-manager';
 import { createTools } from '../../tools';
 import { PathGuard } from '../../tools/path-guard';
 import { WorkspaceService } from '../../workspace/workspace-service';
+import { createMemoryTools } from '../../tools/memory-tools';
 import { createWebTools } from '../../tools/web-tools';
 
 const temporaryDirectories: string[] = [];
@@ -47,6 +48,47 @@ afterEach(() => {
 });
 
 describe('AgentRuntime', () => {
+    test('工具纠正后的下一步立即刷新档案，运行中输入更新召回线索', async () => {
+        const root = createTemporaryDirectory();
+        const paths = resolvePaths('development', path.join(root, 'home'));
+        paths.project = path.resolve(import.meta.dir, '../../..');
+        const workspace = new WorkspaceService(paths.workspace, path.join(paths.project, 'workspace-template'));
+        workspace.initialize();
+        const config = new ConfigStore(paths.config);
+        const logger = new Logger(paths.logs);
+        const memory = new MemoryStore(paths.state);
+        const evidence = memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '我住在上海' } });
+        const old = memory.remember({ kind: 'fact', content: '用户住在上海', confidence: 1, importance: 1, resident: true, sourceEventIds: [evidence.id] });
+        const report = memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '周报固定周五写' } });
+        memory.remember({ kind: 'fact', content: '周报固定周五写', confidence: 1, importance: 1, sourceEventIds: [report.id] });
+        let calls = 0;
+        let inboxCalls = 0;
+        const model = new MockLanguageModelV4({ doStream: async () => {
+            calls++;
+            return { stream: simulateReadableStream({ chunks: calls === 1 ? [
+                { type: 'tool-call', toolCallId: 'correct', toolName: 'memory_correct', input: JSON.stringify({ id: old.id, revisionKind: 'correction', kind: 'fact', content: '用户住在苏州' }) },
+                { type: 'finish', finishReason: { unified: 'tool-calls', raw: undefined }, usage: usage() },
+            ] : [
+                { type: 'text-start', id: 'text' }, { type: 'text-delta', id: 'text', delta: '已纠正' },
+                { type: 'text-end', id: 'text' }, { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+            ] as any }) };
+        } });
+        const agent = new AgentRuntime(config, workspace, new SkillRegistry(path.join(paths.workspace, 'skills')),
+            new SessionStore(paths.sessions), new ContextManager(),
+            new EvolutionService(paths, new ReleaseStore(paths.supervisor, paths.evolution), logger), memory,
+            { beginAgentActivity: () => undefined, endAgentActivity: () => undefined, enqueue: () => 'reflection' },
+            createMemoryTools(memory) as never, logger,
+            () => ({ model, providerId: 'mock', modelId: 'mock', contextWindow: 128000, maxOutputTokens: 4096 }));
+        await agent.run('纠正一下，我住在苏州', () => undefined, {
+            inbox: () => ++inboxCalls === 3 ? [{ id: crypto.randomUUID(), kind: 'user', input: '对了，周报是什么时候写', channel: 'foreground', status: 'queued', messages: [], result: null, parentId: null, retry: false }] : [],
+        });
+        const system = model.doStreamCalls.map(call => call.prompt.filter(message => message.role === 'system').map(message => message.content).join('\n'));
+        expect(system[0]).toContain('用户住在上海');
+        expect(system[1]?.match(/<user-profile>[\s\S]*?<\/user-profile>/)?.[0]).toContain('用户住在苏州');
+        expect(system[1]?.match(/<user-profile>[\s\S]*?<\/user-profile>/)?.[0]).not.toContain('用户住在上海');
+        expect(system[1]).toContain('周报固定周五写');
+    });
+
     test('执行提醒工具循环并持久化完整会话与事件链', async () => {
         setSystemTime(new Date('2026-08-29T16:30:00.000Z'));
         const root = createTemporaryDirectory();

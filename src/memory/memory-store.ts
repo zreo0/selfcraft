@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Database } from 'bun:sqlite';
+import { eventSearchText, initializeMemorySearch, memoryQuery, memoryWords } from './memory-search';
 
 /** 可持久记忆的语义类型 */
 export type MemoryKind = 'identity' | 'fact' | 'preference' | 'relationship' | 'decision' | 'lesson';
@@ -84,6 +85,20 @@ export interface TopicRecord extends TopicInput {
 
 /** Reflection 或显式操作产生的记忆内容 */
 export interface MemoryCandidate {
+    /** 是否适合跨任务常驻 */
+    resident?: boolean;
+    /** 内容依据，不代表指令权限 */
+    basis?: 'stated' | 'observed' | 'inferred';
+    /** 事实、计划与假设影响自动生效 */
+    assertion?: 'established' | 'planned' | 'hypothetical';
+    /** 尚有未解决的矛盾时等待确认 */
+    needsConfirmation?: boolean;
+    /** Reflection 对已有认识的操作 */
+    operation?: 'add' | 'update' | 'reinforce';
+    /** 本次提供给 Reflection 的目标认识 */
+    targetId?: string;
+    /** 更新代表纠错还是现实变化 */
+    revisionKind?: MemoryRevisionKind;
     /** 记忆类型 */
     kind: MemoryKind;
     /** 独立、可理解的认识 */
@@ -116,6 +131,10 @@ export interface MemoryRevisionInput extends Omit<MemoryCandidate, 'sensitive'> 
 
 /** 对 Agent 可见的长期记忆 */
 export interface MemoryItem {
+    /** 是否适合跨任务常驻 */
+    resident: boolean;
+    /** 认识的依据类别 */
+    basis?: MemoryCandidate['basis'];
     /** 记忆标识 */
     id: string;
     /** 记忆类型 */
@@ -261,6 +280,7 @@ export interface EventEraseResult {
 }
 
 interface EventRow {
+    search_rank?: number;
     seq: number;
     id: string;
     actor: string;
@@ -287,6 +307,9 @@ interface TopicRow {
 }
 
 interface MemoryRow {
+    search_rank?: number;
+    resident: number;
+    basis: MemoryCandidate['basis'] | null;
     id: string;
     kind: MemoryKind;
     content: string;
@@ -346,6 +369,7 @@ export class MemoryStore {
         this.database.run('PRAGMA busy_timeout = 5000');
         this.database.run('PRAGMA foreign_keys = ON');
         this.migrate();
+        initializeMemorySearch(this.database);
     }
 
     /**
@@ -542,6 +566,7 @@ export class MemoryStore {
         const commit = this.database.transaction(() => this.insertMemory({
             ...candidate,
             sensitive: false,
+            basis: candidate.basis || 'stated',
         }, 'active'));
         return commit.immediate();
     }
@@ -580,6 +605,12 @@ export class MemoryStore {
                 ? normalizeTime(details.validTo, '现实失效时间')
                 : memory.validTo;
             assertOrderedInterval(validFrom, validTo, '现实有效时间');
+            if (memory.supersedesId) {
+                const previous = this.getMemory(memory.supersedesId);
+                if (!previous || !memory.revisionKind) throw new Error('候选修订目标不存在');
+                this.closeRevision(previous, memory.revisionKind, validFrom, knownFrom);
+            }
+
             for (const eventId of confirmationEventIds) {
                 this.database.query(`
                     INSERT OR IGNORE INTO memory_sources (memory_id, event_id)
@@ -588,7 +619,7 @@ export class MemoryStore {
             }
             this.database.query(`
                 UPDATE memories
-                SET status = 'active', valid_from = ?, valid_to = ?, known_from = ?, updated_at = ?
+                SET status = 'active', basis = 'stated', valid_from = ?, valid_to = ?, known_from = ?, updated_at = ?
                 WHERE id = ?
             `).run(validFrom || null, validTo || null, knownFrom, new Date().toISOString(), memoryId);
             for (const topicId of uniqueStrings(details.topicIds || [])) {
@@ -613,37 +644,15 @@ export class MemoryStore {
         }
         const commit = this.database.transaction(() => {
             const previous = this.getMemory(memoryId);
-            if (!previous || previous.status !== 'active') {
-                throw new Error('只能修订当前 active 记忆');
-            }
-            const now = replacement.knownFrom
-                ? normalizeTime(replacement.knownFrom, '认知时间')
-                : new Date().toISOString();
-            const previousStatus: MemoryStatus = replacement.revisionKind === 'correction'
-                ? 'retracted'
-                : 'superseded';
-            const replacementValidFrom = replacement.validFrom
-                ? normalizeTime(replacement.validFrom, '现实有效时间')
-                : undefined;
-            if (replacement.revisionKind === 'world_change'
-                && previous.validFrom
-                && replacementValidFrom
-                && replacementValidFrom <= previous.validFrom) {
-                throw new Error('现实变化生效时间必须晚于旧版本起点');
-            }
-            const closedValidTo = replacement.revisionKind === 'world_change'
-                && replacementValidFrom
-                && (!previous.validTo || previous.validTo > replacementValidFrom)
-                ? replacementValidFrom
-                : previous.validTo;
-            this.database.query(`
-                UPDATE memories
-                SET status = ?, valid_to = ?, known_to = ?, updated_at = ?
-                WHERE id = ?
-            `).run(previousStatus, closedValidTo || null, now, now, memoryId);
+            if (!previous || previous.status !== 'active') throw new Error('只能修订当前 active 记忆');
+            const now = replacement.knownFrom ? normalizeTime(replacement.knownFrom, '认知时间') : new Date().toISOString();
+            const replacementValidFrom = replacement.validFrom ? normalizeTime(replacement.validFrom, '现实有效时间') : undefined;
+            this.closeRevision(previous, replacement.revisionKind, replacementValidFrom, now);
             const topicIds = replacement.topicIds === undefined ? previous.topicIds : replacement.topicIds;
             return this.insertMemory({
                 ...replacement,
+                resident: replacement.resident ?? previous.resident,
+                basis: replacement.basis || 'stated',
                 sensitive: false,
                 ...(replacementValidFrom && { validFrom: replacementValidFrom }),
                 knownFrom: now,
@@ -651,6 +660,18 @@ export class MemoryStore {
             }, 'active', memoryId, replacement.revisionKind);
         });
         return commit.immediate();
+    }
+
+    /** 在调用方事务中关闭旧版本，候选确认与即时修订共用同一规则 */
+    private closeRevision (previous: MemoryItem, kind: MemoryRevisionKind, validFrom: string | undefined, knownFrom: string): void {
+        if (previous.status !== 'active') throw new Error('修订目标已变化，请重新核对最新认识');
+        if (kind === 'world_change' && (!validFrom || (previous.validFrom && validFrom <= previous.validFrom))) {
+            throw new Error('现实变化生效时间必须晚于旧版本起点');
+        }
+        const validTo = kind === 'world_change' && (!previous.validTo || previous.validTo > validFrom!)
+            ? validFrom : previous.validTo;
+        this.database.query('UPDATE memories SET status = ?, valid_to = ?, known_to = ?, updated_at = ? WHERE id = ?')
+            .run(kind === 'correction' ? 'retracted' : 'superseded', validTo || null, knownFrom, knownFrom, previous.id);
     }
 
     /**
@@ -672,19 +693,15 @@ export class MemoryStore {
      * @returns active 和 candidate 记忆，按相关性排序
      */
     public search (query = '', limit = 20): MemoryItem[] {
+        const match = memoryQuery(query);
+        if (query.trim() && !match) return [];
         const rows = this.database.query(`
-            SELECT * FROM memories
-            WHERE status IN ('active', 'candidate')
-            ORDER BY status = 'active' DESC, importance DESC, updated_at DESC
-        `).all() as MemoryRow[];
-        const normalizedQuery = normalize(query);
-        return rows.map(row => ({
-            row,
-            score: scoreMemory(row, normalizedQuery),
-        })).filter(entry => !normalizedQuery || entry.score > 0)
-            .sort((left, right) => right.score - left.score || right.row.importance - left.row.importance)
-            .slice(0, boundedLimit(limit, 100))
-            .map(entry => this.toMemoryItem(entry.row));
+            SELECT m.* FROM memories m
+            ${match ? 'JOIN memory_fts f ON f.rowid = m.rowid' : ''}
+            WHERE m.status IN ('active', 'candidate') ${match ? 'AND memory_fts MATCH ?' : ''}
+            ORDER BY ${match ? 'f.rank ASC,' : ''} m.importance DESC, m.id ASC LIMIT ?
+        `).all(...(match ? [match] : []), boundedLimit(limit, 100)) as MemoryRow[];
+        return rows.map(row => this.toMemoryItem(row));
     }
 
     /**
@@ -735,7 +752,7 @@ export class MemoryStore {
      * @param excludeEventIds 当前运行中不应被当作历史召回的事件
      * @returns 有序事件、匹配记忆和相关 Topic
      */
-    public recallEpisode (input: EpisodeRecallInput = {}, excludeEventIds: string[] = []): EpisodeView {
+    public recallEpisode (input: EpisodeRecallInput = {}, excludeEventIds: string[] = [], automatic = false): EpisodeView {
         const query = normalize(input.query || '');
         const excludedEvents = new Set(excludeEventIds);
         const explicitTopicIds = uniqueStrings(input.topicIds || []);
@@ -745,10 +762,9 @@ export class MemoryStore {
         const calendarMonthDay = input.calendarMonthDay
             ? normalizeMonthDay(input.calendarMonthDay)
             : undefined;
-        const eventRows = this.loadRecallEvents(input, explicitTopicIds, calendarMonthDay);
-        const memoryRows = this.loadRecallMemories(input, explicitTopicIds);
+        const eventRows = this.loadRecallEvents(input, explicitTopicIds, calendarMonthDay, queryTopicIds, excludeEventIds, automatic);
+        const memoryRows = this.loadRecallMemories(input, explicitTopicIds, queryTopicIds, automatic, excludeEventIds);
         const eventById = new Map(eventRows.map(row => [row.id, row]));
-        const memoryById = new Map(memoryRows.map(row => [row.id, row]));
         const selectedEvents = new Map<string, EventRow>();
         const selectedMemories = new Map<string, MemoryRow>();
         const hasEventCue = Boolean(input.from || input.to || calendarMonthDay || explicitTopicIds.length > 0);
@@ -760,9 +776,9 @@ export class MemoryStore {
                 continue;
             }
             const rowTopicIds = this.readEventTopicIds(row.id);
-            const textMatch = query ? eventMatchesQuery(row, query) : false;
+            const hasQuery = Boolean(query);
             const topicMatch = intersects(rowTopicIds, queryTopicIds);
-            if ((!query && (hasEventCue || !hasAnyCue)) || textMatch || topicMatch) {
+            if ((!query && (hasEventCue || !hasAnyCue)) || hasQuery || topicMatch) {
                 selectedEvents.set(row.id, row);
             }
         }
@@ -773,39 +789,36 @@ export class MemoryStore {
                 continue;
             }
             const rowTopicIds = this.readMemoryTopicIds(row.id);
-            const textMatch = query ? memoryMatchesQuery(row, query) : false;
+            const hasQuery = Boolean(query);
             const topicMatch = intersects(rowTopicIds, queryTopicIds);
-            if ((!query && (hasDirectMemoryCue || !hasAnyCue)) || textMatch || topicMatch) {
+            if ((!query && (hasDirectMemoryCue || !hasAnyCue)) || hasQuery || topicMatch) {
                 selectedMemories.set(row.id, row);
             }
         }
 
         const limitEvents = boundedLimit(input.limitEvents ?? 100, 500);
         const directEvents = [...selectedEvents.values()]
-            .sort(compareEvents)
-            .slice(-limitEvents);
+            .sort(query ? compareSearchRank : compareEvents)
+            .slice(query ? 0 : -limitEvents, query ? limitEvents : undefined);
         selectedEvents.clear();
         directEvents.forEach(row => selectedEvents.set(row.id, row));
 
-        // 先补齐直接事件关联的认识，再对最终 Memory 集合应用限额
-        for (const eventId of [...selectedEvents.keys()]) {
-            for (const memoryId of this.readEventMemoryIds(eventId)) {
-                const row = memoryById.get(memoryId);
-                if (row) {
-                    selectedMemories.set(memoryId, row);
-                }
-            }
+        // 证据命中也能带回认识，先按来源收窄，避免近期无关记忆占满限额
+        if (selectedEvents.size) {
+            const linked = this.loadRecallMemories({ ...input, query: undefined }, explicitTopicIds, [], automatic,
+                excludeEventIds, [...selectedEvents.keys()]);
+            for (const row of linked) if (!selectedMemories.has(row.id)) selectedMemories.set(row.id, row);
         }
 
         const limitMemories = boundedLimit(input.limitMemories ?? 50, 200);
         const memoryRowsWithinLimit = [...selectedMemories.values()]
-            .sort(compareMemories)
-            .slice(-limitMemories);
+            .sort(query ? compareSearchRank : compareMemories)
+            .slice(query ? 0 : -limitMemories, query ? limitMemories : undefined);
         selectedMemories.clear();
         memoryRowsWithinLimit.forEach(row => selectedMemories.set(row.id, row));
 
         // Memory 来源是 provenance closure，可能位于直接时间或 Topic 过滤之外
-        for (const memoryId of selectedMemories.keys()) {
+        for (const memoryId of automatic ? [] : selectedMemories.keys()) {
             for (const eventId of this.readMemorySourceIds(memoryId)) {
                 if (excludedEvents.has(eventId)) {
                     continue;
@@ -935,7 +948,7 @@ export class MemoryStore {
     }
 
     /**
-     * 提交 Reflection 结果，所有模型提取只保存为 candidate
+     * 提交单次 Reflection 结果，缺少明确陈述依据时保留候选
      *
      * @param jobId Reflection 标识
      * @param result 结构化结果
@@ -965,13 +978,15 @@ export class MemoryStore {
      *
      * @param jobIds 本次一起回看的 Reflection 标识
      * @param result 带事件级来源的结构化结果
+     * @returns 被跳过或降级为候选的操作说明，不包含记忆正文
      */
-    public completeReflections (jobIds: string[], result: ReflectionResult): void {
+    public completeReflections (jobIds: string[], result: ReflectionResult, visibleMemories: MemoryItem[] = []): Array<{ targetId?: string; reason: string }> {
         const ids = uniqueStrings(jobIds);
         if (ids.length === 0) {
             throw new Error('Reflection 批次不能为空');
         }
         const commit = this.database.transaction(() => {
+            const notices: Array<{ targetId?: string; reason: string }> = [];
             const jobs = this.database.query(`
                 SELECT id, event_ids FROM memory_reflections
                 WHERE id IN (${placeholders(ids.length)}) AND status = 'running'
@@ -993,11 +1008,71 @@ export class MemoryStore {
                     continue;
                 }
                 const sourceEventIds = requireReflectionSources(memory.sourceEventIds, allowedEvents);
-                const existing = sourceEventIds[0]
-                    ? this.findMemoryFromEvent(memory.kind, memory.content, sourceEventIds[0])
-                    : null;
+                if (sourceEventIds.some(id => this.isSourceForgotten(id))) continue;
+                const operation = memory.operation || 'add';
+                const target = memory.targetId ? this.getMemory(memory.targetId) : null;
+                if (operation !== 'add') {
+                    const shown = visibleMemories.find(item => item.id === memory.targetId);
+                    if (!shown || !target || !['active', 'candidate'].includes(target.status)
+                        || target.updatedAt !== shown.updatedAt || target.status !== shown.status) {
+                        notices.push({ targetId: memory.targetId, reason: '跳过：Reflection 修订目标不可用或已变化' });
+                        continue;
+                    }
+                }
+                if (operation === 'reinforce') {
+                    for (const eventId of sourceEventIds) this.database.query(
+                        'INSERT OR IGNORE INTO memory_sources (memory_id, event_id) VALUES (?, ?)',
+                    ).run(target!.id, eventId);
+                    continue;
+                }
+                const canActivate = memory.basis === 'stated' && memory.assertion === 'established'
+                    && memory.needsConfirmation === false && this.getEvents(sourceEventIds).every(event => event.actor === 'user');
+                const candidate = { ...memory, sourceEventIds };
+                // 仅隔离可预期的日期校验错误；数据库写入仍由外层事务统一保证
+                try {
+                    for (const field of ['validFrom', 'validTo', 'knownFrom', 'knownTo'] as const) {
+                        if (candidate[field]) candidate[field] = normalizeTime(candidate[field], field);
+                    }
+                    assertOrderedInterval(candidate.validFrom, candidate.validTo, '现实有效时间');
+                    assertOrderedInterval(candidate.knownFrom || new Date().toISOString(), candidate.knownTo, '认知时间');
+                    if (operation === 'update' && memory.revisionKind === 'world_change'
+                        && candidate.validFrom && target!.validFrom && candidate.validFrom <= target!.validFrom) {
+                        throw new Error('现实变化生效时间必须晚于旧版本起点');
+                    }
+                } catch (error) {
+                    notices.push({ targetId: memory.targetId, reason: `跳过：${error instanceof Error ? error.message : String(error)}` });
+                    continue;
+                }
+                if (operation === 'update') {
+                    if (target!.status !== 'active' || !memory.revisionKind) {
+                        notices.push({ targetId: memory.targetId, reason: '跳过：修订需要 active 目标和修订类型' });
+                        continue;
+                    }
+                    candidate.resident ??= target!.resident;
+                    candidate.topicIds ??= target!.topicIds;
+                    const missingChangeTime = memory.revisionKind === 'world_change' && !memory.validFrom;
+                    if (missingChangeTime) notices.push({ targetId: memory.targetId, reason: '保留候选：现实变化缺少生效时间' });
+                    if (canActivate && !missingChangeTime) {
+                        this.reviseMemory(target!.id, { ...candidate, revisionKind: memory.revisionKind });
+                    } else {
+                        this.insertMemory(candidate, 'candidate', target!.id, memory.revisionKind);
+                    }
+                    continue;
+                }
+                // 同一事件已被修订的提取结果不能通过重复 add 恢复旧认识
+                const prior = this.findMemoryFromEvent(memory.kind, memory.content, sourceEventIds[0]!);
+                if (prior && (!['active', 'candidate'].includes(prior.status)
+                    || (prior.status === 'candidate' && prior.supersedesId))) continue;
+                const existing = this.findDuplicateMemory(candidate);
                 if (!existing) {
-                    this.insertMemory({ ...memory, sourceEventIds }, 'candidate');
+                    this.insertMemory(candidate, canActivate ? 'active' : 'candidate');
+                } else if (existing.status === 'candidate' && canActivate) {
+                    // 重复证据本身不构成确认；只有本次陈述满足原有生效条件才激活
+                    this.confirmMemory(existing.id, sourceEventIds);
+                } else {
+                    for (const eventId of sourceEventIds) this.database.query(
+                        'INSERT OR IGNORE INTO memory_sources (memory_id, event_id) VALUES (?, ?)',
+                    ).run(existing.id, eventId);
                 }
             }
             for (const growth of result.growth) {
@@ -1005,6 +1080,7 @@ export class MemoryStore {
                     continue;
                 }
                 const sourceEventIds = requireReflectionSources(growth.sourceEventIds, allowedEvents);
+                if (sourceEventIds.some(id => this.isSourceForgotten(id))) continue;
                 const reflectionIds = uniqueStrings(sourceEventIds.flatMap(
                     eventId => reflectionIdsByEvent.get(eventId) || [],
                 ));
@@ -1016,8 +1092,9 @@ export class MemoryStore {
                     reflection_output = NULL, reflection_error = NULL
                 WHERE id IN (${placeholders(ids.length)})
             `).run(new Date().toISOString(), ...ids);
+            return notices;
         });
-        commit.immediate();
+        return commit.immediate();
     }
 
     /**
@@ -1138,32 +1215,61 @@ export class MemoryStore {
      * @returns 可注入系统提示的结构化文本
      */
     public buildContext (query: string, excludeEventIds: string[] = []): string {
-        const episode = this.recallEpisode({
-            query,
-            limitEvents: MAX_CONTEXT_EVENTS,
-            limitMemories: MAX_CONTEXT_MEMORIES,
-        }, excludeEventIds);
-        const events = episode.events;
-        const memories = episode.memories.filter(memory => memory.status === 'active');
-        return [
-            '<structured-memory>',
-            memories.length > 0
-                ? memories.map(memory => [
-                    `- [${memory.id}] (${memory.kind}) ${memory.content}`,
-                    memory.validFrom ? `valid-from=${memory.validFrom}` : '',
-                ].filter(Boolean).join(' ')).join('\n')
-                : '尚无与当前任务相关的 active 记忆',
-            '</structured-memory>',
-            '',
-            '<relevant-events>',
-            events.length > 0
-                ? events.map(event => {
-                    const payload = truncate(JSON.stringify(event.payload), 600);
-                    return `- [${event.id}] ${event.occurredFrom} ${event.actor}/${event.type}: ${payload}`;
-                }).join('\n')
-                : '尚无与当前任务相关的历史事件',
-            '</relevant-events>',
+        const episode = this.recallEpisode({ query, limitEvents: MAX_CONTEXT_EVENTS, limitMemories: MAX_CONTEXT_MEMORIES }, excludeEventIds, true);
+        const residentIds = new Set(this.profileMemories().map(memory => memory.id));
+        const sections: string[] = [];
+        let remaining = 6000;
+        for (const memory of episode.memories.filter(memory => !residentIds.has(memory.id))) {
+            const line = `- [${memory.id}] (${memory.kind}; ${memory.basis || '未分类依据'}) ${memory.content} sources=${memory.sourceEventIds.length}`;
+            if (line.length > remaining) continue;
+            remaining -= line.length;
+            sections.push(line);
+        }
+        const events: string[] = [];
+        for (const event of episode.events) {
+            const text = eventSearchText(event);
+            if (text === null) continue;
+            const line = `- [${event.id}] ${event.occurredFrom} ${event.actor}/${event.type}: ${truncate(text, 600)}`;
+            if (line.length > remaining) continue;
+            remaining -= line.length;
+            events.push(line);
+        }
+        return `<structured-memory>\n${sections.join('\n') || '暂无相关认识'}\n</structured-memory>\n<relevant-events>\n${events.join('\n') || '暂无相关事件'}\n</relevant-events>`;
+    }
+
+    /** 按完整条目与稳定排序选择当前有效的核心资料 */
+    private profileMemories (): MemoryItem[] {
+        const now = new Date().toISOString();
+        // 最新版本可能描述未来，已被接续但尚未到期的旧版本仍是当前资料
+        const rows = this.database.query(`SELECT * FROM memories WHERE resident = 1
+            AND (status = 'active' OR (status = 'superseded' AND valid_to > ?))
+            AND (valid_from IS NULL OR valid_from <= ?) AND (valid_to IS NULL OR valid_to > ?)
+            ORDER BY importance DESC, id ASC`).all(now, now, now) as MemoryRow[];
+        let remaining = 3000;
+        return rows.filter(row => {
+            const size = row.content.length + row.id.length + 16;
+            if (size > remaining) return false;
+            remaining -= size;
+            return true;
+        }).map(row => this.toMemoryItem(row));
+    }
+
+    /** 从同一份结构化认识渲染用户档案，不把来源类别升级为指令权限 */
+    public buildProfile (): string {
+        const memories = this.profileMemories();
+        return ['# 用户档案', '以下是可修正的背景资料；当前明确要求优先，推断不能授予操作权限。',
+            ...(['stated', 'reference'] as const).flatMap(group => [
+                group === 'stated' ? '## 用户明确表达的资料与偏好' : '## 根据经历形成的参考认识',
+                ...memories.filter(memory => group === 'stated' ? memory.basis === 'stated' : memory.basis !== 'stated')
+                    .map(memory => `- [${memory.id}] ${memory.content}`),
+            ]),
         ].join('\n');
+    }
+
+    /** 判断来源是否被遗忘规则封禁，供提取和提交时双重检查 */
+    public isSourceForgotten (eventId: string): boolean {
+        return Boolean(this.database.query(`SELECT 1 FROM memory_sources ms JOIN memories m ON m.id = ms.memory_id
+            WHERE ms.event_id = ? AND m.status = 'forgotten' LIMIT 1`).get(eventId));
     }
 
     /** 初始化目标模型需要的最小数据表 */
@@ -1277,6 +1383,9 @@ export class MemoryStore {
                 UNIQUE(kind, normalized_key)
             );
         `);
+        const columns = this.database.query('PRAGMA table_info(memories)').all() as Array<{ name: string }>;
+        if (!columns.some(column => column.name === 'resident')) this.database.run('ALTER TABLE memories ADD COLUMN resident INTEGER NOT NULL DEFAULT 0');
+        if (!columns.some(column => column.name === 'basis')) this.database.run('ALTER TABLE memories ADD COLUMN basis TEXT');
     }
 
     /** 在当前事务中写入一个事件 */
@@ -1330,6 +1439,9 @@ export class MemoryStore {
         for (const topicId of uniqueStrings(input.topicIds || [])) {
             this.linkEventTopic(id, topicId);
         }
+        const indexedText = eventSearchText(input);
+        if (indexedText !== null) this.database.query('INSERT INTO event_fts(rowid, text) SELECT rowid, ? FROM events WHERE id = ?')
+            .run(memoryWords(indexedText).join(' '), id);
         return this.getEvent(id)!;
     }
 
@@ -1353,8 +1465,8 @@ export class MemoryStore {
             INSERT INTO memories (
                 id, kind, content, normalized_content, confidence, importance, status,
                 valid_from, valid_to, known_from, known_to, supersedes_id,
-                revision_kind, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                revision_kind, created_at, updated_at, resident, basis
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
             id,
             candidate.kind,
@@ -1371,7 +1483,11 @@ export class MemoryStore {
             revisionKind || null,
             now,
             now,
+            candidate.resident ? 1 : 0,
+            candidate.basis || null,
         );
+        this.database.query('INSERT INTO memory_fts(rowid, text) SELECT rowid, ? FROM memories WHERE id = ?')
+            .run(memoryWords(content).join(' '), id);
         for (const eventId of uniqueStrings(candidate.sourceEventIds || [])) {
             this.database.query(`
                 INSERT INTO memory_sources (memory_id, event_id)
@@ -1389,6 +1505,9 @@ export class MemoryStore {
         input: EpisodeRecallInput,
         topicIds: string[],
         calendarMonthDay?: string,
+        queryTopicIds: string[] = [],
+        excludeEventIds: string[] = [],
+        automatic = false,
     ): EventRow[] {
         const conditions: string[] = [];
         const parameters: string[] = [];
@@ -1413,16 +1532,50 @@ export class MemoryStore {
             )`);
             parameters.push(...topicIds);
         }
+        if (excludeEventIds.length) {
+            conditions.push(`e.id NOT IN (${placeholders(excludeEventIds.length)})`);
+            parameters.push(...excludeEventIds);
+        }
+        if (automatic) {
+            conditions.push('e.rowid IN (SELECT rowid FROM event_fts)');
+            conditions.push("NOT EXISTS (SELECT 1 FROM memory_sources ms JOIN memories m ON m.id = ms.memory_id WHERE ms.event_id = e.id AND m.status = 'forgotten')");
+        }
+        const match = memoryQuery(input.query || '');
+        if (input.query?.trim() && !match && !queryTopicIds.length) return [];
+        if (match) {
+            const topicMatch = queryTopicIds.length ? ` OR EXISTS (SELECT 1 FROM event_topics et WHERE et.event_id = e.id AND et.topic_id IN (${placeholders(queryTopicIds.length)}))` : '';
+            conditions.push(`(f.rowid IS NOT NULL${topicMatch})`);
+            parameters.push(...queryTopicIds);
+        }
+        if (!match && input.query?.trim() && queryTopicIds.length) {
+            conditions.push(`EXISTS (SELECT 1 FROM event_topics et WHERE et.event_id = e.id AND et.topic_id IN (${placeholders(queryTopicIds.length)}))`);
+            parameters.push(...queryTopicIds);
+        }
         const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
         return this.database.query(`
-            SELECT e.* FROM events e ${where} ORDER BY e.seq ASC
-        `).all(...parameters) as EventRow[];
+            SELECT e.* ${match ? ', f.rank AS search_rank' : ''} FROM events e
+            ${match ? `${queryTopicIds.length ? 'LEFT JOIN' : 'JOIN'} (SELECT rowid, rank FROM event_fts WHERE event_fts MATCH ?) f ON f.rowid = e.rowid` : ''}
+            ${where} ORDER BY ${match ? 'COALESCE(f.rank, 0) ASC,' : ''} e.seq DESC LIMIT ?
+        `).all(...(match ? [match] : []), ...parameters, boundedLimit(input.limitEvents ?? 100, 500)) as EventRow[];
     }
 
     /** 读取满足 Episode 时态和 Topic 约束的记忆候选 */
-    private loadRecallMemories (input: EpisodeRecallInput, topicIds: string[]): MemoryRow[] {
+    private loadRecallMemories (input: EpisodeRecallInput, topicIds: string[], queryTopicIds: string[] = [], automatic = false, excluded: string[] = [], linkedEvents: string[] = []): MemoryRow[] {
         const conditions: string[] = ["m.status NOT IN ('candidate', 'forgotten')"];
         const parameters: string[] = [];
+        conditions.push(`EXISTS (SELECT 1 FROM memory_sources ms WHERE ms.memory_id = m.id${excluded.length ? ` AND ms.event_id NOT IN (${placeholders(excluded.length)})` : ''})`);
+        parameters.push(...excluded);
+        if (linkedEvents.length) {
+            conditions.push(`EXISTS (SELECT 1 FROM memory_sources ms WHERE ms.memory_id = m.id AND ms.event_id IN (${placeholders(linkedEvents.length)}))`);
+            parameters.push(...linkedEvents);
+        }
+        if (automatic) {
+            const residentIds = this.profileMemories().map(memory => memory.id);
+            if (residentIds.length) {
+                conditions.push(`m.id NOT IN (${placeholders(residentIds.length)})`);
+                parameters.push(...residentIds);
+            }
+        }
         if (input.knownAt) {
             conditions.push("m.status IN ('active', 'superseded', 'retracted')");
             const knownAt = normalizeTime(input.knownAt, '认知查询时间');
@@ -1430,6 +1583,9 @@ export class MemoryStore {
             parameters.push(knownAt, knownAt);
         } else if (input.validAt || input.from || input.to) {
             conditions.push("m.status IN ('active', 'superseded')");
+        } else if (automatic) {
+            conditions.push("(m.status = 'active' OR (m.status = 'superseded' AND m.valid_to > ?))");
+            parameters.push(new Date().toISOString());
         } else {
             conditions.push("m.status = 'active'");
         }
@@ -1457,11 +1613,28 @@ export class MemoryStore {
             )`);
             parameters.push(...topicIds);
         }
+        if (automatic) {
+            const now = new Date().toISOString();
+            conditions.push('(m.valid_from IS NULL OR m.valid_from <= ?) AND (m.valid_to IS NULL OR m.valid_to > ?)');
+            parameters.push(now, now);
+        }
+        const match = memoryQuery(input.query || '');
+        if (input.query?.trim() && !match && !queryTopicIds.length) return [];
+        if (match) {
+            const topicMatch = queryTopicIds.length ? ` OR EXISTS (SELECT 1 FROM memory_topics mt WHERE mt.memory_id = m.id AND mt.topic_id IN (${placeholders(queryTopicIds.length)}))` : '';
+            conditions.push(`(f.rowid IS NOT NULL${topicMatch})`);
+            parameters.push(...queryTopicIds);
+        }
+        if (!match && input.query?.trim() && queryTopicIds.length) {
+            conditions.push(`EXISTS (SELECT 1 FROM memory_topics mt WHERE mt.memory_id = m.id AND mt.topic_id IN (${placeholders(queryTopicIds.length)}))`);
+            parameters.push(...queryTopicIds);
+        }
         return this.database.query(`
-            SELECT m.* FROM memories m
+            SELECT m.* ${match ? ', f.rank AS search_rank' : ''} FROM memories m
+            ${match ? `${queryTopicIds.length ? 'LEFT JOIN' : 'JOIN'} (SELECT rowid, rank FROM memory_fts WHERE memory_fts MATCH ?) f ON f.rowid = m.rowid` : ''}
             WHERE ${conditions.join(' AND ')}
-            ORDER BY m.known_from ASC, m.updated_at ASC
-        `).all(...parameters) as MemoryRow[];
+            ORDER BY ${match ? 'COALESCE(f.rank, 0) ASC,' : ''} COALESCE(m.valid_from, m.known_from) DESC, m.id ASC LIMIT ?
+        `).all(...(match ? [match] : []), ...parameters, boundedLimit(input.limitMemories ?? 50, 200)) as MemoryRow[];
     }
 
     /** 将事件数据库行转换为公开结构 */
@@ -1492,6 +1665,8 @@ export class MemoryStore {
             id: row.id,
             kind: row.kind,
             content: row.content,
+            resident: Boolean(row.resident),
+            ...(row.basis && { basis: row.basis }),
             confidence: row.confidence,
             importance: row.importance,
             status: row.status,
@@ -1531,22 +1706,36 @@ export class MemoryStore {
         return rows.map(row => row.event_id);
     }
 
-    /** 读取由事件直接支撑的记忆 */
-    private readEventMemoryIds (eventId: string): string[] {
+    /** 查找同一来源已生成的同文认识，防止旧提取结果复活已修订版本 */
+    private findMemoryFromEvent (kind: MemoryKind, content: string, eventId: string): MemoryItem | null {
         const rows = this.database.query(`
-            SELECT memory_id FROM memory_sources WHERE event_id = ? ORDER BY memory_id
-        `).all(eventId) as Array<{ memory_id: string }>;
-        return rows.map(row => row.memory_id);
+            SELECT m.* FROM memories m JOIN memory_sources ms ON ms.memory_id = m.id
+            WHERE m.kind = ? AND m.normalized_content = ? AND ms.event_id = ?
+        `).all(kind, normalize(content), eventId) as MemoryRow[];
+        const fullContent = content.trim().toLocaleLowerCase().replace(/\s+/g, ' ');
+        const row = rows.find(item => item.content.trim().toLocaleLowerCase().replace(/\s+/g, ' ') === fullContent);
+        return row ? this.toMemoryItem(row) : null;
     }
 
-    /** 判断同一 Reflection 事件是否已经生成相同候选 */
-    private findMemoryFromEvent (kind: MemoryKind, content: string, eventId: string): MemoryItem | null {
-        const row = this.database.query(`
-            SELECT m.* FROM memories m
-            INNER JOIN memory_sources ms ON ms.memory_id = m.id
-            WHERE m.kind = ? AND m.normalized_content = ? AND ms.event_id = ?
-            LIMIT 1
-        `).get(kind, normalize(content), eventId) as MemoryRow | null;
+    /** 查找同文、同事项与同有效区间的认识；待确认修订必须继续走修订流程 */
+    private findDuplicateMemory (candidate: MemoryCandidate): MemoryItem | null {
+        const rows = this.database.query(`
+            SELECT * FROM memories
+            WHERE kind = ? AND normalized_content = ? AND status IN ('active', 'candidate')
+                AND (status = 'active' OR supersedes_id IS NULL)
+                AND valid_from IS ? AND valid_to IS ? AND known_to IS ?
+            ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, id
+        `).all(candidate.kind, normalize(candidate.content), candidate.validFrom || null,
+            candidate.validTo || null, candidate.knownTo || null) as MemoryRow[];
+        const content = candidate.content.trim().toLocaleLowerCase().replace(/\s+/g, ' ');
+        const topics = uniqueStrings(candidate.topicIds || []).sort();
+        const row = rows.find(item => {
+            // normalized_content 有长度上限，不能用相同前缀代替全文一致
+            if (item.content.trim().toLocaleLowerCase().replace(/\s+/g, ' ') !== content) return false;
+            if (candidate.knownFrom && candidate.knownFrom !== item.known_from) return false;
+            const existingTopics = this.readMemoryTopicIds(item.id);
+            return topics.length === existingTopics.length && topics.every((id, index) => id === existingTopics[index]);
+        });
         return row ? this.toMemoryItem(row) : null;
     }
 
@@ -1819,14 +2008,9 @@ function intersects (left: string[], right: string[]): boolean {
     return left.some(value => rightSet.has(value));
 }
 
-/** 判断事件文本是否匹配检索词 */
-function eventMatchesQuery (row: EventRow, query: string): boolean {
-    return textMatchesQuery(`${row.actor} ${row.event_type} ${row.payload}`, query);
-}
-
-/** 判断记忆文本是否匹配检索词 */
-function memoryMatchesQuery (row: MemoryRow, query: string): boolean {
-    return textMatchesQuery(row.normalized_content, query);
+/** FTS 负分越小越相关；Topic 命中在直接文本命中之后 */
+function compareSearchRank (left: { search_rank?: number }, right: { search_rank?: number }): number {
+    return (left.search_rank ?? 0) - (right.search_rank ?? 0);
 }
 
 /** 按发生时间和稳定序号排序事件 */
@@ -1838,20 +2022,6 @@ function compareEvents (left: EventRow, right: EventRow): number {
 function compareMemories (left: MemoryRow, right: MemoryRow): number {
     return (left.valid_from || left.known_from).localeCompare(right.valid_from || right.known_from)
         || left.known_from.localeCompare(right.known_from);
-}
-
-/** 使用简单文本匹配计算无向量依赖的召回分数 */
-function scoreMemory (row: MemoryRow, query: string): number {
-    const base = row.importance * 2 + row.confidence;
-    if (!query) {
-        return base;
-    }
-    if (row.normalized_content.includes(query) || query.includes(row.normalized_content)) {
-        return base + 5;
-    }
-    const fragments = queryFragments(query);
-    const matches = fragments.filter(fragment => row.normalized_content.includes(fragment)).length;
-    return hasEnoughFragmentMatches(matches, fragments.length) ? base + matches : 0;
 }
 
 /** 判断文本是否匹配完整查询或足够多的中英文片段 */

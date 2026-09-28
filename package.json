@@ -21,6 +21,7 @@
         "runtime": "bun run src/runtime-entry.ts",
         "doctor": "bun run src/doctor.ts",
         "smoke": "bun run scripts/smoke.ts",
+        "smoke:memory": "bun run scripts/memory-smoke.ts",
         "smoke:evolution": "bun run scripts/evolution-smoke.ts",
         "smoke:provider": "bun run scripts/provider-smoke.ts",
         "test": "bun test",

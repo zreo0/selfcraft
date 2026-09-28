@@ -1,3 +1,4 @@
+import { wrapLanguageModel } from 'ai';
 import { AttachmentStore } from '../src/attachment/attachment-store';
 import { ModelFactory } from '../src/model/model-factory';
 import { ExecutionStore } from '../src/execution/execution-store';
@@ -80,6 +81,9 @@ async function main (): Promise<void> {
         );
         const attachments = new AttachmentStore(home);
         const tools = createTools(paths.workspace, skills, notifications, evolution, jobs, memory, undefined, undefined, executions, works, [attachments, () => ModelFactory.createVision(config, logger)]);
+        let inspectProfile = false;
+        let correctionCommitted = false;
+        let nextProfile: string | undefined;
         const createAgent = () => new AgentRuntime(
             config,
             workspace,
@@ -95,7 +99,21 @@ async function main (): Promise<void> {
             },
             tools,
             logger,
-            undefined,
+            () => {
+                const active = ModelFactory.create(config, 'agent', logger);
+                if (!inspectProfile) return active;
+                if (typeof active.model === 'string') throw new Error('验收需要具体模型实例');
+                return { ...active, model: wrapLanguageModel({ model: active.model, middleware: {
+                    transformParams: async ({ params }) => {
+                        if (correctionCommitted && nextProfile === undefined) {
+                            const system = params.prompt.filter(message => message.role === 'system')
+                                .map(message => message.content).join('\n');
+                            nextProfile = system.match(/<user-profile>[\s\S]*?<\/user-profile>/)?.[0] || '';
+                        }
+                        return params;
+                    },
+                } }) };
+            },
             executions,
             works,
             attachments,
@@ -126,6 +144,25 @@ async function main (): Promise<void> {
         });
         if (!secondReply.includes('SC-2718')) {
             throw new Error(`会话恢复验收失败: ${secondReply}`);
+        }
+        // 在真实工具调用开始时插话，观察纠正成功后的下一次模型请求
+        const evidence = memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '我的验收联系城市是上海' } });
+        const oldContact = memory.remember({ kind: 'fact', content: '用户的验收联系城市是上海', confidence: 1,
+            importance: 1, resident: true, sourceEventIds: [evidence.id] });
+        let inserted = false;
+        let correctionReply = '';
+        inspectProfile = true;
+        await createAgent().run('先用 read 读取 files/smoke.txt，再根据常驻用户档案回答我的验收联系城市。这轮直接完成，不创建事项。', event => {
+            if (event.type === 'activity' && event.activity.toolName === 'read' && event.activity.state === 'running' && !inserted) {
+                inserted = true;
+                executions.accept('smoke-correction-input', '纠正一下：我的验收联系城市其实一直是苏州，之前的上海是记录错误。请立即用 memory_correct 纠正这条记忆，然后只回复正确的城市。', 'foreground');
+            }
+            if (event.type === 'activity' && event.activity.toolName === 'memory_correct' && event.activity.state === 'success') correctionCommitted = true;
+            if (event.type === 'text-delta') correctionReply += event.delta;
+        }, { executionId: 'smoke-live-correction', inbox: () => executions.collect('smoke-live-correction') });
+        inspectProfile = false;
+        if (!inserted || !correctionCommitted || !nextProfile?.includes('苏州') || nextProfile.includes(oldContact.id) || memory.getMemory(oldContact.id)?.status !== 'retracted' || !correctionReply.includes('苏州')) {
+            throw new Error(`运行中纠正验收失败: ${JSON.stringify({ inserted, correctionCommitted, nextProfile, correctionReply })}`);
         }
         if (visionModelId) {
             // 自包含的红蓝色块用于验证真实像素输入，不依赖文件名或远程图片
@@ -196,6 +233,7 @@ async function main (): Promise<void> {
             contextHandoffs: 2,
             historyLookup: true,
             latestCorrection: true,
+            inFlightMemoryCorrection: true,
             ...(visionModelId && { nativeImage: true, auxiliaryVision: true, imageRestore: true }),
         }, null, 4));
     } finally {

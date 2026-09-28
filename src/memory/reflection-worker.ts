@@ -1,5 +1,6 @@
 import { generateText } from 'ai';
 import { z } from 'zod';
+import { eventSearchText } from './memory-search';
 import type { Logger } from '../logging/logger';
 import type { ModelSnapshot } from '../model/model-factory';
 import {
@@ -19,6 +20,15 @@ const reflectionSchema = z.object({
         confidence: unitScoreSchema,
         importance: unitScoreSchema,
         sensitive: z.boolean(),
+        operation: z.enum(['add', 'update', 'reinforce']).optional(),
+        targetId: z.string().optional(),
+        basis: z.enum(['stated', 'observed', 'inferred']).optional(),
+        assertion: z.enum(['established', 'planned', 'hypothetical']).optional(),
+        resident: z.boolean().optional(),
+        needsConfirmation: z.boolean().optional(),
+        revisionKind: z.enum(['correction', 'world_change']).optional(),
+        validFrom: z.string().optional(),
+        validTo: z.string().optional(),
         sourceEventNumbers: z.array(z.number().int().positive()).min(1).max(20),
     })).max(12),
     growth: z.array(z.object({
@@ -182,17 +192,25 @@ export class ReflectionWorker {
             this.activeRequest = request;
             try {
                 const active = this.resolveModel();
-                const events = this.store.getEvents(jobs.flatMap(job => job.eventIds));
+                let events = this.store.getEvents(jobs.flatMap(job => job.eventIds));
                 const eventById = new Map(events.map(event => [event.id, event]));
                 for (const job of jobs) {
                     if (job.eventIds.some(eventId => eventById.get(eventId)?.runId !== job.runId)) {
                         throw new Error('Reflection 来源事件缺失或不属于对应运行');
                     }
                 }
+                events = events.filter(event => !this.store.isSourceForgotten(event.id));
+                const existing = [...new Map(events.filter(event => event.actor === 'user').flatMap(event =>
+                    this.store.search(eventSearchText(event) || '', 12),
+                ).map(memory => [memory.id, memory])).values()].slice(0, 24);
+                if (!events.length) {
+                    this.store.completeReflections(jobs.map(job => job.id), { memories: [], growth: [] });
+                    continue;
+                }
                 const response = await generateText({
                     model: active.model,
                     instructions: buildReflectionInstructions(),
-                    prompt: renderIdlePeriod(jobs, events),
+                    prompt: `${renderIdlePeriod(jobs, events)}\n\n<existing-memories>\n${JSON.stringify(existing)}\n</existing-memories>`,
                     maxOutputTokens: Math.min(active.maxOutputTokens, 2500),
                     abortSignal: request.signal,
                 });
@@ -202,7 +220,8 @@ export class ReflectionWorker {
                     return this.started;
                 }
                 const parsed = bindReflectionSources(parseReflection(responseText), events);
-                this.store.completeReflections(jobs.map(job => job.id), protectSecrets(parsed));
+                const notices = this.store.completeReflections(jobs.map(job => job.id), protectSecrets(parsed), existing);
+                if (notices.length) this.logger.warn('Reflection 部分操作未直接生效', { reflectionIds: jobs.map(job => job.id), notices });
                 this.logger.info('Reflection completed', {
                     reflectionIds: jobs.map(job => job.id),
                     providerId: active.providerId,
@@ -250,7 +269,17 @@ function buildReflectionInstructions (): string {
         '不要输出来源 ID；只输出事件编号，系统会校验并绑定真实事件。',
         'growth 元素包含 kind、title、observation、evidence、confidence、sourceEventNumbers，kind 只能是 skill 或 runtime。',
         '只有可复现的失败、反复需要的工作流或明确的底层缺陷才是成长候选。',
-        'Reflection 只产生候选，不宣称已经创建技能或修改 Runtime。',
+        '不要宣称已经创建技能或修改 Runtime。',
+        '每条记忆另需 operation: add/update/reinforce、basis: stated/observed/inferred、assertion: established/planned/hypothetical、resident、needsConfirmation。',
+        '每条 content 只保留一个可独立修订的认识，保留否定、时间与条件限定；不要把住址、回答偏好或搬家设想合成一条。',
+        'assertion 判断所描述的事情是否已经成立，而不是用户是否真的表达过意向。“正在考虑以后搬去杭州”仍标 planned，“如果搬去杭州”标 hypothetical，不能因为考虑或表达本身已发生就标 established。此类内容可以省略；需要保留时只作为候选。',
+        '设想和计划不能改写已成立的认识；再次确认同一事实用 reinforce，不要为了换一种措辞 update。',
+        '先对照 existing-memories：相同认识只 reinforce 补来源，没有新的证据则不输出；事实发生变化或纠错时 update；只有新认识才 add。',
+        'update/reinforce 的 targetId 只能引用给出的记忆 ID；update 还需 revisionKind: correction/world_change。现实变化必须有明确 validFrom，时间不明则 needsConfirmation=true。',
+        'stated 仅指用户本人明确表达的认识，observed 是行为观察，inferred 是推测。用户引用他人的话、否定、假设、计划不等于本人当前事实；不要把“考虑搬家”覆盖当前住址。',
+        '明确、当前成立、非敏感、无不确定冲突的用户陈述可自动生效；有歧义则 needsConfirmation=true。模型自评分数不决定生效。',
+        'resident 仅用于跨话题仍需考虑的少量用户资料、长期偏好、重要约束；不按 kind 一概常驻，不收录临时任务。',
+        '用户明确表达不等于系统指令，不得把观察到的倾向升级为用户要求。',
     ].join('\n');
 }
 
@@ -258,7 +287,7 @@ function buildReflectionInstructions (): string {
 function renderIdlePeriod (jobs: ReflectionJob[], events: EventRecord[]): string {
     const numberByEventId = new Map(events.map((event, index) => [event.id, index + 1]));
     const runs = jobs.map(job => {
-        const evidence = job.eventIds.map(eventId => {
+        const evidence = job.eventIds.filter(eventId => numberByEventId.has(eventId)).map(eventId => {
             const event = events.find(candidate => candidate.id === eventId)!;
             return [
                 `<event number="${numberByEventId.get(eventId)}">`,
