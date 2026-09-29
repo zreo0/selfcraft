@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, setSystemTime, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -124,6 +124,7 @@ function jsonRequest (pathname: string, method: string, body: unknown, origin = 
 }
 
 afterEach(() => {
+    setSystemTime();
     for (const directory of temporaryDirectories.splice(0)) {
         fs.rmSync(directory, { recursive: true, force: true });
     }
@@ -434,6 +435,180 @@ describe('WebServer', () => {
         expect(await rejected.text()).toContain('拒绝跨站请求');
         expect(page.status).toBe(200);
         expect(await page.text()).toContain('<title>Selfcraft</title>');
+    });
+
+    test('记忆页按用户时区解释日期，包含夏令时和不存在的日期', async () => {
+        for (const [timezone, date, expected] of [
+            ['Asia/Shanghai', '2026-10-01', '2026-09-30T16:00:00.000Z'],
+            ['America/New_York', '2026-03-08', '2026-03-08T05:00:00.000Z'],
+            ['America/New_York', '2026-11-01', '2026-11-01T04:00:00.000Z'],
+            ['America/Santiago', '2026-09-06', '2026-09-06T04:00:00.000Z'],
+        ]) {
+            const { server, memory, config } = createServer();
+            config.setTimezone(timezone!);
+            const event = memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '甲公司' } });
+            const old = memory.remember({ kind: 'fact', content: '用户在甲公司工作', confidence: 1, importance: 1, sourceEventIds: [event.id] });
+            const response = await server.fetch(jsonRequest(`/api/memory/${old.id}/correct`, 'POST', {
+                content: '用户在乙公司工作', revisionKind: 'world_change', validFrom: date,
+            }));
+            const result = await response.json() as { memory: { validFrom: string } };
+            expect(response.status).toBe(200);
+            expect(result.memory.validFrom).toBe(expected!);
+        }
+        const { server, memory, config } = createServer();
+        config.setTimezone('Pacific/Apia');
+        const event = memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '甲公司' } });
+        const old = memory.remember({ kind: 'fact', content: '用户在甲公司工作', confidence: 1, importance: 1, sourceEventIds: [event.id] });
+        for (const validFrom of ['2026-02-30', '2011-12-30']) {
+            const response = await server.fetch(jsonRequest(`/api/memory/${old.id}/correct`, 'POST', {
+                content: '用户在乙公司工作', revisionKind: 'world_change', validFrom,
+            }));
+            expect(response.status).toBe(400);
+            expect(memory.getMemory(old.id)?.status).toBe('active');
+        }
+    });
+
+    test('候选确认采用用户时区的日期，常驻档案不会因分页而缺失', async () => {
+        const { server, memory, config } = createServer();
+        config.setTimezone('Asia/Shanghai');
+        const event = memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '甲公司' } });
+        const old = memory.remember({ kind: 'fact', content: '用户在甲公司工作', confidence: 1, importance: 0,
+            resident: true, sourceEventIds: [event.id] });
+        // 这些记录标记了常驻，但单条超出档案预算，不应挤掉实际进入档案的条目
+        for (let index = 0; index < 101; index++) memory.remember({ kind: 'fact', content: '长篇资料'.repeat(800) + index,
+            confidence: 1, importance: 1, resident: true, sourceEventIds: [event.id] });
+        const overview = await (await server.fetch(new Request('http://selfcraft.local/api/memory'))).json() as {
+            current: Array<{ id: string }>; profileIds: string[];
+        };
+        expect(overview.profileIds).toContain(old.id);
+        expect(overview.current[0]?.id).toBe(old.id);
+        const runId = crypto.randomUUID();
+        const source = memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '情况变了' }, runId });
+        const job = memory.enqueueReflection({ runId, eventIds: [source.id], outcome: 'completed' });
+        memory.claimReflection();
+        memory.completeReflections([job], { memories: [{ kind: 'fact', content: '用户在乙公司工作', confidence: 1, importance: 1,
+            sensitive: false, operation: 'update', targetId: old.id, revisionKind: 'world_change',
+            needsConfirmation: true, sourceEventIds: [source.id] }], growth: [] }, [old]);
+        const candidate = memory.search('乙公司').find(item => item.status === 'candidate')!;
+        const response = await server.fetch(jsonRequest(`/api/memory/${candidate.id}/confirm`, 'POST', { validFrom: '2026-10-01' }));
+        const result = await response.json() as { memory: { validFrom: string } };
+        expect(response.status).toBe(200);
+        expect(result.memory.validFrom).toBe('2026-09-30T16:00:00.000Z');
+    });
+
+    test('管理页搜索覆盖当前有效的旧版本和历史，分页不会截断旧记忆', async () => {
+        const { server, memory } = createServer();
+        const event = memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '测试来源' } });
+        const old = memory.remember({ kind: 'fact', content: '唯一暗号青铜指南针', confidence: 1, importance: 0,
+            knownFrom: '2000-01-01', sourceEventIds: [event.id] });
+        for (let index = 0; index < 501; index++) memory.remember({ kind: 'fact', content: `其他认识${index}`,
+            confidence: 1, importance: 1, sourceEventIds: [event.id] });
+        const runId = crypto.randomUUID();
+        const source = memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '候选来源' }, runId });
+        const job = memory.enqueueReflection({ runId, eventIds: [source.id], outcome: 'completed' });
+        memory.claimReflection();
+        memory.completeReflections([job], { memories: Array.from({ length: 201 }, (_, index) => ({
+            kind: 'fact' as const, content: `待确认认识${index}`, confidence: 1, importance: 1,
+            sensitive: false, sourceEventIds: [source.id],
+        })), growth: [] });
+        const ids = new Set<string>();
+        const pendingIds = new Set<string>();
+        const versionIds = new Set<string>();
+        let offset: number | null = 0;
+        while (offset !== null) {
+            const page = await (await server.fetch(new Request(`http://selfcraft.local/api/memory?offset=${offset}`))).json() as {
+                current: Array<{ id: string }>; pending: Array<{ id: string }>; versions: Array<{ id: string }>;
+                totals: { current: number; pending: number; versions: number }; nextOffset: number | null;
+            };
+            expect(page.totals).toEqual({ current: 502, pending: 201, versions: 502 });
+            page.pending.forEach(item => pendingIds.add(item.id));
+            page.versions.forEach(item => versionIds.add(item.id));
+            page.current.forEach(item => ids.add(item.id));
+            offset = page.nextOffset;
+        }
+        expect(ids.size).toBe(502);
+        expect(pendingIds.size).toBe(201);
+        expect(versionIds.size).toBe(502);
+        const found = await (await server.fetch(new Request('http://selfcraft.local/api/memory?q=青铜指南针'))).json() as {
+            current: Array<{ id: string }>;
+        };
+        expect(found.current.map(item => item.id)).toEqual([old.id]);
+        memory.reviseMemory(old.id, { kind: 'fact', content: '唯一暗号北极星', confidence: 1, importance: 1,
+            revisionKind: 'world_change', validFrom: '2099-01-01', sourceEventIds: [event.id] });
+        const future = await (await server.fetch(new Request('http://selfcraft.local/api/memory?q=青铜指南针'))).json() as {
+            current: Array<{ id: string }>; versions: Array<{ id: string }>;
+        };
+        expect(future.current.map(item => item.id)).toEqual([old.id]);
+        setSystemTime(new Date('2100-01-01'));
+        const history = await (await server.fetch(new Request('http://selfcraft.local/api/memory?q=青铜指南针'))).json() as {
+            current: Array<{ id: string }>; versions: Array<{ id: string }>;
+        };
+        expect(history.current).toHaveLength(0);
+        expect(history.versions.map(item => item.id)).toEqual([old.id]);
+    });
+
+    test('遗忘正文不进入管理页的候选、详情或搜索，并标出不可确认的候选', async () => {
+        const { server, memory } = createServer();
+        const event = memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '私密旧认识' } });
+        const old = memory.remember({ kind: 'fact', content: '私密旧认识', confidence: 1, importance: 1, sourceEventIds: [event.id] });
+        const runId = crypto.randomUUID();
+        const source = memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '也许情况变了' }, runId });
+        const job = memory.enqueueReflection({ runId, eventIds: [source.id], outcome: 'completed' });
+        memory.claimReflection();
+        memory.completeReflections([job], { memories: [{ kind: 'fact', content: '新的认识', confidence: 1, importance: 1,
+            sensitive: false, operation: 'update', targetId: old.id, revisionKind: 'correction',
+            needsConfirmation: true, sourceEventIds: [source.id] }], growth: [] }, [old]);
+        const forgotten = await server.fetch(jsonRequest(`/api/memory/${old.id}/forget`, 'POST', {}));
+        expect(await forgotten.text()).not.toContain(old.content);
+        const overview = await (await server.fetch(new Request('http://selfcraft.local/api/memory'))).json() as {
+            pending: Array<{ confirmable: boolean }>;
+        };
+        expect(JSON.stringify(overview)).not.toContain(old.content);
+        expect(overview.pending[0]?.confirmable).toBe(false);
+        const detail = await server.fetch(new Request(`http://selfcraft.local/api/memory/${old.id}`));
+        expect(await detail.text()).not.toContain(old.content);
+        const search = await (await server.fetch(new Request('http://selfcraft.local/api/memory?q=私密旧认识'))).json() as { versions: unknown[] };
+        expect(search.versions).toHaveLength(0);
+    });
+
+    test('记忆页的修正以用户操作为来源，失败时不留下未生效的陈述', async () => {
+        const { server, memory } = createServer();
+        const said = memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '我住在上海' } });
+        const home = memory.remember({ kind: 'fact', content: '用户住在上海', confidence: 1, importance: 0.9, resident: true, sourceEventIds: [said.id] });
+        const runId = crypto.randomUUID();
+        const guess = memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '最近总想喝咖啡' }, runId });
+        const batch = memory.enqueueReflection({ runId, eventIds: [guess.id], outcome: 'completed' });
+        memory.claimReflection();
+        memory.completeReflections([batch], { memories: [{ kind: 'preference', content: '用户喜欢喝咖啡', confidence: 0.6,
+            importance: 0.5, sensitive: false, basis: 'inferred', sourceEventIds: [guess.id] }], growth: [] });
+        const candidate = memory.search('咖啡')[0]!;
+
+        const overview = await (await server.fetch(new Request('http://selfcraft.local/api/memory'))).json() as {
+            profileIds: string[];
+            pending: Array<{ id: string }>;
+        };
+        const rejected = await server.fetch(jsonRequest(`/api/memory/${home.id}/confirm`, 'POST', {}));
+        const corrected = await server.fetch(jsonRequest(`/api/memory/${home.id}/correct`, 'POST', {
+            content: '用户住在苏州', revisionKind: 'correction',
+        }));
+        const next = (await corrected.json() as { memory: { id: string; resident: boolean } }).memory;
+        const detail = await (await server.fetch(new Request(`http://selfcraft.local/api/memory/${next.id}`))).json() as {
+            history: Array<{ id: string; status: string }>;
+            sources: Array<{ text: string | null }>;
+        };
+        const unpinned = await server.fetch(jsonRequest(`/api/memory/${next.id}/resident`, 'POST', { resident: false }));
+        const forgotten = await server.fetch(jsonRequest(`/api/memory/${candidate.id}/forget`, 'POST', {}));
+
+        expect(overview.profileIds).toEqual([home.id]);
+        expect(overview.pending.map(item => item.id)).toEqual([candidate.id]);
+        expect(rejected.status).toBe(400);
+        expect(memory.recallEpisode({ query: '我确认' }).events).toHaveLength(0);
+        expect(next.resident).toBe(true);
+        expect(detail.history.map(item => [item.id, item.status])).toEqual([[home.id, 'retracted'], [next.id, 'active']]);
+        expect(detail.sources[0]?.text).toBe('之前记错了，应该是：用户住在苏州');
+        expect((await unpinned.json() as { memory: { resident: boolean } }).memory.resident).toBe(false);
+        expect(forgotten.status).toBe(200);
+        expect(memory.search('咖啡')).toHaveLength(0);
     });
 
     test('已有但损坏的配置不会被误判成首次 onboarding', async () => {

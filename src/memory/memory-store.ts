@@ -1238,7 +1238,7 @@ export class MemoryStore {
     }
 
     /** 按完整条目与稳定排序选择当前有效的核心资料 */
-    private profileMemories (): MemoryItem[] {
+    public profileMemories (): MemoryItem[] {
         const now = new Date().toISOString();
         // 最新版本可能描述未来，已被接续但尚未到期的旧版本仍是当前资料
         const rows = this.database.query(`SELECT * FROM memories WHERE resident = 1
@@ -1270,6 +1270,103 @@ export class MemoryStore {
     public isSourceForgotten (eventId: string): boolean {
         return Boolean(this.database.query(`SELECT 1 FROM memory_sources ms JOIN memories m ON m.id = ms.memory_id
             WHERE ms.event_id = ? AND m.status = 'forgotten' LIMIT 1`).get(eventId));
+    }
+
+    /**
+     * 分页读取管理页的一栏，在数据库内完成状态筛选、全文检索和计数
+     *
+     * @param scope 当前认识、待确认或历史版本
+     * @param options 检索词、分页偏移，以及需要优先展示的档案标识
+     * @returns 最多 100 条记录与匹配总数
+     */
+    public listMemoryPage (
+        scope: 'current' | 'pending' | 'versions',
+        options: { query?: string; offset?: number; profileIds?: string[] } = {},
+    ): { items: MemoryItem[]; total: number } {
+        const now = new Date().toISOString();
+        const conditions: string[] = [];
+        const parameters: string[] = [];
+        if (scope === 'current') {
+            conditions.push("(m.status = 'active' OR (m.status = 'superseded' AND m.valid_to > ?)) AND (m.valid_to IS NULL OR m.valid_to > ?)");
+            parameters.push(now, now);
+        } else {
+            conditions.push(scope === 'pending' ? "m.status = 'candidate'" : "m.status != 'candidate'");
+        }
+        const match = memoryQuery(options.query || '');
+        if (options.query?.trim() && !match) return { items: [], total: 0 };
+        if (match) {
+            // 遗忘痕迹可以浏览，但不能通过原正文被搜索出来
+            conditions.push("m.status != 'forgotten' AND memory_fts MATCH ?");
+            parameters.push(match);
+        }
+        const from = `FROM memories m ${match ? 'JOIN memory_fts f ON f.rowid = m.rowid' : ''}
+            WHERE ${conditions.join(' AND ')}`;
+        const total = (this.database.query(`SELECT count(*) AS total ${from}`).get(...parameters) as { total: number }).total;
+        const profileIds = scope === 'current' ? options.profileIds || [] : [];
+        // 档案预算最多容纳几十条，让实际常驻资料完整出现在第一页
+        const profileOrder = profileIds.length ? `CASE WHEN m.id IN (${placeholders(profileIds.length)}) THEN 0 ELSE 1 END,` : '';
+        const order = scope === 'current' ? `${profileOrder} m.resident DESC, m.importance DESC,` : '';
+        const rows = this.database.query(`SELECT m.* ${from}
+            ORDER BY ${order} ${match ? 'f.rank ASC,' : ''} m.known_from DESC, m.id ASC LIMIT 100 OFFSET ?`)
+            .all(...parameters, ...profileIds, options.offset || 0) as MemoryRow[];
+        return { items: rows.map(row => this.toMemoryItem(row)), total };
+    }
+
+    /**
+     * 读取一条认识所在的完整修订链
+     *
+     * @param id 链上任意一个版本
+     * @returns 按认知时间升序排列的版本，包含尚待确认的修订
+     */
+    public memoryHistory (id: string): MemoryItem[] {
+        let root = this.getMemory(id);
+        if (!root) return [];
+        const visited = new Set([root.id]);
+        while (root.supersedesId) {
+            const previous = this.getMemory(root.supersedesId);
+            if (!previous || visited.has(previous.id)) break;
+            visited.add(previous.id);
+            root = previous;
+        }
+        // 同一版本可能同时挂着已生效的修订和待确认的修订，因此向后按分支展开
+        const chain = [root];
+        const seen = new Set([root.id]);
+        for (let index = 0; index < chain.length; index++) {
+            const rows = this.database.query('SELECT * FROM memories WHERE supersedes_id = ? ORDER BY known_from ASC, id ASC')
+                .all(chain[index]!.id) as MemoryRow[];
+            for (const row of rows) {
+                if (seen.has(row.id)) continue;
+                seen.add(row.id);
+                chain.push(this.toMemoryItem(row));
+            }
+        }
+        return chain.sort((left, right) => left.knownFrom.localeCompare(right.knownFrom) || left.id.localeCompare(right.id));
+    }
+
+    /**
+     * 调整一条认识是否常驻用户档案
+     *
+     * @param id 当前或待确认的认识
+     * @param resident 是否常驻
+     * @returns 更新后的认识
+     */
+    public setResident (id: string, resident: boolean): MemoryItem {
+        const result = this.database.query(`UPDATE memories SET resident = ?, updated_at = ?
+            WHERE id = ? AND status IN ('active', 'candidate')`).run(resident ? 1 : 0, new Date().toISOString(), id);
+        if (!result.changes) throw new Error('只能调整当前或待确认的认识');
+        return this.getMemory(id)!;
+    }
+
+    /**
+     * 把用户在入口上的直接操作记为事件，并在同一事务中完成记忆修改
+     *
+     * @param input 用户操作事件
+     * @param apply 以该事件为来源执行的修改
+     * @returns 修改结果；修改失败时事件一并回滚，不留下未生效的陈述
+     */
+    public applyUserEdit<T> (input: EventInput, apply: (eventId: string) => T): T {
+        const commit = this.database.transaction(() => apply(this.recordEvent({ ...input, actor: 'user' }).id));
+        return commit.immediate();
     }
 
     /** 初始化目标模型需要的最小数据表 */

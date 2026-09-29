@@ -7,7 +7,7 @@ import type {
 } from '@/types/api.types';
 
 /** 请求并解析 Selfcraft JSON API */
-async function requestJson<T> (pathname: string, init?: RequestInit): Promise<T> {
+export async function requestJson<T> (pathname: string, init?: RequestInit): Promise<T> {
     const response = await fetch(pathname, init);
     if (!response.ok) {
         const contentType = response.headers.get('content-type') || '';

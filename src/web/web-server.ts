@@ -27,7 +27,8 @@ import type { SelfcraftConfig } from '../config/types';
 import type { HealthChecker } from '../health/health-checker';
 import type { JobManager } from '../job/job-manager';
 import type { Logger } from '../logging/logger';
-import type { EventRecord, MemoryStore } from '../memory/memory-store';
+import type { EventRecord, MemoryItem, MemoryStore } from '../memory/memory-store';
+import { eventSearchText } from '../memory/memory-search';
 import type { NotificationInbox } from '../notification/notification-inbox';
 import type { SkillRegistry } from '../skills/skill-registry';
 import type { ScheduledTaskManager } from '../task/scheduled-task-manager';
@@ -84,6 +85,23 @@ const timezoneRequestSchema = z.object({
 
 const webAccessRequestSchema = z.object({
     apiKey: z.string().trim().min(1).max(8192).refine(value => !/[\r\n]/.test(value), 'API key 必须是单行文本'),
+});
+
+const memoryConfirmSchema = z.object({
+    validFrom: z.string().max(64).optional(),
+});
+
+const memoryCorrectSchema = z.object({
+    content: z.string().trim().min(4, '请至少写下四个字').max(1000, '内容过长'),
+    revisionKind: z.enum(['correction', 'world_change']),
+    validFrom: z.string().max(64).optional(),
+}).refine(value => value.revisionKind !== 'world_change' || Boolean(value.validFrom), {
+    message: '情况变化需要写明从哪天开始',
+    path: ['validFrom'],
+});
+
+const memoryResidentSchema = z.object({
+    resident: z.boolean(),
 });
 
 interface WebMessageMetadata {
@@ -408,6 +426,20 @@ export class WebServer {
                 items: this.dependencies.memory.search(url.searchParams.get('q') || '', 50),
             });
         }
+        if (request.method === 'GET' && url.pathname === '/api/memory') {
+            return jsonResponse(this.buildMemoryOverview(url));
+        }
+        const memoryMatch = matchResourcePath(url.pathname, '/api/memory');
+        if (request.method === 'GET' && memoryMatch) {
+            return jsonResponse(this.buildMemoryDetail(memoryMatch.id));
+        }
+        const memoryActionMatch = matchResourceActionPath(url.pathname, '/api/memory');
+        if (request.method === 'POST' && memoryActionMatch) {
+            this.assertMutationRequest(request);
+            return jsonResponse({
+                memory: memoryView(this.applyMemoryAction(memoryActionMatch.id, memoryActionMatch.action, await request.json())),
+            });
+        }
         if (request.method === 'GET' && url.pathname === '/api/growth') {
             return jsonResponse({ items: this.dependencies.memory.listGrowth('proposed') });
         }
@@ -441,6 +473,116 @@ export class WebServer {
             sourceEventId: source.id,
             timezone,
         });
+    }
+
+    /** 按同一检索词分页返回当前认识、候选和历史，返回总数避免把截断当成全部 */
+    private buildMemoryOverview (url: URL): object {
+        const memory = this.dependencies.memory;
+        const query = url.searchParams.get('q') || '';
+        const offset = z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).parse(url.searchParams.get('offset') || 0);
+        const profileIds = memory.profileMemories().map(item => item.id);
+        const current = memory.listMemoryPage('current', { query, offset, profileIds });
+        const pending = memory.listMemoryPage('pending', { query, offset });
+        const versions = memory.listMemoryPage('versions', { query, offset });
+        const totals = { current: current.total, pending: pending.total, versions: versions.total };
+        return {
+            profileIds,
+            current: current.items.map(memoryView),
+            pending: pending.items.map(item => {
+                const previous = item.supersedesId ? memory.getMemory(item.supersedesId) : null;
+                return { ...memoryView(item), previous: previous ? memoryView(previous) : null,
+                    confirmable: !item.supersedesId || previous?.status === 'active' };
+            }),
+            versions: versions.items.map(memoryView),
+            totals,
+            nextOffset: Object.values(totals).some(total => total > offset + 100) ? offset + 100 : null,
+        };
+    }
+
+    /** 读取一条认识的修订链与原话来源；工具输出等非对话证据只显示类型 */
+    private buildMemoryDetail (id: string): object {
+        const memory = this.dependencies.memory;
+        const item = memory.getMemory(id);
+        if (!item) {
+            throw new Error('这条记忆不存在');
+        }
+        const sources = memory.getEvents(item.status === 'forgotten' ? [] : item.sourceEventIds)
+            .sort((left, right) => right.occurredFrom.localeCompare(left.occurredFrom))
+            .slice(0, 20)
+            .map(event => ({
+                id: event.id,
+                occurredFrom: event.occurredFrom,
+                actor: event.actor,
+                type: event.type,
+                text: eventSearchText(event) || null,
+            }));
+        return {
+            memory: memoryView(item),
+            history: memory.memoryHistory(id).map(memoryView),
+            sources,
+            sourceCount: item.status === 'forgotten' ? 0 : item.sourceEventIds.length,
+        };
+    }
+
+    /**
+     * 执行记忆页上的一次修正，确认与纠正都以本次用户操作作为新的来源
+     *
+     * @param id 目标认识
+     * @param action confirm、correct、forget 或 resident
+     * @param body 已解析的 JSON 请求体
+     * @returns 操作后的认识
+     */
+    private applyMemoryAction (id: string, action: string, body: unknown): MemoryItem {
+        const memory = this.dependencies.memory;
+        const target = memory.getMemory(id);
+        if (!target) {
+            throw new Error('这条记忆不存在');
+        }
+        const runId = randomUUID();
+        const event = {
+            actor: 'user',
+            type: 'client_command',
+            runId,
+            timezone: this.dependencies.config.read().timezone,
+            idempotencyKey: `run:${runId}:client-command`,
+        };
+        if (action === 'confirm') {
+            const input = memoryConfirmSchema.parse(body);
+            const validFrom = memoryEffectiveTime(input.validFrom, event.timezone);
+            return memory.applyUserEdit({ ...event, payload: { command: 'memory_confirm', memoryId: id, text: `我确认：${target.content}` } },
+                eventId => memory.confirmMemory(id, [eventId], { ...(validFrom && { validFrom }) }));
+        }
+        if (action === 'correct') {
+            const input = memoryCorrectSchema.parse(body);
+            const validFrom = memoryEffectiveTime(input.validFrom, event.timezone);
+            if (target.status !== 'active') {
+                throw new Error('只能修正当前成立的认识');
+            }
+            const prefix = input.revisionKind === 'correction' ? '之前记错了，应该是' : '情况变了，现在是';
+            return memory.applyUserEdit({ ...event, payload: { command: 'memory_correct', memoryId: id, text: `${prefix}：${input.content}` } },
+                eventId => memory.reviseMemory(id, {
+                    kind: target.kind,
+                    content: input.content,
+                    confidence: 1,
+                    importance: target.importance,
+                    revisionKind: input.revisionKind,
+                    ...(validFrom && { validFrom }),
+                    sourceEventIds: [eventId],
+                }));
+        }
+        if (action === 'forget') {
+            // 忘记的事件不写入正文，避免被遗忘的内容通过这条操作记录重新被检索到
+            return memory.applyUserEdit({ ...event, payload: { command: 'memory_forget', memoryId: id } }, () => {
+                if (!memory.forget(id)) throw new Error('这条记忆已经被忘记');
+                return memory.getMemory(id)!;
+            });
+        }
+        if (action === 'resident') {
+            const input = memoryResidentSchema.parse(body);
+            return memory.applyUserEdit({ ...event, payload: { command: 'memory_resident', memoryId: id, resident: input.resident } },
+                () => memory.setResident(id, input.resident));
+        }
+        throw new Error('不支持的记忆操作');
     }
 
     /** 把当前非敏感配置、状态和最近消息交给页面初始化 */
@@ -946,4 +1088,38 @@ function publicChatError (error: unknown): string {
         return error.message;
     }
     return '回应没有完成，请稍后重试或查看 Runtime 日志';
+}
+
+/** 把遗忘记录渲染成无正文、无证据入口的痕迹，不改变持久审计数据 */
+function memoryView (item: MemoryItem): MemoryItem {
+    return item.status === 'forgotten' ? { ...item, content: '', sourceEventIds: [] } : item;
+}
+
+/**
+ * 将日期输入转换为用户时区中该日的第一个有效时刻，完整时间仍由存储层校验
+ *
+ * @param value 日期或带时间的输入
+ * @param timezone 用户配置的 IANA 时区
+ * @returns UTC ISO 时间；日期整天不存在时拒绝
+ */
+function memoryEffectiveTime (value: string | undefined, timezone: string): string | undefined {
+    if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+    const utc = Date.parse(`${value}T00:00:00Z`);
+    if (!Number.isFinite(utc) || new Date(utc).toISOString().slice(0, 10) !== value) throw new Error('生效日期无效');
+    const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' });
+    /** 用固定年月日顺序比较该时刻在用户时区中的日历日期 */
+    function localDate (seconds: number): string {
+        const parts = formatter.formatToParts(new Date(seconds * 1000));
+        return ['year', 'month', 'day'].map(type => parts.find(part => part.type === type)!.value).join('-');
+    }
+    // 搜索日历日期的边界，夏令时跳过午夜时自动选中当天第一个有效时刻
+    let low = utc / 1000 - 36 * 3600;
+    let high = utc / 1000 + 36 * 3600;
+    while (low < high) {
+        const middle = Math.floor((low + high) / 2);
+        if (localDate(middle) < value) low = middle + 1;
+        else high = middle;
+    }
+    if (localDate(low) !== value) throw new Error('用户时区中不存在这个生效日期');
+    return new Date(low * 1000).toISOString();
 }

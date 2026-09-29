@@ -1,6 +1,7 @@
-import { MessageCircle, Settings } from 'lucide-react';
+import { MessageCircle, Settings, Waves } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { ChatView } from '@/components/ChatView';
+import { MemoryView } from '@/components/MemoryView';
 import { Button } from '@/components/motion/button';
 import { Tabs, TabsList, TabsTrigger } from '@/components/motion/tabs';
 import { OnboardingView } from '@/components/OnboardingView';
@@ -12,7 +13,7 @@ import { BRAND_IMAGE_PATH } from '@/lib/brand';
 import { getBootstrap } from '@/services/runtime';
 import type { BootstrapView, ConfigView } from '@/types/api.types';
 
-type ViewName = 'chat' | 'settings';
+type ViewName = 'chat' | 'memory' | 'settings';
 
 /** Selfcraft Web 应用根组件 */
 export function App () {
@@ -103,6 +104,7 @@ export function App () {
                     <Tabs className="global-navigation" onValueChange={value => setView(value as ViewName)} value={view} variant="pill">
                         <TabsList>
                             <TabsTrigger value="chat"><MessageCircle aria-hidden="true" className="size-3.5" />对话</TabsTrigger>
+                            <TabsTrigger value="memory"><Waves aria-hidden="true" className="size-3.5" />记忆</TabsTrigger>
                             <TabsTrigger value="settings"><Settings aria-hidden="true" className="size-3.5" />设置</TabsTrigger>
                         </TabsList>
                     </Tabs>
@@ -128,8 +130,16 @@ export function App () {
                                 onRequestSettings={() => setView('settings')}
                             />
                         </div>
+                        <div className={view === 'memory' ? 'contents' : 'hidden'}>
+                            <MemoryView
+                                active={view === 'memory'}
+                                onOpenChat={() => setView('chat')}
+                                timezone={bootstrap.config?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'}
+                            />
+                        </div>
                         <div className={view === 'settings' ? 'contents' : 'hidden'}>
                             <SettingsView
+                                active={view === 'settings'}
                                 config={bootstrap.config}
                                 configurationError={bootstrap.configurationError}
                                 onChanged={handleConfigChanged}

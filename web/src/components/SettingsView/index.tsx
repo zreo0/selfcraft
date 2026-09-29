@@ -1,5 +1,6 @@
 import { RotateCcw } from 'lucide-react';
 import { useEffect, useState } from 'react';
+import { PageTitle } from '@/components/PageTitle';
 import { Button } from '@/components/motion/button';
 import { TimeZonePicker } from '@/components/TimeZonePicker';
 import {
@@ -20,10 +21,12 @@ import { WebAccessForm } from './WebAccessForm';
 
 /** Selfcraft 的模型、时区与本地配置页面 */
 export function SettingsView ({
+    active,
     config,
     configurationError,
     onChanged,
 }: {
+    active: boolean;
     config: ConfigView | null;
     configurationError: string | null;
     onChanged: (config: ConfigView) => void;
@@ -73,7 +76,7 @@ export function SettingsView ({
             <div className="settings-layout">
                 <header className="settings-header">
                     <div>
-                        <h1>设置</h1>
+                        <PageTitle active={active} variant="assemble">设置</PageTitle>
                         <nav aria-label="设置分区" className="settings-index">
                             <a href="#settings-model">当前模型</a>
                             <a href="#settings-provider">模型渠道</a>

@@ -17,6 +17,7 @@ Selfcraft Web 是唯一 Runtime 的浏览器通信入口。Vite 负责本地开�
 web/src/
 ├── components/
 │   ├── ChatView/             # 业务组件：PascalCase 目录 + index.tsx
+│   ├── MemoryView/           # 记忆页：当前认识、常驻档案与变化之河
 │   ├── OnboardingView/       # Web 渠道的首次认识与第一句话
 │   ├── SettingsView/         # 较小子组件使用 PascalCase 文件名
 │   ├── ThemeControls/        # 配色与明暗主题入口
@@ -92,3 +93,9 @@ bun run build:web
 输入框在生成期间仍可提交文字或图片。有新输入时按钮为发送，输入为空且正在生成时按钮为停止；停止仅影响主脑当前回应。
 
 `useConversation` 继续使用 AI SDK `UIMessage`，通过 `POST /api/conversation/messages` 提交本轮消息、通过 `/api/conversation/events` 订阅持久消息快照。按消息 ID 合并、按 `metadata.seq` 排序；SSE 自动重连携带版本游标。`/api/messages` 提供历史分页与正在生成的部分文字。关闭页面不取消 Runtime 执行，也不要求逐 token 重放。旧 `/api/chat` 流式接口保留给现有协议客户端。
+
+## 记忆管理
+
+记忆页通过 `GET /api/memory?q=...&offset=...` 查询当前认识、候选和历史版本。每栏每页最多 100 条，响应的 `totals` 表示匹配总数，`nextOffset` 为空时表示全部加载完成。搜索在 Runtime 内完成，包含仍有效的旧版本和历史认识；已忘记的正文不参与搜索。修改后重新查询当前条件，同时刷新展开的详情。
+
+页面提交的 `YYYY-MM-DD` 按实例配置的 IANA 时区转换为当天第一个有效时刻，包含夏令时切换。遗忘记录在管理接口中只返回无正文、无来源入口的痕迹，原始审计数据仍保留；原认识已失效的候选不能直接确认。
