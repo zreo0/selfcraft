@@ -18,6 +18,7 @@ type ViewName = 'chat' | 'memory' | 'settings';
 /** Selfcraft Web 应用根组件 */
 export function App () {
     const [bootstrap, setBootstrap] = useState<BootstrapView | null>(null);
+    const [accessToken, setAccessToken] = useState('');
     const [loadError, setLoadError] = useState<string | null>(null);
     const [view, setView] = useState<ViewName>('chat');
     const [onboardingOpen, setOnboardingOpen] = useState(false);
@@ -66,6 +67,18 @@ export function App () {
                 <div className="text-center">
                     <div className="brand-core brand-core--loading"><img alt="" src={BRAND_IMAGE_PATH} /></div>
                     <p className="mt-5 text-sm text-muted-foreground">{loadError || '正在连接 Runtime'}</p>
+                    {loadError && <form className="mt-4 flex flex-col gap-3" onSubmit={async event => {
+                        event.preventDefault();
+                        try {
+                            const response = await fetch('/api/access/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: accessToken }) });
+                            if (!response.ok) throw new Error('连接凭证无效');
+                            setAccessToken('');
+                            await load();
+                        } catch (error) { setLoadError(error instanceof Error ? error.message : '连接失败'); }
+                    }}>
+                        <input aria-label="连接凭证" autoComplete="off" className="rounded-md border bg-background px-3 py-2" onChange={event => setAccessToken(event.target.value)} placeholder="连接凭证" type="password" value={accessToken} />
+                        <Button type="submit">使用凭证连接</Button>
+                    </form>}
                     {loadError && <Button className="mt-4" onClick={() => void load()} type="button" variant="outline">重新连接</Button>}
                 </div>
             </main>

@@ -611,7 +611,7 @@ describe('WebServer', () => {
         expect(memory.search('咖啡')).toHaveLength(0);
     });
 
-    test('已有但损坏的配置不会被误判成首次 onboarding', async () => {
+    test('凭证文件损坏时拒绝访问，不降级为未鉴权 onboarding', async () => {
         const { server, config, paths } = createServer();
         config.addProvider({
             providerId: 'old',
@@ -626,9 +626,9 @@ describe('WebServer', () => {
         const response = await server.fetch(new Request('http://selfcraft.local/api/bootstrap'));
         const body = await response.json() as any;
 
-        expect(body.config).toBeNull();
-        expect(body.configurationError).toBeString();
-        expect(body.configurationError.length).toBeGreaterThan(0);
+        expect(response.status).toBe(400);
+        expect(body.error).toBeString();
+        expect(body.config).toBeUndefined();
     });
 
     test('独立 CLI 客户端可通过 HTTP 共用配置、对话与 Runtime 状态', async () => {
@@ -779,4 +779,35 @@ test('停止 Runtime 会关闭长订阅，不阻止自我升级重启', async ()
     await reader.read();
     server.stop();
     expect((await reader.read()).done).toBeTrue();
+});
+
+test('连接凭证覆盖所有读取入口，轮换后旧 Bearer 与 Cookie 同时失效', async () => {
+    const { server, config } = createServer();
+    config.setCredential('client-access', 'test-client-token');
+    for (const pathname of ['/api/bootstrap', '/api/messages', '/api/conversation/events', '/api/works', '/api/notifications', '/api/audio/one/file']) {
+        expect((await server.fetch(new Request(`http://selfcraft.local${pathname}`))).status).toBe(401);
+    }
+    const login = await server.fetch(jsonRequest('/api/access/login', 'POST', { token: 'test-client-token' }));
+    expect(login.status).toBe(200);
+    const cookie = login.headers.get('set-cookie')!.split(';')[0]!;
+    const authorized = new Request('http://selfcraft.local/api/connection', { headers: { Cookie: cookie } });
+    const first = await (await server.fetch(authorized)).json();
+    expect(first.protocolVersion).toBe(1);
+    expect(first.instanceId).toBeTruthy();
+    config.setCredential('client-access', 'rotated-token');
+    expect((await server.fetch(authorized)).status).toBe(401);
+    const next = await server.fetch(new Request('http://selfcraft.local/api/connection', { headers: { Authorization: 'Bearer rotated-token' } }));
+    expect((await next.json()).instanceId).toBe(first.instanceId);
+    expect((await server.fetch(jsonRequest('/api/access/login', 'POST', { token: 'rotated-token' }, 'https://other.example'))).status).toBe(400);
+});
+
+test('配置重置不会清除入口鉴权，转写密钥不会进入配置响应', async () => {
+    const { server, config } = createServer();
+    config.setCredential('client-access', 'keep-access');
+    config.configureTranscription({ baseURL: 'https://api.siliconflow.cn/v1', modelId: 'FunAudioLLM/SenseVoiceSmall', apiKey: 'private-transcription-test' });
+    const response = await server.fetch(new Request('http://selfcraft.local/api/config/transcription', { headers: { Authorization: 'Bearer keep-access' } }));
+    expect(await response.text()).not.toContain('private-transcription-test');
+    config.backupAndReset();
+    expect(config.credential('client-access')).toBe('keep-access');
+    expect(config.credential('transcription')).toBeUndefined();
 });

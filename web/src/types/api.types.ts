@@ -49,6 +49,8 @@ export interface ConfigView {
 
 /** Web 消息附带的持久时间线信息 */
 export interface MessageMetadata {
+    /** 语音原件的播放引用 */
+    audio?: { id: string; url: string; duration: number; deleted: boolean };
     /** Runtime 中的生成状态，页面重连后继续追加同一消息 */
     state?: 'streaming' | 'completed' | 'failed';
     /** 对应主脑执行 */

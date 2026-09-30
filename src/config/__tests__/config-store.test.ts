@@ -180,7 +180,7 @@ describe('ConfigStore', () => {
         expect(fs.statSync(path.join(backupDirectory, 'config.json')).mode & 0o777).toBe(0o600);
         expect(store.read().defaultModel).toBeNull();
         expect(store.read().providers).toEqual({});
-        expect(JSON.parse(fs.readFileSync(path.join(directory, 'secrets.json'), 'utf8')).credentials).toEqual({});
+        expect(Object.keys(JSON.parse(fs.readFileSync(path.join(directory, 'secrets.json'), 'utf8')).credentials)).toEqual(['client-access']);
         expect(fs.readFileSync(path.join(directory, 'keep.txt'), 'utf8')).toBe('keep');
         expect(fs.existsSync(path.join(backupDirectory, 'secrets.json'))).toBeFalse();
     });

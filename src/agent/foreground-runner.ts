@@ -71,6 +71,12 @@ export class ForegroundRunner {
         return result;
     }
 
+    /** 查询持久接收状态供客户端核实回执，不返回模型内部检查点 */
+    public receipt (id: string): { id: string; status: string } | null {
+        const record = this.executions?.get(id);
+        return record ? { id, status: record.status } : null;
+    }
+
     /** 事项的重要更新先进入同一持久收件箱，再唤醒或加入当前主脑 */
     public notify (id: string, title: string, message: string): void {
         const executionId = `notice:${id}`;

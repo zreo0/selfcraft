@@ -1,3 +1,6 @@
+import { ClientAccess } from './client-access';
+import { AudioStore } from '../attachment/audio-store';
+import { WorkStore } from '../work/work-store';
 import { ConversationStore } from '../conversation/conversation-store';
 import { AttachmentStore, MAX_IMAGES, MAX_IMAGE_BYTES } from '../attachment/attachment-store';
 import { userContentFiles } from '../model/user-content';
@@ -140,6 +143,9 @@ export interface WebServerAddress {
 /** 同一 Runtime 中的 Web 通信入口与静态文件服务 */
 export class WebServer {
     private server?: Bun.Server<undefined>;
+    private readonly access: ClientAccess;
+    private readonly audio: AudioStore;
+    private readonly works: WorkStore;
     private readonly attachments: AttachmentStore;
     private readonly conversation: ConversationStore;
     private readonly subscriptions = new Set<() => void>();
@@ -164,9 +170,18 @@ export class WebServer {
         staticDirectory: string;
         onRestart: () => void;
     }) {
+        this.access = new ClientAccess(dependencies.paths.state, dependencies.config);
+        this.audio = new AudioStore(dependencies.paths.home, dependencies.paths.state, dependencies.config);
+        this.works = new WorkStore(dependencies.paths.state);
         this.attachments = new AttachmentStore(dependencies.paths.home);
         this.conversation = dependencies.conversation || new ConversationStore(dependencies.paths.state);
         this.importHistory();
+        for (const voice of this.audio.completed()) {
+            const message = this.conversation.get(`user:${voice.id}`);
+            if (message && (!message.metadata?.audio || message.metadata.audio.deleted !== (voice.status === 'deleted'))) {
+                this.conversation.attachAudio(voice.id, { id: voice.id, url: `/api/audio/${voice.id}/file`, duration: voice.duration, deleted: voice.status === 'deleted' }, voice.capturedAt);
+            }
+        }
     }
 
     /**
@@ -188,7 +203,7 @@ export class WebServer {
             port,
             maxRequestBodySize: MAX_IMAGE_BYTES + 65536,
             fetch: (request, server) => {
-                if (request.method === 'POST' && new URL(request.url).pathname === '/api/chat') {
+                if (request.method === 'POST' && (new URL(request.url).pathname === '/api/chat' || /^\/api\/audio\/[^/]+\/transcribe$/.test(new URL(request.url).pathname))) {
                     // 图片读取期间可能没有流式输出，执行预算由 ForegroundRunner 控制
                     server.timeout(request, 0);
                 }
@@ -216,7 +231,15 @@ export class WebServer {
     public async fetch (request: Request): Promise<Response> {
         const url = new URL(request.url);
         try {
+            if (url.pathname === '/api/access/login' && request.method === 'POST') {
+                this.assertMutationRequest(request);
+                const { token } = z.object({ token: z.string().max(8192) }).parse(await request.json());
+                if (!this.access.matches(token)) return jsonResponse({ error: '连接凭证无效' }, 401);
+                return new Response('{}', { headers: { 'Content-Type': 'application/json',
+                    'Set-Cookie': `selfcraft_session=${this.access.session()}; Path=/api; HttpOnly; SameSite=Strict; Max-Age=604800${url.protocol === 'https:' ? '; Secure' : ''}` } });
+            }
             if (url.pathname.startsWith('/api/')) {
+                if (!this.access.authorized(request)) return jsonResponse({ error: '请输入有效的连接凭证' }, 401);
                 return await this.handleApi(request, url);
             }
             return await this.serveStatic(request, url.pathname);
@@ -247,6 +270,61 @@ export class WebServer {
 
     /** 分发同源 API 请求 */
     private async handleApi (request: Request, url: URL): Promise<Response> {
+        if (request.method === 'GET' && url.pathname === '/api/connection') {
+            return jsonResponse({ instanceId: this.access.instanceId, protocolVersion: 1, authenticated: this.access.enabled() });
+        }
+        if (request.method === 'GET' && url.pathname === '/api/works') {
+            return jsonResponse(this.works.list(true, 200));
+        }
+        if (request.method === 'PUT' && url.pathname === '/api/config/transcription') {
+            this.assertMutationRequest(request);
+            this.dependencies.config.configureTranscription(await request.json());
+            return jsonResponse(this.transcriptionView());
+        }
+        if (request.method === 'GET' && url.pathname === '/api/config/transcription') {
+            return jsonResponse(this.transcriptionView());
+        }
+        const receipt = /^\/api\/conversation\/receipts\/([^/]+)$/.exec(url.pathname);
+        if (receipt && request.method === 'GET') {
+            const record = this.dependencies.agent.receipt(decodeURIComponent(receipt[1]!));
+            return jsonResponse(record);
+        }
+        const notificationDetail = /^\/api\/notifications\/([^/]+)$/.exec(url.pathname);
+        if (notificationDetail && request.method === 'GET') {
+            return jsonResponse(this.dependencies.notifications.get(decodeURIComponent(notificationDetail[1]!)));
+        }
+        const notification = /^\/api\/notifications\/([^/]+)\/read$/.exec(url.pathname);
+        if (notification && request.method === 'POST') {
+            this.assertMutationRequest(request);
+            this.dependencies.notifications.acknowledge(decodeURIComponent(notification[1]!));
+            return jsonResponse({ read: true });
+        }
+        const audio = /^\/api\/audio\/([a-zA-Z0-9-]{1,128})(?:\/(file|transcribe))?$/.exec(url.pathname);
+        if (audio) {
+            const id = audio[1]!;
+            if (request.method === 'PUT' && !audio[2]) {
+                const origin = request.headers.get('origin');
+                if (origin && origin !== url.origin) return jsonResponse({ error: '拒绝跨站上传' }, 403);
+                const form = await request.formData();
+                const file = form.get('file');
+                if (!(file instanceof File)) throw new Error('请选择录音');
+                return jsonResponse(await this.audio.save(id, file, String(form.get('capturedAt'))));
+            }
+            if (request.method === 'GET' && audio[2] === 'file') return new Response(new Uint8Array(this.audio.read(id)), {
+                headers: { 'Content-Type': 'audio/wav', 'Cache-Control': 'private, no-store' },
+            });
+            if (request.method === 'GET' && !audio[2]) return jsonResponse(this.audio.get(id));
+            if (request.method === 'POST' && audio[2] === 'transcribe') {
+                this.assertMutationRequest(request);
+                return jsonResponse(await this.audio.transcribe(id));
+            }
+            if (request.method === 'DELETE' && !audio[2]) {
+                this.assertMutationRequest(request);
+                const record = this.audio.delete(id);
+                this.conversation.attachAudio(id, { id, url: `/api/audio/${id}/file`, duration: record.duration, deleted: true });
+                return jsonResponse(record);
+            }
+        }
         if (request.method === 'POST' && url.pathname === '/api/attachments') {
             const origin = request.headers.get('origin');
             if (origin && origin !== url.origin) {
@@ -290,11 +368,16 @@ export class WebServer {
             this.assertMutationRequest(request);
             if (!this.dependencies.config.isConfigured()) return new Response('请先完成模型配置', { status: 409 });
             const body = chatRequestSchema.parse(await request.json());
-            const input = this.readInput(body);
+            const voiceId = body.audioId === undefined ? undefined : z.string().max(128).parse(body.audioId);
+            const voice = voiceId ? this.audio.get(voiceId) : null;
+            if (voiceId && (!voice?.text || voice.status === 'deleted')) throw new Error('录音尚未成功转写');
+            const input = voice?.text || this.readInput(body);
             const id = z.string().min(1).max(128).parse(body.id || randomUUID());
+            if (voice && voice.id !== id) throw new Error('语音消息必须使用录音的提交标识');
             void this.dependencies.agent.run(input, () => undefined, {
                 executionId: id, retry: body.trigger === 'regenerate-message',
             }).catch(error => this.dependencies.logger.warn('对话未完成，执行记录已保留', { error: publicChatError(error) }));
+            if (voice) this.conversation.attachAudio(id, { id, url: `/api/audio/${id}/file`, duration: voice.duration, deleted: false }, voice.capturedAt);
             return jsonResponse({ id }, 202);
         }
         if (request.method === 'POST' && url.pathname === '/api/chat') {
@@ -597,6 +680,8 @@ export class WebServer {
         }
         return {
             product: 'Selfcraft',
+            instanceId: this.access.instanceId,
+            protocolVersion: 1,
             config,
             configurationError,
             messages: this.buildMessages(50),
@@ -608,6 +693,13 @@ export class WebServer {
                 checks: this.dependencies.health.check(this.dependencies.paths),
             },
         };
+    }
+
+    /** 返回脱敏转写配置，不返回供应商密钥 */
+    private transcriptionView (): object {
+        const config = this.dependencies.config.read().transcription;
+        return { configured: Boolean(config && this.dependencies.config.credential(config.credentialRef)),
+            baseURL: config?.baseURL || 'https://api.siliconflow.cn/v1', modelId: config?.modelId || 'FunAudioLLM/SenseVoiceSmall' };
     }
 
     /** 返回不包含 credentialRef 与密钥的页面配置 */

@@ -43,6 +43,7 @@ const configSchema = z.object({
     }).default({}),
     providers: z.record(z.string(), providerSchema),
     webAccess: webAccessSchema.nullable().default(null),
+    transcription: z.object({ baseURL: z.string().url(), modelId: z.string().min(1), credentialRef: z.string().min(1) }).optional(),
     maxSteps: z.number().int().min(1).max(100),
     timezone: z.string().min(1).max(100).refine(isValidTimezone, '时区必须是有效的 IANA 名称'),
 });
@@ -69,6 +70,27 @@ export class ConfigStore {
         this.secretsPath = path.join(configDirectory, 'secrets.json');
         fs.mkdirSync(configDirectory, { recursive: true, mode: 0o700 });
         fs.chmodSync(configDirectory, 0o700);
+    }
+
+    /** 读取服务端凭证，调用方不得把返回值放入普通接口响应 */
+    public credential (key: string): string | undefined {
+        return this.readSecrets()[key];
+    }
+
+    /** 保存或删除一项服务端凭证，保留其他用途 */
+    public setCredential (key: string, value: string | null): void {
+        const credentials = this.readSecrets();
+        if (value) credentials[key] = value;
+        else delete credentials[key];
+        this.writeSecrets(credentials);
+    }
+
+    /** 保存转写渠道；空密钥保留已有凭证 */
+    public configureTranscription (input: { baseURL: string; modelId: string; apiKey?: string }): void {
+        const parsed = z.object({ baseURL: z.string().url(), modelId: z.string().trim().min(1).max(128), apiKey: z.string().max(8192).optional() }).parse(input);
+        if (parsed.apiKey) this.setCredential('transcription', parsed.apiKey);
+        if (!this.credential('transcription')) throw new Error('请提供转写服务凭证');
+        this.write({ ...this.read(), transcription: { baseURL: parsed.baseURL, modelId: parsed.modelId, credentialRef: 'transcription' } });
     }
 
     /**
@@ -146,7 +168,12 @@ export class ConfigStore {
         }
 
         if (fs.existsSync(this.secretsPath)) {
-            this.writeSecrets({});
+            let token: string | undefined;
+            try { token = this.credential('client-access'); } catch {
+                // 本地修复损坏文件时仍保持鉴权，用户通过 client-token 命令重新领取凭证
+                token = `${randomUUID()}${randomUUID()}`;
+            }
+            this.writeSecrets(token ? { 'client-access': token } : {});
         }
         this.write(createDefaultConfig());
         return backupDirectory;

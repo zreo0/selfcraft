@@ -9,6 +9,7 @@ export type ConversationMessage = UIMessage<{
     occurredAt: string;
     state: 'streaming' | 'completed' | 'failed';
     executionId?: string;
+    audio?: { id: string; url: string; duration: number; deleted: boolean };
 }, { activity: { status: 'working' | 'complete'; items: AgentActivity[] } }>;
 
 /** 与请求连接无关的持久消息视图，所有入口按版本补齐最新记录 */
@@ -23,7 +24,8 @@ export class ConversationStore {
             message TEXT NOT NULL, version INTEGER NOT NULL
         ); CREATE TABLE IF NOT EXISTS conversation_clock (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
         INSERT OR IGNORE INTO conversation_clock VALUES (1, 0);
-        CREATE INDEX IF NOT EXISTS conversation_execution ON conversation_messages (json_extract(message, '$.metadata.executionId'), seq);`);
+        CREATE INDEX IF NOT EXISTS conversation_execution ON conversation_messages (json_extract(message, '$.metadata.executionId'), seq);
+        CREATE INDEX IF NOT EXISTS conversation_version ON conversation_messages (version);`);
     }
 
     /** 持久显示已接收输入；重复投递复用原消息 */
@@ -33,6 +35,15 @@ export class ConversationStore {
             : content.flatMap<ConversationMessage['parts'][number]>(part => part.type === 'text' ? [part] : userContentFiles([part]));
         this.save({ id: `user:${id}`, role: 'user', parts,
             metadata: { seq: 0, occurredAt: new Date().toISOString(), state: 'completed', executionId: id } });
+    }
+
+    /** 将原音关联到已接收的文字，附件不进入模型输入 */
+    public attachAudio (id: string, audio: { id: string; url: string; duration: number; deleted: boolean }, capturedAt?: string): void {
+        const message = this.get(`user:${id}`);
+        if (!message) return;
+        message.metadata!.audio = audio;
+        if (capturedAt) message.metadata!.occurredAt = capturedAt;
+        this.save(message);
     }
 
     /** 开始或恢复一次答复，未完成的模型文本不冒充已提交的执行结果 */
@@ -126,6 +137,7 @@ export class ConversationStore {
 
     /** 返回有序历史页，刷新时包含尚在生成的消息 */
     public page (limit = 50, before = Number.MAX_SAFE_INTEGER): { items: ConversationMessage[]; nextCursor: number | null } {
+        limit = Number.isFinite(limit) ? Math.max(1, Math.min(100, Math.trunc(limit))) : 50;
         const rows = this.database.query('SELECT message FROM conversation_messages WHERE seq < ? ORDER BY seq DESC LIMIT ?').all(before, limit) as { message: string }[];
         const items: ConversationMessage[] = rows.reverse().map(row => JSON.parse(row.message));
         return { items, nextCursor: items.length === limit ? items[0]!.metadata!.seq : null };
@@ -135,10 +147,16 @@ export class ConversationStore {
     public changes (after: number): { items: ConversationMessage[]; cursor: number } {
         return this.database.transaction(() => {
             const { version } = this.database.query('SELECT version FROM conversation_clock WHERE id = 1').get() as { version: number };
-            const rows = after === 0
-                ? (this.database.query('SELECT message FROM conversation_messages ORDER BY seq DESC LIMIT 50').all() as { message: string }[]).reverse()
-                : this.database.query('SELECT message FROM conversation_messages WHERE version > ? ORDER BY seq').all(after) as { message: string }[];
-            return { items: rows.map(row => JSON.parse(row.message)), cursor: version };
+            if (after === version) return { items: [], cursor: version };
+            if (after <= 0 || after > version) {
+                const rows = (this.database.query('SELECT message FROM conversation_messages ORDER BY seq DESC LIMIT 50').all() as { message: string }[]).reverse();
+                return { items: rows.map(row => JSON.parse(row.message)), cursor: version };
+            }
+            // 按修改版本分页，游标只越过已交付内容；旧消息在补读期间再更新仍会被下一批读到
+            const rows = this.database.query('SELECT message, version FROM conversation_messages WHERE version > ? ORDER BY version LIMIT 101')
+                .all(after) as { message: string; version: number }[];
+            const page = rows.slice(0, 100);
+            return { items: page.map(row => JSON.parse(row.message)), cursor: rows.length > 100 ? page.at(-1)!.version : version };
         })();
     }
 

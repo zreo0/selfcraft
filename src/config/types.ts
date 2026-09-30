@@ -61,6 +61,8 @@ export interface SelfcraftConfig {
     providers: Record<string, ProviderConfig>;
     /** 可选的外部搜索与网页读取能力 */
     webAccess: WebAccessConfig | null;
+    /** 独立于对话模型的语音识别配置 */
+    transcription?: { baseURL: string; modelId: string; credentialRef: string };
     /** Agent 单轮最多执行的步骤数 */
     maxSteps: number;
     /** 解释用户本地时间使用的 IANA 时区 */

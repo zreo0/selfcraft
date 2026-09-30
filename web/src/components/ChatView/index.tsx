@@ -333,6 +333,9 @@ export function ChatView ({
                                     ) : (
                                         <MessageBubble align="end" animateIn={animateIn} variant="tint">
                                             <MessageBubbleContent className="message-user-surface">
+                                                {message.metadata?.audio && (message.metadata.audio.deleted
+                                                    ? <p className="mb-2 text-sm text-muted-foreground">原始录音已删除</p>
+                                                    : <audio aria-label="播放原始录音" className="mb-2 max-w-full" controls preload="none" src={message.metadata.audio.url} />)}
                                                 {message.parts.filter(part => part.type === 'file' && part.mediaType.startsWith('image/')).map((part, index) => part.type === 'file' && (
                                                     <a aria-label={`查看${part.filename || '原图'}`} className="mb-2 block rounded-lg focus-visible:outline-2 focus-visible:outline-ring" href={part.url} key={`${part.url}:${index}`} rel="noreferrer" target="_blank">
                                                         <img alt={part.filename || '用户上传的图片'} className="max-h-80 max-w-full rounded-lg object-contain" loading="lazy" src={part.url} />

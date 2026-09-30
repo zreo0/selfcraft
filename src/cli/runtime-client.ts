@@ -1,3 +1,5 @@
+import { ConfigStore } from '../config/config-store';
+import { resolvePaths } from '../config/paths';
 import type { ConversationMessage } from '../conversation/conversation-store';
 import { randomUUID } from 'node:crypto';
 import { DefaultChatTransport, type UIMessageChunk } from 'ai';
@@ -77,7 +79,13 @@ export class RuntimeClient {
         fetchFunction: typeof fetch = fetch,
     ) {
         this.baseURL = baseURL.replace(/\/+$/, '');
-        this.fetchFunction = fetchFunction;
+        this.fetchFunction = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+            const headers = new Headers(init?.headers);
+            const isLocal = ['127.0.0.1', 'localhost', '[::1]'].includes(new URL(this.baseURL).hostname);
+            const token = process.env.SELFCRAFT_ACCESS_TOKEN || (isLocal ? new ConfigStore(resolvePaths().config).credential('client-access') : undefined);
+            if (token) headers.set('Authorization', `Bearer ${token}`);
+            return fetchFunction(input, { ...init, headers });
+        }) as typeof fetch;
     }
 
     /** 读取 Runtime 初始化状态 */

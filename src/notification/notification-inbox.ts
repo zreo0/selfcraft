@@ -103,6 +103,17 @@ export class NotificationInbox {
         return rows.map(row => JSON.parse(row.record));
     }
 
+    /** 按稳定标识读取通知，已读后仍可从系统通知重新打开 */
+    public get (id: string): Notification | null {
+        const row = this.database.query('SELECT record FROM notifications WHERE id = ?').get(id) as { record: string } | null;
+        return row ? JSON.parse(row.record) : null;
+    }
+
+    /** 将指定通知标记已读，重复操作保持幂等 */
+    public acknowledge (id: string): void {
+        this.database.query('UPDATE notifications SET acknowledged = 1 WHERE id = ?').run(id);
+    }
+
     /** 将当前通知标记已读，保留去重依据 */
     public clear (): void {
         this.database.run('UPDATE notifications SET acknowledged = 1 WHERE acknowledged = 0');
