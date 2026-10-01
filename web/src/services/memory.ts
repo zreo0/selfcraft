@@ -46,3 +46,8 @@ export function forgetMemory (id: string): Promise<MemoryItemView> {
 export function setMemoryResident (id: string, resident: boolean): Promise<MemoryItemView> {
     return postMemoryAction(id, 'resident', { resident });
 }
+
+/** 设置候选是否从待确认列表隐藏，返回未改变判断的认识 */
+export function setMemoryIgnored (id: string, ignored: boolean): Promise<MemoryItemView> {
+    return postMemoryAction(id, 'ignore', { ignored });
+}

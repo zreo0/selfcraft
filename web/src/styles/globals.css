@@ -2037,6 +2037,25 @@ button {
     margin-top: 0.3rem;
 }
 
+.memory-ignored > summary {
+    width: fit-content;
+    padding: 0.35rem 0;
+    color: var(--muted-foreground);
+    font-size: 0.82rem;
+    font-weight: 650;
+    cursor: pointer;
+}
+
+.memory-ignored > summary:hover {
+    color: var(--foreground);
+}
+
+.memory-ignored > summary:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 4px;
+    border-radius: 0.25rem;
+}
+
 .memory-mouth ul {
     position: relative;
     display: grid;

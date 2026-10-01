@@ -518,9 +518,9 @@ describe('WebServer', () => {
         while (offset !== null) {
             const page = await (await server.fetch(new Request(`http://selfcraft.local/api/memory?offset=${offset}`))).json() as {
                 current: Array<{ id: string }>; pending: Array<{ id: string }>; versions: Array<{ id: string }>;
-                totals: { current: number; pending: number; versions: number }; nextOffset: number | null;
+                totals: { current: number; pending: number; ignored: number; versions: number }; nextOffset: number | null;
             };
-            expect(page.totals).toEqual({ current: 502, pending: 201, versions: 502 });
+            expect(page.totals).toEqual({ current: 502, pending: 201, ignored: 0, versions: 502 });
             page.pending.forEach(item => pendingIds.add(item.id));
             page.versions.forEach(item => versionIds.add(item.id));
             page.current.forEach(item => ids.add(item.id));
@@ -545,6 +545,53 @@ describe('WebServer', () => {
         };
         expect(history.current).toHaveLength(0);
         expect(history.versions.map(item => item.id)).toEqual([old.id]);
+    });
+
+    test('忽略只隐藏候选，持久保存且可恢复，不改变证据、推测和后续学习', async () => {
+        const { server, memory, paths } = createServer();
+        const runId = crypto.randomUUID();
+        const source = memory.recordEvent({ actor: 'user', type: 'user_message', payload: { text: '最近总想喝咖啡' }, runId });
+        const batch = memory.enqueueReflection({ runId, eventIds: [source.id], outcome: 'completed' });
+        memory.claimReflection();
+        memory.completeReflections([batch], { memories: [{ kind: 'preference', content: '用户喜欢咖啡', confidence: 0.6,
+            importance: 0.5, sensitive: false, basis: 'inferred', sourceEventIds: [source.id] }], growth: [] });
+        const candidate = memory.search('咖啡')[0]!;
+        const hypothesis = memory.buildHypothesisContext('咖啡');
+        expect(hypothesis).toContain(candidate.content);
+
+        const invalid = await server.fetch(jsonRequest(`/api/memory/${candidate.id}/ignore`, 'POST', { ignored: 'true' }));
+        expect(invalid.status).toBe(400);
+        expect(memory.listMemoryPage('pending').total).toBe(1);
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const response = await server.fetch(jsonRequest(`/api/memory/${candidate.id}/ignore`, 'POST', { ignored: true }));
+            expect(response.status).toBe(200);
+        }
+        const overview = await (await server.fetch(new Request('http://selfcraft.local/api/memory?q=咖啡'))).json() as {
+            pending: unknown[]; ignored: Array<{ id: string }>; totals: { pending: number; ignored: number };
+        };
+        expect(overview.pending).toHaveLength(0);
+        expect(overview.ignored.map(item => item.id)).toEqual([candidate.id]);
+        expect(overview.totals.pending).toBe(0);
+        expect(overview.totals.ignored).toBe(1);
+        expect(memory.getMemory(candidate.id)).toEqual(candidate);
+        expect(memory.search('咖啡')).toEqual([candidate]);
+        expect(memory.buildHypothesisContext('咖啡')).toBe(hypothesis);
+        expect(memory.isSourceForgotten(source.id)).toBe(false);
+        expect(memory.recallEpisode({ query: '咖啡' }).events.map(item => item.id)).toEqual([source.id]);
+
+        const reopened = new MemoryStore(paths.state);
+        expect(reopened.listMemoryPage('ignored').items.map(item => item.id)).toEqual([candidate.id]);
+        expect(reopened.listMemoryPage('pending').total).toBe(0);
+        // 同一来源仍可以支撑新的认识，忽略不会封禁该段对话
+        const learned = reopened.remember({ kind: 'fact', content: '用户最近常想起咖啡', confidence: 1,
+            importance: 0.5, sourceEventIds: [source.id] });
+        expect(learned.status).toBe('active');
+        const rejected = await server.fetch(jsonRequest(`/api/memory/${learned.id}/ignore`, 'POST', { ignored: true }));
+        expect(rejected.status).toBe(400);
+        const restored = await server.fetch(jsonRequest(`/api/memory/${candidate.id}/ignore`, 'POST', { ignored: false }));
+        expect(restored.status).toBe(200);
+        expect(memory.listMemoryPage('ignored').total).toBe(0);
+        expect(memory.listMemoryPage('pending').items).toEqual([candidate]);
     });
 
     test('遗忘正文不进入管理页的候选、详情或搜索，并标出不可确认的候选', async () => {

@@ -566,16 +566,20 @@ export class WebServer {
         const profileIds = memory.profileMemories().map(item => item.id);
         const current = memory.listMemoryPage('current', { query, offset, profileIds });
         const pending = memory.listMemoryPage('pending', { query, offset });
+        const ignored = memory.listMemoryPage('ignored', { query, offset });
         const versions = memory.listMemoryPage('versions', { query, offset });
-        const totals = { current: current.total, pending: pending.total, versions: versions.total };
+        const totals = { current: current.total, pending: pending.total, ignored: ignored.total, versions: versions.total };
+        /** 为候选附上旧版本及当前能否确认的判断 */
+        const pendingView = (item: MemoryItem) => {
+            const previous = item.supersedesId ? memory.getMemory(item.supersedesId) : null;
+            return { ...memoryView(item), previous: previous ? memoryView(previous) : null,
+                confirmable: !item.supersedesId || previous?.status === 'active' };
+        };
         return {
             profileIds,
             current: current.items.map(memoryView),
-            pending: pending.items.map(item => {
-                const previous = item.supersedesId ? memory.getMemory(item.supersedesId) : null;
-                return { ...memoryView(item), previous: previous ? memoryView(previous) : null,
-                    confirmable: !item.supersedesId || previous?.status === 'active' };
-            }),
+            pending: pending.items.map(pendingView),
+            ignored: ignored.items.map(pendingView),
             versions: versions.items.map(memoryView),
             totals,
             nextOffset: Object.values(totals).some(total => total > offset + 100) ? offset + 100 : null,
@@ -611,7 +615,7 @@ export class WebServer {
      * 执行记忆页上的一次修正，确认与纠正都以本次用户操作作为新的来源
      *
      * @param id 目标认识
-     * @param action confirm、correct、forget 或 resident
+     * @param action confirm、correct、forget、resident 或 ignore
      * @param body 已解析的 JSON 请求体
      * @returns 操作后的认识
      */
@@ -620,6 +624,11 @@ export class WebServer {
         const target = memory.getMemory(id);
         if (!target) {
             throw new Error('这条记忆不存在');
+        }
+        if (action === 'ignore') {
+            const input = z.object({ ignored: z.boolean() }).parse(body);
+            // 显示偏好不生成用户陈述，避免被 Reflection 当作正面或负面反馈
+            return memory.setReviewIgnored(id, input.ignored);
         }
         const runId = randomUUID();
         const event = {

@@ -25,6 +25,7 @@ function versionMark (item: MemoryItemView, currentIds: Set<string>): string {
  * 右侧的变化之河：河口是等你确认的变化，河道按时间记录每个版本
  *
  * @param props.pending 待确认候选
+ * @param props.ignored 已隐藏的候选
  * @param props.versions 全部版本，按认知时间倒序
  * @param props.currentIds 此刻成立的认识
  * @param props.timezone 用户时区
@@ -34,10 +35,12 @@ function versionMark (item: MemoryItemView, currentIds: Set<string>): string {
  * @param props.searching 是否处于检索结果中
  * @param props.onConfirm 确认候选
  * @param props.onReject 否定候选
+ * @param props.onIgnore 忽略或恢复候选的显示
  * @param props.onSelectVersion 从河中回到对应的认识
  */
 export function MemoryRiver ({
     pending,
+    ignored,
     versions,
     currentIds,
     timezone,
@@ -47,9 +50,11 @@ export function MemoryRiver ({
     searching,
     onConfirm,
     onReject,
+    onIgnore,
     onSelectVersion,
 }: {
     pending: MemoryPendingView[];
+    ignored: MemoryPendingView[];
     versions: MemoryItemView[];
     currentIds: Set<string>;
     timezone: string;
@@ -59,6 +64,7 @@ export function MemoryRiver ({
     searching: boolean;
     onConfirm: (id: string, validFrom?: string) => Promise<void>;
     onReject: (id: string) => Promise<void>;
+    onIgnore: (id: string, ignored: boolean) => Promise<void>;
     onSelectVersion: (item: MemoryItemView) => void;
 }) {
     const reduce = useReducedMotion();
@@ -120,11 +126,33 @@ export function MemoryRiver ({
                                 key={item.id}
                                 onConfirm={validFrom => onConfirm(item.id, validFrom)}
                                 onReject={() => onReject(item.id)}
+                                onIgnore={() => onIgnore(item.id, true)}
                                 timezone={timezone}
                             />
                         ))}
                     </ul>
                 </section>
+            )}
+
+            {ignored.length > 0 && (
+                <details className="memory-mouth memory-ignored">
+                    <summary>已忽略<span className="memory-count-chip">{ignored.length}</span></summary>
+                    <p className="memory-quiet">只隐藏，没有判定对错。你随时可以恢复显示。</p>
+                    <ul>
+                        {ignored.map(item => (
+                            <PendingItem
+                                busy={busy}
+                                ignored
+                                item={item}
+                                key={item.id}
+                                onConfirm={validFrom => onConfirm(item.id, validFrom)}
+                                onReject={() => onReject(item.id)}
+                                onIgnore={() => onIgnore(item.id, false)}
+                                timezone={timezone}
+                            />
+                        ))}
+                    </ul>
+                </details>
             )}
 
             {stream.length === 0 ? (
@@ -195,19 +223,25 @@ export function MemoryRiver ({
  * @param props.busy 是否正在提交
  * @param props.onConfirm 确认候选
  * @param props.onReject 否定候选
+ * @param props.ignored 是否仅在已忽略区域显示
+ * @param props.onIgnore 忽略或恢复显示
  */
 function PendingItem ({
     item,
+    ignored = false,
     timezone,
     busy,
     onConfirm,
     onReject,
+    onIgnore,
 }: {
     item: MemoryPendingView;
+    ignored?: boolean;
     timezone: string;
     busy: boolean;
     onConfirm: (validFrom?: string) => Promise<void>;
     onReject: () => Promise<void>;
+    onIgnore: () => Promise<void>;
 }) {
     // 情况变化必须知道从哪天开始；候选没有给出时，先按说这句话的日期填好，由用户确认或修改
     const needsDate = item.revisionKind === 'world_change' && !item.validFrom;
@@ -215,15 +249,15 @@ function PendingItem ({
         timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
     }).format(new Date(item.knownFrom)));
     const [error, setError] = useState<string | null>(null);
-    const [pendingAction, setPendingAction] = useState<'confirm' | 'reject' | null>(null);
+    const [pendingAction, setPendingAction] = useState<'confirm' | 'reject' | 'ignore' | null>(null);
     const reason = item.previous
         ? item.revisionKind === 'world_change'
             ? `情况可能变了${item.validFrom ? ` · ${formatMemoryDate(item.validFrom, timezone)}起` : ''}`
             : '之前可能记错了'
         : basisLabel(item.basis);
 
-    /** 执行确认或否定，失败时保留在这条候选旁边 */
-    async function run (kind: 'confirm' | 'reject', action: () => Promise<void>): Promise<void> {
+    /** 执行候选操作，失败时保留错误在这条候选旁边 */
+    async function run (kind: 'confirm' | 'reject' | 'ignore', action: () => Promise<void>): Promise<void> {
         setError(null);
         setPendingAction(kind);
         try {
@@ -249,7 +283,7 @@ function PendingItem ({
                     <p className="memory-pending-text">{item.content}</p>
                 )}
                 <p className="memory-pending-meta">{reason} · {formatMemoryDate(item.knownFrom, timezone)}</p>
-                {item.confirmable && needsDate && (
+                {!ignored && item.confirmable && needsDate && (
                     <>
                         <Input
                             className="memory-date-field"
@@ -262,19 +296,33 @@ function PendingItem ({
                         <p className="memory-hint">先按你说这句话的日期填好了，不对可以改。</p>
                     </>
                 )}
-                {!item.confirmable && <p className="memory-hint">原认识已变化或被忘记，请通过对话重新核对，也可以移除此候选。</p>}
+                {!ignored && !item.confirmable && <p className="memory-hint">原认识已变化或被忘记，请通过对话重新核对，也可以移除此候选。</p>}
                 <div className="memory-form-actions memory-pending-actions">
+                    {!ignored && (
+                        <>
+                            <Button
+                                disabled={busy || !item.confirmable || (needsDate && !validFrom)}
+                                onClick={() => void run('confirm', () => onConfirm(needsDate ? validFrom : undefined))}
+                                size="sm"
+                                type="button"
+                                variant="outline"
+                            >
+                                {pendingAction === 'confirm' ? '正在确认' : '确认'}
+                            </Button>
+                            <Button disabled={busy} onClick={() => void run('reject', onReject)} size="sm" type="button" variant="ghost">
+                                {pendingAction === 'reject' ? '正在移除' : item.confirmable ? '不对' : '移除候选'}
+                            </Button>
+                        </>
+                    )}
                     <Button
-                        disabled={busy || !item.confirmable || (needsDate && !validFrom)}
-                        onClick={() => void run('confirm', () => onConfirm(needsDate ? validFrom : undefined))}
+                        disabled={busy}
+                        onClick={() => void run('ignore', onIgnore)}
                         size="sm"
+                        title={ignored ? '重新显示在等待确认中' : '只隐藏，不判定对错，可在已忽略中恢复'}
                         type="button"
-                        variant="outline"
+                        variant="ghost"
                     >
-                        {pendingAction === 'confirm' ? '正在确认' : '确认'}
-                    </Button>
-                    <Button disabled={busy} onClick={() => void run('reject', onReject)} size="sm" type="button" variant="ghost">
-                        {pendingAction === 'reject' ? '正在移除' : item.confirmable ? '不对' : '移除候选'}
+                        {pendingAction === 'ignore' ? (ignored ? '正在恢复' : '正在忽略') : (ignored ? '恢复显示' : '忽略')}
                     </Button>
                 </div>
                 {error && <p className="memory-inline-error" role="alert">{error}</p>}

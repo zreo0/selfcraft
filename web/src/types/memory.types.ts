@@ -58,10 +58,12 @@ export interface MemoryOverview {
     current: MemoryItemView[];
     /** 等待确认的候选 */
     pending: MemoryPendingView[];
+    /** 用户仅选择隐藏、未判定对错的候选 */
+    ignored: MemoryPendingView[];
     /** 按认知时间倒序的非候选版本，候选单独展示 */
     versions: MemoryItemView[];
     /** 各栏匹配总数，不是当前页数量 */
-    totals: { current: number; pending: number; versions: number };
+    totals: { current: number; pending: number; ignored: number; versions: number };
     /** 下一页偏移；全部读完时为空 */
     nextOffset: number | null;
 }

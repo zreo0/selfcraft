@@ -1385,12 +1385,12 @@ export class MemoryStore {
     /**
      * 分页读取管理页的一栏，在数据库内完成状态筛选、全文检索和计数
      *
-     * @param scope 当前认识、待确认或历史版本
+     * @param scope 当前认识、待确认、已忽略或历史版本
      * @param options 检索词、分页偏移，以及需要优先展示的档案标识
      * @returns 最多 100 条记录与匹配总数
      */
     public listMemoryPage (
-        scope: 'current' | 'pending' | 'versions',
+        scope: 'current' | 'pending' | 'ignored' | 'versions',
         options: { query?: string; offset?: number; profileIds?: string[] } = {},
     ): { items: MemoryItem[]; total: number } {
         const now = new Date().toISOString();
@@ -1399,8 +1399,10 @@ export class MemoryStore {
         if (scope === 'current') {
             conditions.push("(m.status = 'active' OR (m.status = 'superseded' AND m.valid_to > ?)) AND (m.valid_to IS NULL OR m.valid_to > ?)");
             parameters.push(now, now);
+        } else if (scope === 'pending' || scope === 'ignored') {
+            conditions.push(`m.status = 'candidate' AND m.review_ignored = ${scope === 'ignored' ? 1 : 0}`);
         } else {
-            conditions.push(scope === 'pending' ? "m.status = 'candidate'" : "m.status != 'candidate'");
+            conditions.push("m.status != 'candidate'");
         }
         const match = memoryQuery(options.query || '');
         if (options.query?.trim() && !match) return { items: [], total: 0 };
@@ -1420,6 +1422,21 @@ export class MemoryStore {
             ORDER BY ${order} ${match ? 'f.rank ASC,' : ''} m.known_from DESC, m.id ASC LIMIT 100 OFFSET ?`)
             .all(...parameters, ...profileIds, options.offset || 0) as MemoryRow[];
         return { items: rows.map(row => this.toMemoryItem(row)), total };
+    }
+
+    /**
+     * 只调整候选在确认列表中的可见性，不作为记忆判断或学习证据
+     *
+     * @param id 候选标识
+     * @param ignored 是否忽略
+     * @returns 状态和来源保持不变的候选
+     */
+    public setReviewIgnored (id: string, ignored: boolean): MemoryItem {
+        // 不改 updated_at，避免纯显示操作使 Reflection 的证据快照过期
+        const result = this.database.query(`UPDATE memories SET review_ignored = ?
+            WHERE id = ? AND status = 'candidate'`).run(ignored ? 1 : 0, id);
+        if (!result.changes) throw new Error('只能忽略或恢复待确认的认识');
+        return this.getMemory(id)!;
     }
 
     /**
@@ -1593,6 +1610,7 @@ export class MemoryStore {
         const columns = this.database.query('PRAGMA table_info(memories)').all() as Array<{ name: string }>;
         if (!columns.some(column => column.name === 'resident')) this.database.run('ALTER TABLE memories ADD COLUMN resident INTEGER NOT NULL DEFAULT 0');
         if (!columns.some(column => column.name === 'basis')) this.database.run('ALTER TABLE memories ADD COLUMN basis TEXT');
+        if (!columns.some(column => column.name === 'review_ignored')) this.database.run('ALTER TABLE memories ADD COLUMN review_ignored INTEGER NOT NULL DEFAULT 0');
     }
 
     /** 在当前事务中写入一个事件 */

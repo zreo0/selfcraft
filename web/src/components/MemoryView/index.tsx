@@ -22,6 +22,7 @@ import {
     forgetMemory,
     getMemoryDetail,
     getMemoryOverview,
+    setMemoryIgnored,
     setMemoryResident,
 } from '@/services/memory';
 import type {
@@ -94,6 +95,7 @@ export function MemoryView ({
             if (previous && offset > 0) {
                 next.current = mergeEntries(previous.current, next.current);
                 next.pending = mergeEntries(previous.pending, next.pending);
+                next.ignored = mergeEntries(previous.ignored, next.ignored);
                 next.versions = mergeEntries(previous.versions, next.versions);
             }
             overviewRef.current = next;
@@ -240,6 +242,7 @@ export function MemoryView ({
                 .map(([kind, label]) => ({ kind, label, items: others.filter(item => item.kind === kind) }))
                 .filter(group => group.items.length > 0),
             pending: overview.pending,
+            ignored: overview.ignored,
             versions: overview.versions,
             currentIds: new Set([...overview.current, ...overview.versions].filter(isCurrentMemory).map(item => item.id)),
             total: overview.totals.current,
@@ -412,12 +415,16 @@ export function MemoryView ({
                     busy={busyId !== null || loadState === 'search' || Boolean(loadError)}
                     currentIds={view.currentIds}
                     freshIds={freshIds}
+                    ignored={view.ignored}
                     litIds={litIds}
                     onConfirm={async (id, validFrom) => {
                         await act(id, () => confirmMemory(id, validFrom), '已确认，这条认识开始生效');
                     }}
                     onReject={async id => {
                         await act(id, () => forgetMemory(id), '已否定，我不会再从这段话里学到它');
+                    }}
+                    onIgnore={async (id, ignored) => {
+                        await act(id, () => setMemoryIgnored(id, ignored), ignored ? '已忽略，没有判定对错，可在已忽略中恢复' : '已恢复到等待确认');
                     }}
                     onSelectVersion={item => void handleSelectVersion(item)}
                     pending={view.pending}
@@ -428,7 +435,7 @@ export function MemoryView ({
             </div>
 
             <div className="memory-pagination">
-                <p className="memory-quiet">已加载 {overview.current.length}/{overview.totals.current} 条当前认识 · {overview.pending.length}/{overview.totals.pending} 条候选 · {overview.versions.length}/{overview.totals.versions} 条版本记录</p>
+                <p className="memory-quiet">已加载 {overview.current.length}/{overview.totals.current} 条当前认识 · {overview.pending.length}/{overview.totals.pending} 条候选 · {overview.versions.length}/{overview.totals.versions} 条版本记录{overview.totals.ignored > 0 && ` · ${overview.ignored.length}/${overview.totals.ignored} 条已忽略`}</p>
                 {overview.nextOffset !== null && (
                     <Button disabled={loading || busyId !== null} onClick={() => void load(query.trim(), overview.nextOffset!)} type="button" variant="outline">
                         {loadState === 'more' ? '正在加载' : '加载更多记忆'}
