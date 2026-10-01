@@ -1,13 +1,14 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { generateText } from 'ai';
 import { ConfigStore } from '../src/config/config-store';
 import { Logger } from '../src/logging/logger';
 import { MemoryStore } from '../src/memory/memory-store';
 import { ReflectionWorker } from '../src/memory/reflection-worker';
 import { ModelFactory } from '../src/model/model-factory';
 
-/** 用真实模型验证明确陈述、计划、纠正和重复证据的学习闭环 */
+/** 用真实模型验证陈述、跨轮反馈、执行纠错及后续使用的学习闭环 */
 async function main (): Promise<void> {
     const baseURL = process.env.SELFCRAFT_TEST_BASE_URL;
     const apiKey = process.env.SELFCRAFT_TEST_API_KEY;
@@ -45,7 +46,44 @@ async function main (): Promise<void> {
         const repeated = await learn('再确认一下：我一直住在苏州。');
         const current = memory.search('苏州').filter(item => item.status === 'active');
         if (current.length !== 1 || !current[0]!.sourceEventIds.includes(repeated.id)) throw new Error('重复陈述未补充证据或产生了重复认识');
-        console.log(JSON.stringify({ modelId, passed: ['statement', 'resident', 'hypothesis', 'correction', 'reinforce'] }));
+        memory.recordEvent({ actor: 'agent', type: 'assistant_message', runId: 'previous-offer',
+            payload: { text: '要不要以后都在周报结尾附上完整英文翻译？', channel: 'foreground' } });
+        await learn('不用，以后这类都不要自动附上，除非我明确要求。');
+        const refusal = memory.search('周报 英文翻译').find(item => item.status === 'active'
+            && /英文|翻译/.test(item.content));
+        if (!refusal) throw new Error('跨轮反馈没有结合所回应的具体建议形成认识');
+        console.log(`${modelId}: cross-turn feedback passed`);
+
+        const runId = crypto.randomUUID();
+        const request = memory.recordEvent({ actor: 'user', type: 'user_message', runId,
+            payload: { text: '请读取 example.test 的今日新闻榜单，给我前两条标题' } });
+        const failedCall = memory.recordEvent({ actor: 'agent', type: 'tool_call', runId,
+            payload: { toolName: 'web_fetch', input: { url: 'https://example.test/old-news' } } });
+        memory.recordEvent({ actor: 'tool:web_fetch', type: 'tool_error', runId, sourceEventId: failedCall.id,
+            payload: { error: '404，旧新闻榜单地址已失效' } });
+        const correctedCall = memory.recordEvent({ actor: 'agent', type: 'tool_call', runId,
+            payload: { toolName: 'web_fetch', input: { url: 'https://example.test/news-board' } } });
+        memory.recordEvent({ actor: 'tool:web_fetch', type: 'tool_result', runId, sourceEventId: correctedCall.id,
+            payload: { result: { url: 'https://example.test/news-board', title: '今日新闻榜单',
+                items: [{ rank: 1, title: '城市图书馆开放' }, { rank: 2, title: '气象卫星成功发射' }] } } });
+        memory.recordEvent({ actor: 'agent', type: 'assistant_message', runId, sourceEventId: request.id,
+            payload: { text: '旧地址失效，改用 /news-board 取得实际榜单：城市图书馆开放；气象卫星成功发射', channel: 'foreground' } });
+        worker.enqueue({ runId, eventIds: memory.listEventsByRun(runId).map(event => event.id), outcome: 'completed' });
+        await worker.waitForIdle(180000);
+        const lesson = memory.search('example.test news-board').find(item => item.kind === 'lesson'
+            && item.status === 'active' && item.basis === 'observed' && item.content.includes('news-board'));
+        if (!lesson) throw new Error('具体纠错经验没有保留条件并以 observed 生效');
+        const context = memory.buildContext('再次读取 example.test 今日新闻榜单');
+        if (!context.includes(lesson.content)) throw new Error('有效执行经验没有进入下一次相关上下文');
+        // 隔离已生效记忆验证后续使用，避免原始事件直接泄露成功路径使测试误通过
+        const structured = context.match(/<structured-memory>[\s\S]*?<\/structured-memory>/)?.[0] || '';
+        const active = ModelFactory.create(config, 'reflection', logger);
+        const next = await generateText({ model: active.model,
+            instructions: '根据已验证记忆选择实际操作路径，只返回下一次读取所用的 URL。',
+            prompt: `${structured}\n请再次读取 example.test 今日新闻榜单。`, maxOutputTokens: 1000 });
+        if (!next.text.includes('example.test/news-board')) throw new Error('后续模型没有采用已验证的地址');
+        console.log(JSON.stringify({ modelId, passed: ['statement', 'resident', 'hypothesis', 'correction',
+            'reinforce', 'cross-turn-feedback', 'verified-lesson', 'subsequent-use'] }));
     } finally {
         worker?.stop();
         fs.rmSync(root, { recursive: true, force: true });

@@ -48,6 +48,52 @@ afterEach(() => {
 });
 
 describe('AgentRuntime', () => {
+    test('前台单独呈现相关推测，用户确认后通过现有工具生效', async () => {
+        const root = createTemporaryDirectory();
+        const paths = resolvePaths('development', path.join(root, 'home'));
+        paths.project = path.resolve(import.meta.dir, '../../..');
+        const workspace = new WorkspaceService(paths.workspace, path.join(paths.project, 'workspace-template'));
+        workspace.initialize();
+        const config = new ConfigStore(paths.config);
+        const logger = new Logger(paths.logs);
+        const memory = new MemoryStore(paths.state);
+        const event = memory.recordEvent({ actor: 'user', type: 'user_message', runId: 'earlier',
+            payload: { text: '上次那家酒店有点吵' } });
+        const reflection = memory.enqueueReflection({ runId: 'earlier', eventIds: [event.id], outcome: 'completed' });
+        memory.claimReflection();
+        memory.completeReflections([reflection], { memories: [{ kind: 'preference', content: '选择酒店时偏好安静',
+            basis: 'inferred', assertion: 'established', needsConfirmation: true, sensitive: false,
+            confidence: 0.6, importance: 0.7, sourceEventIds: [event.id] }], growth: [] });
+        const candidate = memory.search('酒店')[0]!;
+        let calls = 0;
+        const model = new MockLanguageModelV4({ doStream: async () => {
+            calls++;
+            return { stream: simulateReadableStream({ chunks: calls === 2 ? [
+                { type: 'tool-call', toolCallId: 'confirm-hotel', toolName: 'memory_confirm', input: JSON.stringify({ id: candidate.id }) },
+                { type: 'finish', finishReason: { unified: 'tool-calls', raw: undefined }, usage: usage() },
+            ] : [
+                { type: 'text-start', id: 'text' },
+                { type: 'text-delta', id: 'text', delta: calls === 1 ? '这次酒店也优先考虑安静吗？' : '已确认' },
+                { type: 'text-end', id: 'text' },
+                { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+            ] as any }) };
+        } });
+        const agent = new AgentRuntime(config, workspace, new SkillRegistry(path.join(paths.workspace, 'skills')),
+            new SessionStore(paths.sessions), new ContextManager(),
+            new EvolutionService(paths, new ReleaseStore(paths.supervisor, paths.evolution), logger), memory,
+            { beginAgentActivity: () => undefined, endAgentActivity: () => undefined, enqueue: () => 'reflection' },
+            createMemoryTools(memory) as never, logger,
+            () => ({ model, providerId: 'mock', modelId: 'mock', contextWindow: 128000, maxOutputTokens: 4096 }));
+        await agent.run('帮我考虑酒店选择', () => undefined);
+        const system = model.doStreamCalls[0]!.prompt.filter(message => message.role === 'system').map(message => message.content).join('\n');
+        expect(system.match(/<pending-understanding>[\s\S]*?<\/pending-understanding>/)?.[0]).toContain(candidate.id);
+        expect(system.match(/<structured-memory>[\s\S]*?<\/structured-memory>/)?.[0]).not.toContain(candidate.id);
+        expect(memory.getMemory(candidate.id)?.status).toBe('candidate');
+        await agent.run('是的，我选酒店一直偏好安静，请确认这一偏好', () => undefined);
+        expect(memory.getMemory(candidate.id)?.status).toBe('active');
+        expect(memory.getMemory(candidate.id)?.basis).toBe('stated');
+    });
+
     test('工具纠正后的下一步立即刷新档案，运行中输入更新召回线索', async () => {
         const root = createTemporaryDirectory();
         const paths = resolvePaths('development', path.join(root, 'home'));

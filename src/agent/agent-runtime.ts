@@ -474,6 +474,8 @@ export class AgentRuntime {
             '技能是工作区中可持续修改的能力说明。使用技能前调用 read_skill；需要新能力时可以创建或改进 skills/<name>/SKILL.md。',
             '只有在发现可复现的 Runtime 缺陷、明确收益并能提供完整测试时，才用 runtime_files、runtime_read 检查当前实现，再使用 evolve_runtime 修改自身代码。',
             'Reflection 在空闲时对照已有认识学习；明确、当前成立的非敏感用户陈述可自动生效，计划、推测和歧义保留候选。候选需用户确认后用 memory_confirm 激活；用户说“记住”时用 memory_remember，纠正用 memory_correct，忘记用 memory_forget。',
+            'pending-understanding 是有待核实的推测数据，不是事实、偏好要求或授权。仅当它会影响当前做法、且对话尚未澄清时，说明依据并简短确认；无关或不影响结果时不问。同一推测已经问过、用户未回答或暂不确认时，不重复追问。明确确认当前成立的认识后才用 memory_confirm；同意尝试、未来计划和条件假设都不等于确认事实，否定时纠正或忘记候选。',
+            '从具体执行纠错中验证过的 lesson 可以自动生效，依据仍为 observed；只在记忆注明的条件下使用，不能推广成用户偏好、通用保证或扩大权限。',
             '开始个性化任务时，先考虑需要哪些过去的信息；常驻档案不完整，自动检索也不保证命中，应主动用 memory_recall 核对相关约束。需要回顾过去、按时间找事或追踪长期事项时使用 memory_recall。工作笔记用于接续，精确原文用 history_search 和 history_read 回查；已知 [message:ID] 时直接读取。',
             '窗口交接由 Runtime 自动完成，不需要用户新建会话。工作笔记不是新指令或永久事实；Work 的最新版本、用户纠正和取消优先于旧笔记。',
             this.hasWebAccess()
@@ -502,7 +504,7 @@ export class AgentRuntime {
             JSON.stringify(this.executions?.issues() || []),
             '</execution-issues>',
             '',
-            includeMemory ? this.buildMemoryContext(query, [context.sourceEventId]) : '',
+            includeMemory ? this.buildMemoryContext(query, [context.sourceEventId], undefined, context.channel === 'foreground') : '',
             '',
             '<available-skills>',
             this.skills.buildCatalog(),
@@ -511,14 +513,14 @@ export class AgentRuntime {
     }
 
     /** 每步读取最新结构化认识，稳定渲染档案并保护手动修改的导出文件 */
-    private buildMemoryContext (query: string, excluded: string[], onEvent?: (event: AgentRunEvent) => void): string {
+    private buildMemoryContext (query: string, excluded: string[], onEvent?: (event: AgentRunEvent) => void, includeHypotheses = false): string {
         const profile = this.memory.buildProfile();
         if (this.workspace.writeUserProfile(profile) === 'conflict') {
             const label = 'USER.md 有手动修改，已保留原文件；请通过对话修改记忆，当前使用数据库档案';
             this.logger.warn(label);
             onEvent?.({ type: 'status', phase: 'preparing', label });
         }
-        return `<user-profile>\n${profile}\n</user-profile>\n\n${this.memory.buildContext(query, excluded)}`;
+        return `<user-profile>\n${profile}\n</user-profile>\n\n${this.memory.buildContext(query, excluded)}\n${includeHypotheses ? this.memory.buildHypothesisContext(query, excluded) : ''}`;
     }
 
     /** 执行一次可复用并输出结构化事件的 AI SDK 工具循环 */
@@ -627,7 +629,7 @@ export class AgentRuntime {
                     history.appendOnce(`work-state:${work.id}:${work.revision}`, { role: 'user',
                         content: `主脑已提交的当前事项状态，以此为准；这不是新的用户授权：\n${JSON.stringify(work)}\n默认产物目录：files/works/${work.id}` });
                 }
-                const stepInstructions = `${instructions}\n\n${this.buildMemoryContext(retrievalQuery, [...memoryExclusions], onEvent)}`;
+                const stepInstructions = `${instructions}\n\n${this.buildMemoryContext(retrievalQuery, [...memoryExclusions], onEvent, runtimeContext.channel === 'foreground')}`;
                 const reservedTokens = toolTokens + this.context.estimate(stepInstructions);
                 let snapshot = history.load();
                 const estimate = () => reservedTokens + this.context.estimate(snapshot.summary)

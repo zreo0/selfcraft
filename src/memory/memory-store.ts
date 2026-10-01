@@ -85,6 +85,21 @@ export interface TopicRecord extends TopicInput {
 
 /** Reflection 或显式操作产生的记忆内容 */
 export interface MemoryCandidate {
+    /** 具体执行纠错的证据，不用于用户偏好或概括规律 */
+    verifiedCorrection?: {
+        /** 原做法失败的事件 */
+        failureEventId: string;
+        /** 改正后的工具调用 */
+        correctionEventId: string;
+        /** 改正后确实取得所需结果的事件 */
+        resultEventId: string;
+        /** 必须同时出现在记忆正文中的适用条件 */
+        applicability: string;
+        /** 结果为何能证明原问题已解决 */
+        explanation: string;
+        /** 是否包含对用户的推断，此类认识仍需确认 */
+        aboutUser: boolean;
+    };
     /** 是否适合跨任务常驻 */
     resident?: boolean;
     /** 内容依据，不代表指令权限 */
@@ -203,6 +218,8 @@ export interface EpisodeView {
 
 /** Reflection 产生的成长候选 */
 export interface GrowthCandidate {
+    /** 增强本次提供的同一个成长候选，不按标题猜测目标 */
+    targetId?: string;
     /** 候选作用的层级 */
     kind: 'skill' | 'runtime';
     /** 简短标题 */
@@ -424,6 +441,18 @@ export class MemoryStore {
             SELECT * FROM events WHERE run_id = ? ORDER BY seq ASC
         `).all(requireText(runId, '运行标识')) as EventRow[];
         return rows.map(row => this.toEventRecord(row));
+    }
+
+    /** 为当前前台用户事件寻找此前最近的前台回复，仅作理解反馈的背景 */
+    public previousAssistantReply (event: EventRecord): EventRecord | null {
+        if (event.actor !== 'user' || event.taskId || (event.payload as { channel?: string } | null)?.channel === 'background') return null;
+        const rows = this.database.query(`SELECT * FROM events
+            WHERE seq < ? AND actor = 'agent' AND event_type = 'assistant_message'
+                AND task_id IS NULL AND json_extract(payload, '$.channel') = 'foreground'
+            ORDER BY seq DESC LIMIT 1`).all(event.seq) as EventRow[];
+        const row = rows[0];
+        // 被忘记的最近回复不能退回到更早、无关的回复
+        return row && !this.isSourceForgotten(row.id) ? this.toEventRecord(row) : null;
     }
 
     /**
@@ -978,9 +1007,11 @@ export class MemoryStore {
      *
      * @param jobIds 本次一起回看的 Reflection 标识
      * @param result 带事件级来源的结构化结果
+     * @param visibleMemories 本次展示给 Reflection 的记忆快照
+     * @param visibleGrowth 本次展示给 Reflection 的成长候选快照
      * @returns 被跳过或降级为候选的操作说明，不包含记忆正文
      */
-    public completeReflections (jobIds: string[], result: ReflectionResult, visibleMemories: MemoryItem[] = []): Array<{ targetId?: string; reason: string }> {
+    public completeReflections (jobIds: string[], result: ReflectionResult, visibleMemories: MemoryItem[] = [], visibleGrowth: GrowthProposal[] = []): Array<{ targetId?: string; reason: string }> {
         const ids = uniqueStrings(jobIds);
         if (ids.length === 0) {
             throw new Error('Reflection 批次不能为空');
@@ -1019,14 +1050,23 @@ export class MemoryStore {
                         continue;
                     }
                 }
+                const stated = memory.basis === 'stated' && memory.assertion === 'established'
+                    && memory.needsConfirmation === false && this.getEvents(sourceEventIds).every(event => event.actor === 'user');
+                const verified = this.isVerifiedCorrection(memory, sourceEventIds)
+                    && (!target || (target.kind === 'lesson' && target.basis === 'observed'));
+                const canActivate = stated || verified;
                 if (operation === 'reinforce') {
                     for (const eventId of sourceEventIds) this.database.query(
                         'INSERT OR IGNORE INTO memory_sources (memory_id, event_id) VALUES (?, ?)',
                     ).run(target!.id, eventId);
+                    // 补证据只能激活同一条认识，不能借 reinforce 偷换内容或绕过修订链
+                    if (target!.status === 'candidate' && !target!.supersedesId && canActivate
+                        && target!.kind === memory.kind && target!.content === memory.content) {
+                        if (stated) this.confirmMemory(target!.id, sourceEventIds);
+                        else this.activateObservedMemory(target!.id);
+                    }
                     continue;
                 }
-                const canActivate = memory.basis === 'stated' && memory.assertion === 'established'
-                    && memory.needsConfirmation === false && this.getEvents(sourceEventIds).every(event => event.actor === 'user');
                 const candidate = { ...memory, sourceEventIds };
                 // 仅隔离可预期的日期校验错误；数据库写入仍由外层事务统一保证
                 try {
@@ -1066,9 +1106,15 @@ export class MemoryStore {
                 const existing = this.findDuplicateMemory(candidate);
                 if (!existing) {
                     this.insertMemory(candidate, canActivate ? 'active' : 'candidate');
-                } else if (existing.status === 'candidate' && canActivate) {
+                } else if (existing.status === 'candidate' && (stated || (verified && existing.basis === 'observed'))) {
                     // 重复证据本身不构成确认；只有本次陈述满足原有生效条件才激活
-                    this.confirmMemory(existing.id, sourceEventIds);
+                    if (stated) this.confirmMemory(existing.id, sourceEventIds);
+                    else {
+                        for (const eventId of sourceEventIds) this.database.query(
+                            'INSERT OR IGNORE INTO memory_sources (memory_id, event_id) VALUES (?, ?)',
+                        ).run(existing.id, eventId);
+                        this.activateObservedMemory(existing.id);
+                    }
                 } else {
                     for (const eventId of sourceEventIds) this.database.query(
                         'INSERT OR IGNORE INTO memory_sources (memory_id, event_id) VALUES (?, ?)',
@@ -1081,6 +1127,15 @@ export class MemoryStore {
                 }
                 const sourceEventIds = requireReflectionSources(growth.sourceEventIds, allowedEvents);
                 if (sourceEventIds.some(id => this.isSourceForgotten(id))) continue;
+                if (growth.targetId) {
+                    const shown = visibleGrowth.find(item => item.id === growth.targetId);
+                    const current = this.listGrowth(undefined, 200).find(item => item.id === growth.targetId);
+                    if (!shown || !current || current.status !== 'proposed' || shown.status !== 'proposed'
+                        || current.kind !== growth.kind || current.updatedAt !== shown.updatedAt) {
+                        notices.push({ targetId: growth.targetId, reason: '跳过：成长候选目标不可用或已变化' });
+                        continue;
+                    }
+                }
                 const reflectionIds = uniqueStrings(sourceEventIds.flatMap(
                     eventId => reflectionIdsByEvent.get(eventId) || [],
                 ));
@@ -1095,6 +1150,42 @@ export class MemoryStore {
             return notices;
         });
         return commit.immediate();
+    }
+
+    /** 校验具体执行纠错的事件链；是否真正解决问题仍由 Reflection 结合结果内容判断 */
+    private isVerifiedCorrection (memory: MemoryCandidate, sources: string[]): boolean {
+        const proof = memory.verifiedCorrection;
+        if (!proof || proof.aboutUser !== false || memory.kind !== 'lesson' || memory.basis !== 'observed'
+            || memory.assertion !== 'established' || memory.needsConfirmation !== false
+            || !proof.applicability.trim() || !proof.explanation.trim()
+            || !memory.content.includes(proof.applicability)) return false;
+        const ids = [proof.failureEventId, proof.correctionEventId, proof.resultEventId];
+        if (new Set(ids).size !== 3 || ids.some(id => !sources.includes(id))) return false;
+        const failure = this.getEvent(ids[0]!)!;
+        const correction = this.getEvent(ids[1]!)!;
+        const result = this.getEvent(ids[2]!)!;
+        if (!failure || !correction || !result || !failure.runId || failure.runId !== correction.runId
+            || result.runId !== correction.runId || failure.seq >= correction.seq || correction.seq >= result.seq
+            || !failure.actor.startsWith('tool:') || !['tool_error', 'tool_result'].includes(failure.type)
+            || correction.actor !== 'agent' || correction.type !== 'tool_call'
+            || result.type !== 'tool_result' || !result.actor.startsWith('tool:')
+            || result.sourceEventId !== correction.id) return false;
+        const payload = result.payload as { result?: unknown } | null;
+        const output = payload?.result;
+        if (output === undefined || output === null || output === '') return false;
+        if (typeof output === 'object') {
+            const details = output as Record<string, unknown>;
+            if (details.error || details.success === false || details.ok === false
+                || (typeof details.exitCode === 'number' && details.exitCode !== 0)) return false;
+        }
+        return true;
+    }
+
+    /** 激活已有的执行经验并保留 observed 依据，认知时间从本次验证开始 */
+    private activateObservedMemory (id: string): void {
+        const now = new Date().toISOString();
+        this.database.query(`UPDATE memories SET status = 'active', basis = 'observed', known_from = ?, updated_at = ?
+            WHERE id = ? AND status = 'candidate' AND supersedes_id IS NULL`).run(now, now, id);
     }
 
     /**
@@ -1235,6 +1326,25 @@ export class MemoryStore {
             events.push(line);
         }
         return `<structured-memory>\n${sections.join('\n') || '暂无相关认识'}\n</structured-memory>\n<relevant-events>\n${events.join('\n') || '暂无相关事件'}\n</relevant-events>`;
+    }
+
+    /** 为前台提供少量相关推测；不改变状态、不进入档案，也不把计划当事实 */
+    public buildHypothesisContext (query: string, excludeEventIds: string[] = []): string {
+        const match = memoryQuery(query);
+        if (!match) return '';
+        const now = new Date().toISOString();
+        const rows = this.database.query(`SELECT m.* FROM memories m JOIN memory_fts f ON f.rowid = m.rowid
+            WHERE m.status = 'candidate' AND m.basis = 'inferred' AND m.supersedes_id IS NULL
+                AND m.known_to IS NULL AND (m.valid_from IS NULL OR m.valid_from <= ?)
+                AND (m.valid_to IS NULL OR m.valid_to > ?) AND memory_fts MATCH ?
+            ORDER BY f.rank ASC, m.importance DESC LIMIT 12`).all(now, now, match) as MemoryRow[];
+        const candidates = rows.map(row => this.toMemoryItem(row)).filter(memory => memory.sourceEventIds.length
+            && !memory.sourceEventIds.some(id => this.isSourceForgotten(id))
+            && memory.sourceEventIds.some(id => !excludeEventIds.includes(id))).slice(0, 3);
+        if (!candidates.length) return '';
+        return `<pending-understanding>\n${JSON.stringify(candidates.map(memory => ({
+            id: memory.id, content: memory.content, basis: memory.basis, status: memory.status,
+        })))}\n</pending-understanding>`;
     }
 
     /** 按完整条目与稳定排序选择当前有效的核心资料 */
@@ -1846,12 +1956,15 @@ export class MemoryStore {
         const existing = this.database.query(`
             SELECT id, kind, title, observation, evidence, confidence,
                 evidence_count, status, updated_at, source_reflections
-            FROM growth_proposals WHERE kind = ? AND normalized_key = ?
-        `).get(candidate.kind, key) as (GrowthRow & { source_reflections: string }) | null;
+            FROM growth_proposals WHERE ${candidate.targetId ? 'id = ?' : 'kind = ? AND normalized_key = ?'}
+        `).get(...(candidate.targetId ? [candidate.targetId] : [candidate.kind, key])) as (GrowthRow & { source_reflections: string }) | null;
         const now = new Date().toISOString();
         if (existing) {
+            // 已处理候选不能因再次提取旧认识而重新打开
+            if (existing.status !== 'proposed') return;
             const previousSources = parseStringArray(existing.source_reflections);
             const sources = uniqueStrings([...previousSources, ...candidateSources]);
+            if (sources.length === previousSources.length) return;
             const evidenceCount = existing.evidence_count + sources.length - previousSources.length;
             this.database.query(`
                 UPDATE growth_proposals

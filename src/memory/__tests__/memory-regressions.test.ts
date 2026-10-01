@@ -154,7 +154,7 @@ test('拒绝 candidate 和失效目标的 update，不影响同批合法新增�
         proposal('周报采用季度模板', pending.event.id),
         { ...proposal('用户住在杭州', pending.event.id), operation: 'update', targetId: candidate.id, revisionKind: 'correction' },
         { ...proposal('不存在的修订目标', pending.event.id), operation: 'update', targetId: crypto.randomUUID(), revisionKind: 'correction' },
-        { ...proposal(candidate.content, pending.event.id), operation: 'reinforce', targetId: candidate.id },
+        { ...proposal(candidate.content, pending.event.id), operation: 'reinforce', targetId: candidate.id, needsConfirmation: true },
     ], growth: [] }, [candidate]);
     expect(store.search('季度模板')[0]?.status).toBe('active');
     expect(store.search('杭州')).toHaveLength(0);
