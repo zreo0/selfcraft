@@ -11,7 +11,7 @@ const memoryKindSchema = z.enum([
     'relationship',
     'decision',
     'lesson',
-]);
+]).describe('identity 只指用户的身份；助理自身的名字、角色与稳定特点写入 IDENTITY.md');
 
 /**
  * 创建显式记忆、Episode 召回、Topic 与成长候选工具

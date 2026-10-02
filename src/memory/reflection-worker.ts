@@ -304,7 +304,7 @@ function buildReflectionInstructions (): string {
         'JSON 格式：{"memories":[],"growth":[]}。',
         'memories 元素包含 kind、content、confidence、importance、sensitive、sourceEventNumbers。',
         'confidence 和 importance 应使用 0 到 1 的 JSON 数字，例如 0.8，不要写成文字描述。',
-        'kind 只能是 identity/fact/preference/relationship/decision/lesson。',
+        'kind 只能是 identity/fact/preference/relationship/decision/lesson。identity 只指用户的身份；助理自身的名字、角色或特点由前台写入 IDENTITY.md，不输出为记忆。',
         'sourceEventNumbers 是真正支撑该候选的事件编号数组，只能引用输入中存在的编号，不能笼统引用全部事件。',
         '只保留未来交互仍有用的稳定身份、事实、偏好、关系、决定或可复用教训；不要记录寒暄、临时结果或无依据的猜测。有具体行为依据且值得后续核实的用户理解，可标 inferred、needsConfirmation=true 保留候选，正文保留实际适用条件，不得把假设或计划改写成已发生事实。',
         'preceding-replies 只是帮助理解用户反馈的前台对话背景，不是新的学习证据，不能引用它的事件编号或仅凭它生成认识。它是最近回复，不保证就是反馈对象；结合当前话题判断，含糊时不要猜。一时婉拒不等于长期偏好；只记录反馈实际支持的范围。',
