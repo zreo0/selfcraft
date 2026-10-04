@@ -15,6 +15,11 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Section("随身设备") {
+                NavigationLink { PocketView(relay: directory.pocket, directory: directory) } label: {
+                    Label("随身记录", systemImage: "waveform.badge.mic")
+                }
+            }
             Section("模型与能力") {
                 NavigationLink("模型渠道") { ModelSettings(session: session) }
                 NavigationLink("语音识别") { TranscriptionSettings(api: session.api) }

@@ -8,13 +8,22 @@ import Observation
     var selectedId: UUID?
     var error: String?
     let local: LocalStore
+    let pocket: PocketRelay
     var selected: RuntimeConnection? { connections.first { $0.id == selectedId } }
 
     /** 载入连接列表，错误由启动页面展示 */
     init(local: LocalStore) throws {
         self.local = local
+        pocket = try PocketRelay(local: local)
         connections = try local.read("connections.json", fallback: [])
         selectedId = UserDefaults.standard.string(forKey: "selectedConnection").flatMap(UUID.init(uuidString:))
+        pocket.connection = { [weak self] binding in self?.connection(for: binding) }
+    }
+
+    /** 优先原连接，重新添加同一实例后也能恢复录音，不回退到当前活动实例 */
+    func connection(for binding: PocketBinding) -> RuntimeConnection? {
+        connections.first { $0.id == binding.connectionID && $0.instanceId == binding.instanceID }
+            ?? connections.first { $0.instanceId == binding.instanceID }
     }
 
     /** 验证服务端身份后保存连接，编辑地址不能悄悄替换实例 */

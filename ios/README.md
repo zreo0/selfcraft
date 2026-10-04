@@ -79,4 +79,12 @@ Xcode 中运行 `SelfcraftTests`；Runtime 在相同测试环境执行 `bun run 
 
 实际结果见 [验收记录](../docs/ios-validation.md)。目前通过模拟器和测试容器验收，不等于完整真机回归：真实麦克风、来电/锁屏、网络切换、动态字号和 VoiceOver 尚需真机确认。Markdown 已支持标题、列表、引用、链接、表格与围栏代码；宽表格和代码在各自区域横向滚动。公式与 Mermaid 尚未启用，代码保留等宽原文而不做语法高亮。
 
-APNs 按用户决定保留设计并暂缓：已实现权限与通知定位入口，**尚未实现设备 token 注册、Runtime APNs 投递及签名 entitlement**，不能接收 App 关闭后的真实远程推送。后续开通开发者能力时按[方案](../docs/ios-app-plan.md)补齐并验收。BLE 硬件接入、Android、完整英文翻译和 App Store 分发不在本次验收内。
+APNs 按用户决定保留设计并暂缓：已实现权限与通知定位入口，**尚未实现设备 token 注册、Runtime APNs 投递及签名 entitlement**，不能接收 App 关闭后的真实远程推送。后续开通开发者能力时按[方案](../docs/ios-app-plan.md)补齐并验收。Android、完整英文翻译和 App Store 分发不在本次验收内。
+
+## 随身记录
+
+「设置 → 随身记录」可连接 XIAO nRF52840 Sense，接收板载麦克风录音。固件、接线、容量限制和协议见 [硬件指南](../hardware/README.md)。
+
+`PocketRelay` 由应用生命周期持有，启动回调内重建 CoreBluetooth 状态恢复管理器；`PocketInbox` 在独立 actor 中保存分包检查点、WAV 和待发送队列。设备 ACK 必须晚于手机持久化，Runtime 回执必须晚于上传和语音收件。对话页面不持有独立硬件队列，多个入口仍共享 Runtime 的消息与稳定提交 ID。
+
+设备固定绑定目标实例，不随当前调试连接切换。五分钟内的完整录音可以自动发送，过期/时间未知/中断录音需手动确认；待发送条目可试听或左滑移除本地副本。蓝牙后台恢复不保证任意时刻能完成网络转写，强制退出时依靠设备存储与下次打开补传。

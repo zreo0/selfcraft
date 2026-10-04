@@ -20,8 +20,8 @@ import UserNotifications
             .preferredColorScheme(appearance == "system" ? nil : appearance == "dark" ? .dark : .light)
             .task {
                 guard directory == nil else { return }
-                do { directory = try ConnectionDirectory(local: LocalStore()) }
-                catch { failure = error.localizedDescription }
+                directory = delegate.directory
+                failure = delegate.failure
             }
         }
     }
@@ -30,12 +30,21 @@ import UserNotifications
 /** 根页面不显示实例切换器；通知跳转跨实例时必须确认 */
 struct RootView: View {
     @Bindable var directory: ConnectionDirectory
+    @Environment(\.scenePhase) private var scenePhase
     @State private var notifications = NotificationRouter.shared
     @State private var showSwitch = false
     var body: some View {
         Group {
             if let connection = directory.selected { SessionHost(connection: connection, directory: directory).id(directory.revision) }
             else { NavigationStack { ConnectionForm(directory: directory) } }
+        }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            directory.pocket.reconnect()
+            while !Task.isCancelled {
+                directory.pocket.flush()
+                try? await Task.sleep(for: .seconds(15))
+            }
         }
         .onChange(of: notifications.pending, initial: true) { _, pending in
             guard let pending else { return }
@@ -141,9 +150,15 @@ private enum SessionSheet: Identifiable {
 
 /** 系统通知入口；远程注册在开发者能力配置后启用 */
 @MainActor final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+    var directory: ConnectionDirectory?
+    var failure: String?
+
     /** 设置通知代理，应用启动不弹权限提示 */
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         UNUserNotificationCenter.current().delegate = self
+        // 蓝牙后台恢复不依赖 SwiftUI 页面出现，启动回调内重建同一中央管理器
+        do { directory = try ConnectionDirectory(local: LocalStore()) }
+        catch { failure = error.localizedDescription }
         return true
     }
 

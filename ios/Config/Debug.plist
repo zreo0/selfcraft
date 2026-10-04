@@ -27,6 +27,12 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>连接你在局域网中运行的 Selfcraft。</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>连接随身设备，将你主动录下的想法保存到手机并发送给 Selfcraft</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+	</array>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>按住说话时录制语音，发送给你的 Selfcraft 进行识别。</string>
 	<key>UIApplicationSceneManifest</key>
