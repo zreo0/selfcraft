@@ -3,20 +3,19 @@ services:
         build: .
         image: selfcraft:dev
         init: true
+        restart: unless-stopped
         working_dir: /app
         entrypoint:
             - /bin/sh
             - -c
         command:
             - |
+                set -eu
                 if [ ! -d /app/node_modules/ai ]; then
                     cp -a /opt/selfcraft/node_modules/. /app/node_modules/
                 fi
                 bun install --frozen-lockfile
-                echo "Selfcraft development container is ready"
-                echo "Runtime: docker compose -f docker-compose.dev.yml exec selfcraft bun run start"
-                echo "CLI:     docker compose -f docker-compose.dev.yml exec selfcraft bun run cli"
-                exec tail -f /dev/null
+                exec bun run start
         environment:
             SELFCRAFT_ENV: development
             SELFCRAFT_HOME: /var/lib/selfcraft
@@ -25,8 +24,6 @@ services:
             SELFCRAFT_WEB_PORT: 3210
         ports:
             - "127.0.0.1:3210:3210"
-        stdin_open: true
-        tty: true
         volumes:
             - type: bind
               source: .

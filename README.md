@@ -351,20 +351,52 @@ bun run smoke
 <details>
 <summary>展开 Docker Compose 使用说明</summary>
 
-`docker-compose.dev.yml` 启动常驻开发容器，但不会自动启动 Runtime：
+`docker-compose.dev.yml` 挂载本地源码，后台启动完整的 Supervisor → Runtime。每次容器启动都会安装锁定的依赖，再通过 `bun run start` 构建 Web 并启动服务，无需进入容器手动运行：
 
 ```bash
 docker compose -f docker-compose.dev.yml up -d --build
-docker compose -f docker-compose.dev.yml exec selfcraft bun run start
 ```
 
-第二条命令由开发者手动启动 Runtime，便于修改代码后自行控制重启。随后在宿主机访问 `http://127.0.0.1:3210`，或从另一个终端进入 CLI：
+启动完成后访问 `http://127.0.0.1:3210`。关闭启动命令所在的终端不会停止服务。容器使用 `restart: unless-stopped`，主动停止后不会自动拉起。
+
+修改 Runtime 或 Web 源码后，重启即可应用修改；Web 会重新构建，刷新页面后查看效果，无需重建镜像：
 
 ```bash
+docker compose -f docker-compose.dev.yml restart selfcraft
+```
+
+重启会中断当时的运行。修改依赖清单时同步更新 `bun.lock`，下次启动会重新安装；修改 Dockerfile 或镜像内的系统依赖时使用 `up -d --build`。修改 Compose 配置后使用 `up -d` 重新创建容器，单独 `restart` 不会应用配置变化。从旧版手动启动方式切换时也执行一次 `up -d`，现有命名卷中的数据会保留。
+
+查看容器状态、标准输出和错误：
+
+```bash
+docker compose -f docker-compose.dev.yml ps
+docker compose -f docker-compose.dev.yml logs -f --tail=100 selfcraft
+```
+
+完整的结构化日志保存在数据卷中，可以直接跟随查看；日志轮转后 `-F` 会继续跟随同名文件：
+
+```bash
+docker compose -f docker-compose.dev.yml exec selfcraft tail -n 100 -F /var/lib/selfcraft/logs/selfcraft.log
+```
+
+退出日志查看不会停止服务。需要手动执行命令或使用 CLI 时，另开终端：
+
+```bash
+docker compose -f docker-compose.dev.yml exec selfcraft bash
 docker compose -f docker-compose.dev.yml exec selfcraft bun run cli
 ```
 
-开发容器只把 Web/API 端口绑定到宿主回环地址。
+退出这些终端不会停止服务，也不要在其中再次运行 `bun run start` 或 `bun run dev`。开发容器只把 Web/API 端口绑定到宿主回环地址。
+
+频繁调试 Web 时，在宿主机项目根目录安装依赖并只启动 Vite：
+
+```bash
+bun install --frozen-lockfile
+bun run --cwd web dev
+```
+
+访问 `http://127.0.0.1:5173`，Vite 将 `/api` 代理到容器暴露的 `3210` 端口。前端保存后热更新，不需要重启容器，也不会中断后台任务；停止 Vite 不影响容器服务。此时不要使用根目录的 `bun run dev`，它会额外启动本机 Runtime 并占用相同端口。`3210` 仍提供上次构建的页面，用于验收构建产物。
 
 如果命名卷里保留了旧配置，可以在容器中备份并重新配置：
 
@@ -372,9 +404,15 @@ docker compose -f docker-compose.dev.yml exec selfcraft bun run cli
 docker compose -f docker-compose.dev.yml exec selfcraft bun run reset-config
 ```
 
-宿主源码挂载到 `/app`；依赖和实例数据分别保存在 Compose 命名卷。Selfcraft 通过 `docker compose exec` 运行，输出属于当前终端，不会出现在 `docker compose logs`。
+宿主源码挂载到 `/app`；容器依赖和实例数据分别保存在 `selfcraft-dev-modules`、`selfcraft-dev-data` 命名卷中，宿主机调试 Web 使用本机依赖。
 
-停止容器但保留数据：
+停止服务和容器但保留数据，再次使用时执行 `up -d`：
+
+```bash
+docker compose -f docker-compose.dev.yml stop selfcraft
+```
+
+移除容器和网络但保留数据：
 
 ```bash
 docker compose -f docker-compose.dev.yml down

@@ -80,6 +80,17 @@ bun run dev
 - Runtime API：`http://127.0.0.1:3210`
 - Vite 将 `/api` 代理到 Runtime
 
+如果 Runtime 已在本地测试容器中运行，在宿主机项目根目录只启动 Web：
+
+```bash
+bun install --frozen-lockfile
+bun run --cwd web dev
+```
+
+访问 `http://127.0.0.1:5173`，现有代理会连接容器暴露的 `3210` 端口。修改 Web 后自动热更新，不需要重启容器；不要同时运行根目录的 `bun run dev`，以免额外启动本机 Runtime 并产生端口冲突。
+
+偶尔修改 Web 时也可以直接重启测试容器，它会重新构建页面，随后刷新 `http://127.0.0.1:3210` 即可。容器的启动、日志和重启命令见[根目录 Docker 开发说明](../README.md#docker-开发环境)。
+
 生产构建：
 
 ```bash
