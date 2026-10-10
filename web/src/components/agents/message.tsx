@@ -39,12 +39,11 @@ export function Message ({
 }: MessageProps) {
     const reduce = useReducedMotion() ?? false;
 
+    // 入场开关只决定初始状态，末尾消息变成历史后仍保留完整目标，避免 transform 回退到零缩放
     return (
         <MessageContext.Provider value={{ from }}>
             <motion.article
-                animate={animate ?? (animateIn && !reduce
-                    ? { opacity: 1, transform: 'translateY(0px) scale(1)' }
-                    : { opacity: 1 })}
+                animate={animate ?? { opacity: 1, transform: 'translateY(0px) scale(1)' }}
                 aria-label={props['aria-label'] ?? (from === 'user' ? '用户消息' : 'Selfcraft 消息')}
                 className={cn(
                     'group/message flex w-full items-start gap-2',

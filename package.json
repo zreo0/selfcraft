@@ -26,6 +26,7 @@
         "smoke:evolution": "bun run scripts/evolution-smoke.ts",
         "smoke:provider": "bun run scripts/provider-smoke.ts",
         "smoke:mobile": "bun run scripts/mobile-smoke.ts",
+        "smoke:web-message": "bun run build:web && bun run scripts/web-message-smoke.ts",
         "bench:conversation": "bun run scripts/conversation-performance.ts",
         "test": "bun test",
         "typecheck": "bun run typecheck:runtime && bun run --cwd web typecheck",
