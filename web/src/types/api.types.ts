@@ -106,6 +106,9 @@ export interface AgentActivityGroup {
 
 /** Web 消息接收的结构化数据类型 */
 export interface MessageData extends Record<string, unknown> {
+    /** 持久交互快照 */
+    ui: import('./interaction.types').InteractionView;
+    'ui-submission': import('@interaction/submission-summary').SubmissionSummary;
     /** 不进入历史消息的短暂运行状态 */
     status: {
         phase: 'queued' | 'preparing' | 'thinking';
@@ -152,6 +155,8 @@ export interface MessagePage {
 
 /** 页面初始化数据 */
 export interface BootstrapView {
+    /** 隔离本轮填写和提交意图 */
+    instanceId: string;
     /** 产品名 */
     product: string;
     /** 配置无效时为空 */

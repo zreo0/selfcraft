@@ -3,6 +3,7 @@ import Foundation
 /** 可直接展示的连接错误 */
 struct RuntimeError: LocalizedError {
     let message: String
+    var status: Int? = nil
     var errorDescription: String? { message }
 }
 
@@ -89,7 +90,7 @@ final class RuntimeAPI: NSObject, URLSessionTaskDelegate, Sendable {
         if response.statusCode == 401 { throw RuntimeError(message: "连接凭证失效，请在连接管理中更新") }
         guard (200..<300).contains(response.statusCode) else {
             let value = try? JSONDecoder().decode(JSONValue.self, from: data)
-            throw RuntimeError(message: value?["error"].string.isEmpty == false ? value!["error"].string : "请求失败（\(response.statusCode)）")
+            throw RuntimeError(message: value?["error"].string.isEmpty == false ? value!["error"].string : "请求失败（\(response.statusCode)）", status: response.statusCode)
         }
     }
 }

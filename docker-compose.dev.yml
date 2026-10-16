@@ -14,9 +14,12 @@ services:
                 if [ ! -d /app/node_modules/ai ]; then
                     cp -a /opt/selfcraft/node_modules/. /app/node_modules/
                 fi
-                bun install --frozen-lockfile
+                bun install --frozen-lockfile --ignore-scripts
                 exec bun run start
         environment:
+            OPENUI_TELEMETRY_DISABLED: "1"
+            DO_NOT_TRACK: "1"
+            OPENUI_RUNTIME_TELEMETRY_ENABLED: "0"
             SELFCRAFT_ENV: development
             SELFCRAFT_HOME: /var/lib/selfcraft
             SELFCRAFT_PROJECT_ROOT: /app

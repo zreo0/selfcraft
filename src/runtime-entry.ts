@@ -1,3 +1,6 @@
+import { InteractionStore } from './interaction/interaction-store';
+import { createInteractionTool } from './tools/interaction-tool';
+import { wrapToolsWithTimeline } from './tools';
 import { ConversationStore } from './conversation/conversation-store';
 import { AttachmentStore } from './attachment/attachment-store';
 import { acquireRuntimeLease } from './supervisor/runtime-lease';
@@ -49,6 +52,8 @@ async function main (): Promise<void> {
     const executions = new ExecutionStore(paths.state);
     const works = new WorkStore(paths.state);
     const conversation = new ConversationStore(paths.state);
+    const interactions = new InteractionStore(paths.state);
+    interactions.recoverTools();
     const scheduledTasks = new ScheduledTaskManager(paths.state, notifications, memory, 1000,
         (id, title, message) => foreground.notify(id, title, message));
     const reflection = new ReflectionWorker(memory, () => ModelFactory.create(config, 'reflection', logger), logger);
@@ -80,6 +85,7 @@ async function main (): Promise<void> {
         works,
         [attachments, () => ModelFactory.createVision(config, logger)],
     );
+    Object.assign(tools, wrapToolsWithTimeline({ present_ui: createInteractionTool(interactions, conversation) }, memory, executions));
     const agent = new AgentRuntime(
         config,
         workspace,
@@ -97,6 +103,7 @@ async function main (): Promise<void> {
         attachments,
     );
     const foreground = new ForegroundRunner(agent, executions, () => requestShutdown(RESTART_EXIT_CODE), conversation);
+    interactions.reconcile(conversation, foreground);
     jobs.setAgentExecutor((job, signal, onLog) => agent.runBackground(job, signal, onLog),
         job => Boolean(executions.get(`job:${job.id}`)));
     jobs.start();
@@ -130,6 +137,7 @@ async function main (): Promise<void> {
         config,
         agent: foreground,
         conversation,
+        interactions,
         memory,
         skills,
         notifications,

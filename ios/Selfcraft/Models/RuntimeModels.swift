@@ -68,7 +68,17 @@ struct ChatMessage: Codable, Identifiable, Sendable, Equatable {
         var duration: Double
         var deleted: Bool
     }
-    var text: String { parts.filter { $0["type"].string == "text" }.map { $0["text"].string }.joined() }
+    var submission: SubmissionSummary? {
+        guard role == "user" else { return nil }
+        for part in parts where part["type"].string == "data-ui-submission" {
+            if let data = try? JSONEncoder().encode(part["data"]),
+               let summary = try? JSONDecoder().decode(SubmissionSummary.self, from: data), summary.version == 1 {
+                return summary
+            }
+        }
+        return nil
+    }
+    var text: String { submission?.text ?? parts.filter { $0["type"].string == "text" }.map { $0["text"].string }.joined() }
     var isStreaming: Bool { metadata?.state == "streaming" }
 }
 

@@ -135,6 +135,7 @@ export function App () {
                     <div className="app-surface">
                         <div className={view === 'chat' ? 'contents' : 'hidden'}>
                             <ChatView
+                                instanceId={bootstrap.instanceId}
                                 config={bootstrap.config}
                                 initialMessage={firstMessage}
                                 initialCursor={bootstrap.messages.nextCursor}

@@ -1,3 +1,5 @@
+import type { InteractionView, InteractionValues } from '../interaction/protocol';
+import type { InteractionReceipt } from '../interaction/interaction-store';
 import { ConfigStore } from '../config/config-store';
 import { resolvePaths } from '../config/paths';
 import type { ConversationMessage } from '../conversation/conversation-store';
@@ -47,6 +49,8 @@ export interface RuntimeConfigView {
 
 /** CLI 初始化所需的 Runtime 状态 */
 export interface RuntimeBootstrap {
+    /** 稳定实例身份，用于隔离本地提交意图 */
+    instanceId?: string;
     /** 产品名称 */
     product: string;
     /** 配置无效时为空 */
@@ -221,6 +225,34 @@ export class RuntimeClient {
             }
             this.consumeChatChunk(result.value, onEvent, activityStates);
         }
+    }
+
+    /** 查询分页待回答表单 */
+    public async interactions (after = 0): Promise<{ items: InteractionView[]; nextCursor: number | null }> {
+        return this.request(`/api/conversation/ui?status=ready&after=${after}`);
+    }
+
+    /** 获取某张表单的最新版本 */
+    public async interaction (id: string): Promise<InteractionView> {
+        return this.request(`/api/conversation/ui/${encodeURIComponent(id)}`);
+    }
+
+    /** 保存表单草稿 */
+    public async saveInteraction (id: string, expectedRevision: number, values: InteractionValues): Promise<InteractionView> {
+        return this.request(`/api/conversation/ui/${encodeURIComponent(id)}/state`, { method: 'PATCH', body: JSON.stringify({ expectedRevision, values }) });
+    }
+
+    /** 使用稳定提交标识回传用户字段 */
+    public async submitInteraction (id: string, input: unknown): Promise<InteractionReceipt> {
+        return this.request(`/api/conversation/ui/${encodeURIComponent(id)}/actions`, { method: 'POST', body: JSON.stringify(input) });
+    }
+
+    /** 仅将 404 视为尚未接收，网络错误保留未知状态 */
+    public async interactionReceipt (id: string): Promise<InteractionReceipt | null> {
+        const response = await this.fetchFunction(`${this.baseURL}/api/conversation/ui/submissions/${encodeURIComponent(id)}`);
+        if (response.status === 404) return null;
+        if (!response.ok) throw new Error('无法核实交互提交回执');
+        return await response.json() as InteractionReceipt;
     }
 
     /** 列出当前技能 */

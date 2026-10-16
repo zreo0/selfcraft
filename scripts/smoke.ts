@@ -1,3 +1,9 @@
+import { messageSubmission, submissionText } from '../src/interaction/submission-summary';
+import { InteractionStore } from '../src/interaction/interaction-store';
+import { ConversationStore } from '../src/conversation/conversation-store';
+import { ForegroundRunner } from '../src/agent/foreground-runner';
+import { createInteractionTool } from '../src/tools/interaction-tool';
+import { wrapToolsWithTimeline } from '../src/tools';
 import { wrapLanguageModel } from 'ai';
 import { AttachmentStore } from '../src/attachment/attachment-store';
 import { ModelFactory } from '../src/model/model-factory';
@@ -81,6 +87,9 @@ async function main (): Promise<void> {
         );
         const attachments = new AttachmentStore(home);
         const tools = createTools(paths.workspace, skills, notifications, evolution, jobs, memory, undefined, undefined, executions, works, [attachments, () => ModelFactory.createVision(config, logger)]);
+        const interactions = new InteractionStore(paths.state);
+        const conversation = new ConversationStore(paths.state);
+        Object.assign(tools, wrapToolsWithTimeline({ present_ui: createInteractionTool(interactions, conversation) }, memory, executions));
         let inspectProfile = false;
         let correctionCommitted = false;
         let nextProfile: string | undefined;
@@ -224,8 +233,27 @@ async function main (): Promise<void> {
             || !history.readHistory('message', originalId).content.includes('900')) {
             throw new Error('跨窗口原文回查验收失败');
         }
+        await createAgent().run('请用 present_ui 工具询问我的偏好：标题为“验收偏好”，一个必填单选字段 goal，选项 speed（速度）和 quality（质量），一个可选文本字段 note。只展示一次表单，然后等待我回答，不创建事项。', undefined, { executionId: 'smoke-ui' });
+        const ui = interactions.list().items.find(item => item.interaction.fields.some(field => field.name === 'goal'));
+        if (!ui) throw new Error('真实模型未生成有效交互表单');
+        const request = { submissionId: crypto.randomUUID(), expectedRevision: ui.revision, actionId: 'submit', values: { goal: 'quality', note: '验收代号 UI-827，只回复代号和我的选择' } };
+        const receipt = interactions.submit(ui.id, request);
+        const runner = new ForegroundRunner(createAgent(), executions, undefined, conversation);
+        let uiReply = '';
+        await runner.run(receipt.input, event => { if (event.type === 'text-delta') uiReply += event.delta; }, { executionId: receipt.executionId });
+        const restoredUI = new InteractionStore(paths.state);
+        restoredUI.reconcile(conversation, runner);
+        if (restoredUI.submit(ui.id, request).executionId !== receipt.executionId || !uiReply.includes('UI-827') || !uiReply.includes('质量')
+            || !conversation.page().items.some(item => item.id === `assistant:ui:${ui.id}`)) throw new Error('真实交互回传或恢复验收失败');
+        const submitted = conversation.get(`user:${receipt.executionId}`)!;
+        const summary = messageSubmission(submitted);
+        if (!summary || !submissionText(summary).includes('质量') || !submissionText(summary).includes('UI-827')
+            || executions.get(receipt.executionId)?.input !== receipt.input) throw new Error('提交摘要或原始输入保留验收失败');
         console.log(JSON.stringify({
             healthy: true,
+            submissionSummary: true,
+            interactionRoundTrip: true,
+            interactionRestore: true,
             model: model.modelId,
             toolRoundTrip: true,
             sessionRestore: true,

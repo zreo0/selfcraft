@@ -66,7 +66,7 @@ Selfcraft 当前是一个基于 Bun、TypeScript 和 Vercel AI SDK v7 的实验�
 需要 Bun 1.3 或更高版本。
 
 ```bash
-bun install
+OPENUI_TELEMETRY_DISABLED=1 DO_NOT_TRACK=1 bun install --frozen-lockfile --ignore-scripts
 bun run start
 ```
 
@@ -392,7 +392,7 @@ docker compose -f docker-compose.dev.yml exec selfcraft bun run cli
 频繁调试 Web 时，在宿主机项目根目录安装依赖并只启动 Vite：
 
 ```bash
-bun install --frozen-lockfile
+OPENUI_TELEMETRY_DISABLED=1 DO_NOT_TRACK=1 bun install --frozen-lockfile --ignore-scripts
 bun run --cwd web dev
 ```
 
@@ -451,3 +451,7 @@ bun run doctor
 ```
 
 `doctor` 确定性检查必需源码、数据目录读写能力与模型配置状态，不会调用模型。
+
+## 跨端交互表单
+
+模型可通过 `present_ui` 生成澄清或方案选择表单。Web 直接填写，CLI 使用 `/ui`，iOS 使用原生表单和「待回答」入口。三端共享持久状态、版本冲突检查和稳定提交回执；完整协议、恢复机制、无遥测安装要求与验收方式见 [OpenUI 交互说明](docs/openui.md)。

@@ -5,6 +5,9 @@ services:
         init: true
         restart: unless-stopped
         environment:
+            OPENUI_TELEMETRY_DISABLED: "1"
+            DO_NOT_TRACK: "1"
+            OPENUI_RUNTIME_TELEMETRY_ENABLED: "0"
             SELFCRAFT_ENV: production
             SELFCRAFT_HOME: /var/lib/selfcraft
             SELFCRAFT_WEB_HOST: 0.0.0.0

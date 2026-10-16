@@ -1,0 +1,49 @@
+diff --git a/dist/shared-BuVpfVsg.cjs b/dist/shared-BuVpfVsg.cjs
+index 57b3ef1209c0c42c4fc3ede5e1ccd0975a9affff..168d58648ceb22397dbc81812c09b3f53f011f5e 100644
+--- a/dist/shared-BuVpfVsg.cjs
++++ b/dist/shared-BuVpfVsg.cjs
+@@ -31,10 +31,12 @@ function isTruthyEnv(value) {
+ 	return value === "1" || value?.toLowerCase() === "true";
+ }
+ function isTelemetryDisabled(env) {
++	return true; // Selfcraft: telemetry is never permitted
+ 	return isTruthyEnv(env?.["OPENUI_TELEMETRY_DISABLED"]) || isTruthyEnv(env?.["DO_NOT_TRACK"]);
+ }
+ /** Runtime telemetry is opt-in: it requires explicit consent and honors the disable flags. */
+ function isRuntimeTelemetryEnabled(env) {
++	return false; // Selfcraft: telemetry is never permitted
+ 	return isTruthyEnv(env?.["OPENUI_RUNTIME_TELEMETRY_ENABLED"]) && !isTelemetryDisabled(env);
+ }
+ function normalizeProjectIdentity(rawValue) {
+diff --git a/dist/shared-Dzgc28Wo.mjs b/dist/shared-Dzgc28Wo.mjs
+index 1538975daf9be01f31d3fd10ab75e73495db62d2..5a3158ef7c067d6cd514a25a0f93cda7f089617a 100644
+--- a/dist/shared-Dzgc28Wo.mjs
++++ b/dist/shared-Dzgc28Wo.mjs
+@@ -10,10 +10,12 @@ function isTruthyEnv(value) {
+ 	return value === "1" || value?.toLowerCase() === "true";
+ }
+ function isTelemetryDisabled(env) {
++	return true; // Selfcraft: telemetry is never permitted
+ 	return isTruthyEnv(env?.["OPENUI_TELEMETRY_DISABLED"]) || isTruthyEnv(env?.["DO_NOT_TRACK"]);
+ }
+ /** Runtime telemetry is opt-in: it requires explicit consent and honors the disable flags. */
+ function isRuntimeTelemetryEnabled(env) {
++	return false; // Selfcraft: telemetry is never permitted
+ 	return isTruthyEnv(env?.["OPENUI_RUNTIME_TELEMETRY_ENABLED"]) && !isTelemetryDisabled(env);
+ }
+ function normalizeProjectIdentity(rawValue) {
+diff --git a/postinstall.cjs b/postinstall.cjs
+index 2f17810f35f0c8d2afcc12af61beb25c56b2b92b..8393fd7de9a8f5f85ec5c2de6c23cce4ebff90b9 100644
+--- a/postinstall.cjs
++++ b/postinstall.cjs
+@@ -1,9 +1,2 @@
+ "use strict";
+-
+-try {
+-  process.env.OPENUI_LANG_CORE_PACKAGE_VERSION = require("./package.json").version;
+-  require("./dist/postinstall.cjs");
+-} catch {
+-  // Telemetry must never fail installation, including a clean source checkout
+-  // where the compiled postinstall entry does not exist yet.
+-}
++// Selfcraft: installation telemetry is disabled unconditionally

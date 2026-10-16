@@ -1,3 +1,5 @@
+import { InteractionStore } from '../interaction/interaction-store';
+import { InteractionError } from '../interaction/protocol';
 import { ClientAccess } from './client-access';
 import { AudioStore } from '../attachment/audio-store';
 import { WorkStore } from '../work/work-store';
@@ -148,6 +150,8 @@ export class WebServer {
     private readonly works: WorkStore;
     private readonly attachments: AttachmentStore;
     private readonly conversation: ConversationStore;
+    private readonly interactions: InteractionStore;
+    private interactionRecovery?: ReturnType<typeof setInterval>;
     private readonly subscriptions = new Set<() => void>();
 
     /**
@@ -160,6 +164,7 @@ export class WebServer {
         config: ConfigStore;
         agent: ForegroundRunner;
         conversation?: ConversationStore;
+        interactions?: InteractionStore;
         memory: MemoryStore;
         skills: SkillRegistry;
         notifications: NotificationInbox;
@@ -175,6 +180,8 @@ export class WebServer {
         this.works = new WorkStore(dependencies.paths.state);
         this.attachments = new AttachmentStore(dependencies.paths.home);
         this.conversation = dependencies.conversation || new ConversationStore(dependencies.paths.state);
+        this.interactions = dependencies.interactions || new InteractionStore(dependencies.paths.state);
+        this.interactions.reconcile(this.conversation, dependencies.agent);
         this.importHistory();
         for (const voice of this.audio.completed()) {
             const message = this.conversation.get(`user:${voice.id}`);
@@ -210,6 +217,10 @@ export class WebServer {
                 return this.fetch(request);
             },
         });
+        this.interactionRecovery = setInterval(() => {
+            try { this.interactions.reconcile(this.conversation, this.dependencies.agent); }
+            catch (error) { this.dependencies.logger.warn('交互恢复稍后重试', { error: String(error) }); }
+        }, 1000);
         const address = this.address();
         this.dependencies.logger.info('Web entry started', { ...address });
         return address;
@@ -217,6 +228,8 @@ export class WebServer {
 
     /** 停止接受新的 Web 请求 */
     public stop (): void {
+        clearInterval(this.interactionRecovery);
+        this.interactionRecovery = undefined;
         for (const close of this.subscriptions) close();
         this.server?.stop(true);
         this.server = undefined;
@@ -244,6 +257,8 @@ export class WebServer {
             }
             return await this.serveStatic(request, url.pathname);
         } catch (error) {
+            if (error instanceof InteractionError) return jsonResponse({ error: error.message }, error.status);
+            if (url.pathname.startsWith('/api/conversation/ui') && error instanceof z.ZodError) return jsonResponse({ error: '交互请求字段无效' }, 422);
             this.dependencies.logger.warn('Web request failed', {
                 method: request.method,
                 path: url.pathname,
@@ -355,6 +370,40 @@ export class WebServer {
             const limit = parseOptionalInteger(url.searchParams.get('limit')) || 50;
             const before = parseOptionalInteger(url.searchParams.get('before'));
             return jsonResponse(this.buildMessages(limit, before));
+        }
+        if (url.pathname.startsWith('/api/conversation/ui')) {
+            if (request.method === 'GET' && url.pathname === '/api/conversation/ui') {
+                return jsonResponse(this.interactions.list(Number(url.searchParams.get('after') || 0)));
+            }
+            const receipt = url.pathname.match(/^\/api\/conversation\/ui\/submissions\/([a-fA-F0-9-]+)$/);
+            if (request.method === 'GET' && receipt) {
+                const result = this.interactions.receipt(receipt[1]!);
+                return result ? jsonResponse(result) : jsonResponse({ error: '尚未接收提交' }, 404);
+            }
+            const match = url.pathname.match(/^\/api\/conversation\/ui\/(ui_[a-f0-9]{32})(?:\/(state|actions))?$/);
+            if (match) {
+                if (request.method === 'GET' && !match[2]) {
+                    const view = this.interactions.get(match[1]!);
+                    return view ? jsonResponse(view) : jsonResponse({ error: '交互不存在' }, 404);
+                }
+                this.assertMutationRequest(request);
+                if (Number(request.headers.get('content-length')) > 40_000) throw new InteractionError(413, '交互请求过大');
+                const raw = await request.text();
+                if (raw.length > 40_000) throw new InteractionError(413, '交互请求过大');
+                const body: unknown = JSON.parse(raw);
+                if (request.method === 'PATCH' && match[2] === 'state') {
+                    const view = this.interactions.saveDraft(match[1]!, body);
+                    this.interactions.reconcile(this.conversation);
+                    return jsonResponse(view);
+                }
+                if (request.method === 'POST' && match[2] === 'actions') {
+                    if (!this.dependencies.config.isConfigured()) throw new InteractionError(409, '请先完成模型配置');
+                    const result = this.interactions.submit(match[1]!, body);
+                    this.interactions.reconcile(this.conversation, this.dependencies.agent);
+                    return jsonResponse(result, 202);
+                }
+            }
+            return jsonResponse({ error: '交互接口不存在' }, 404);
         }
         if (request.method === 'GET' && url.pathname === '/api/conversation/events') {
             return this.streamConversation(request);
@@ -691,6 +740,7 @@ export class WebServer {
             product: 'Selfcraft',
             instanceId: this.access.instanceId,
             protocolVersion: 1,
+            interaction: { protocolVersion: 1, libraryVersion: 'selfcraft-ui@1', fields: ['single-select', 'multi-select', 'text'] },
             config,
             configurationError,
             messages: this.buildMessages(50),

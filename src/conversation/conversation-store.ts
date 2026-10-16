@@ -1,3 +1,5 @@
+import type { SubmissionSummary } from '../interaction/submission-summary';
+import type { InteractionView } from '../interaction/protocol';
 import { Database } from 'bun:sqlite';
 import type { UIMessage, UserModelMessage } from 'ai';
 import type { AgentActivity, AgentRunEvent } from '../agent/run-events';
@@ -10,7 +12,7 @@ export type ConversationMessage = UIMessage<{
     state: 'streaming' | 'completed' | 'failed';
     executionId?: string;
     audio?: { id: string; url: string; duration: number; deleted: boolean };
-}, { activity: { status: 'working' | 'complete'; items: AgentActivity[] } }>;
+}, { 'ui-submission': SubmissionSummary; ui: InteractionView; activity: { status: 'working' | 'complete'; items: AgentActivity[] } }>;
 
 /** 与请求连接无关的持久消息视图，所有入口按版本补齐最新记录 */
 export class ConversationStore {
@@ -35,6 +37,16 @@ export class ConversationStore {
             : content.flatMap<ConversationMessage['parts'][number]>(part => part.type === 'text' ? [part] : userContentFiles([part]));
         this.save({ id: `user:${id}`, role: 'user', parts,
             metadata: { seq: 0, occurredAt: new Date().toISOString(), state: 'completed', executionId: id } });
+    }
+
+    /** 为已接收的表单回答补齐持久摘要，保留原文、顺序和时间，不重复写入 */
+    public publishSubmission (id: string, input: string, summary: SubmissionSummary): void {
+        this.receive(id, input);
+        const message = this.get(`user:${id}`)!;
+        if (message.role !== 'user' || message.parts.filter(part => part.type === 'text').map(part => part.text).join('') !== input
+            || message.parts.some(part => part.type === 'data-ui-submission')) return;
+        message.parts.push({ type: 'data-ui-submission', id: summary.submissionId, data: summary });
+        this.save(message);
     }
 
     /** 将原音关联到已接收的文字，附件不进入模型输入 */
@@ -111,6 +123,18 @@ export class ConversationStore {
             }
         }
         this.save(message);
+    }
+
+    /** 独立保存已提交的交互气泡，文本流恢复不会重置表单状态 */
+    public publishInteraction (view: InteractionView, text: string): void {
+        const id = `assistant:ui:${view.id}`;
+        const previous = this.get(id);
+        const previousUI = previous?.parts.find(part => part.type === 'data-ui');
+        if (previousUI?.type === 'data-ui' && previousUI.data.revision >= view.revision) return;
+        this.save({ id, role: 'assistant', parts: [
+            { type: 'text', text: `${text}\n\n交互 ${view.id}：${view.status === 'ready' ? '待回答' : view.status === 'submitted' ? '已提交' : '已关闭'}` },
+            { type: 'data-ui', id: view.id, data: view },
+        ], metadata: { seq: previous?.metadata?.seq || 0, occurredAt: previous?.metadata?.occurredAt || new Date().toISOString(), state: 'completed' } });
     }
 
     /** 幂等导入已有历史；新记录沿用当前数据库顺序 */

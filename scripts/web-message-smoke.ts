@@ -35,7 +35,7 @@ async function main (): Promise<void> {
         async fetch (request) {
             const pathname = new URL(request.url).pathname;
             if (pathname === '/api/bootstrap') return Response.json({
-                product: 'Selfcraft', configurationError: null,
+                product: 'Selfcraft', instanceId: 'web-smoke', configurationError: null,
                 config: { configured: true, timezone: 'Asia/Shanghai', providers: [], defaultModel: null, modelOverrides: {}, webAccess: null },
                 messages: { items: messages, nextCursor: null },
                 runtime: { environment: 'test', home: '/test', workspace: '/test', pendingForegroundRuns: 0, checks: [] },

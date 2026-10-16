@@ -1,3 +1,5 @@
+import { messageSubmission, submissionText } from '../interaction/submission-summary';
+import { interactionCommand } from './interaction-command';
 import { clearLine, cursorTo } from 'node:readline';
 import { createInterface } from 'node:readline/promises';
 import { OnboardingCancelledError, type Onboarding } from '../onboarding/onboarding';
@@ -57,8 +59,9 @@ export class Cli {
         let configuring = false;
         void this.dependencies.client.subscribe((messages, initial) => {
             for (const message of messages) {
-                if (message.role !== 'assistant') continue;
-                const text = message.parts.filter(part => part.type === 'text').map(part => part.text).join('');
+                const submission = messageSubmission(message);
+                if (message.role !== 'assistant' && !submission) continue;
+                const text = submission ? submissionText(submission) : message.parts.filter(part => part.type === 'text').map(part => part.text).join('');
                 const previous = displayed.get(message.id) || '';
                 displayed.set(message.id, text);
                 if (configuring || (initial && message.metadata?.state !== 'streaming')) continue;
@@ -79,6 +82,12 @@ export class Cli {
                 }
                 let commandResult: number | null;
                 try {
+                    if (input === '/ui' || input.startsWith('/ui ')) {
+                        configuring = true;
+                        try { await interactionCommand(this.dependencies.client, input.split(/\s+/).slice(1), prompt => terminal.question(prompt)); }
+                        finally { configuring = false; }
+                        continue;
+                    }
                     commandResult = await this.handleCommand(input);
                 } catch (error) {
                     console.error(`命令失败：${error instanceof Error ? error.message : String(error)}`);
@@ -253,6 +262,7 @@ export class Cli {
     /** 输出 CLI 命令帮助 */
     private printHelp (): void {
         console.log([
+            '/ui [id] [submit]            查看待回答交互或填写表单',
             '/stop                        停止当前回应，事项继续保留',
             '/model list                  查看模型',
             '/model add                   新增渠道与模型',

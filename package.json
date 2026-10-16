@@ -31,13 +31,15 @@
         "test": "bun test",
         "typecheck": "bun run typecheck:runtime && bun run --cwd web typecheck",
         "typecheck:runtime": "tsc --noEmit",
-        "check": "bun run typecheck && bun test && bun run doctor"
+        "check": "bun run typecheck && bun test && bun run doctor",
+        "smoke:interaction": "bun run build:web && bun run scripts/interaction-web-smoke.ts"
     },
     "dependencies": {
         "@ai-sdk/anthropic": "4.0.16",
         "@ai-sdk/openai": "4.0.16",
         "@ai-sdk/openai-compatible": "3.0.12",
         "@clack/prompts": "1.7.0",
+        "@openuidev/lang-core": "1.0.1",
         "ai": "7.0.31",
         "zod": "^4.3.6"
     },
@@ -47,5 +49,9 @@
         "bun-types": "1.4.0",
         "concurrently": "^9.2.1",
         "typescript": "^5.9.0"
+    },
+    "patchedDependencies": {
+        "@openuidev/lang-core@1.0.1": "patches/@openuidev%2Flang-core@1.0.1.patch",
+        "@openuidev/react-lang@1.0.1": "patches/@openuidev%2Freact-lang@1.0.1.patch"
     }
 }

@@ -1,3 +1,8 @@
+import { messageSubmission } from '@interaction/submission-summary';
+import { SubmissionSummary } from '@/components/SubmissionSummary';
+import { InteractionInbox } from '@/components/InteractionCard/InteractionInbox';
+import { isInteractionView, supportsInteraction } from '@/types/interaction.types';
+import { InteractionCard } from '@/components/InteractionCard';
 import { useConversation } from '@/hooks/useConversation';
 import { type FileUIPart } from 'ai';
 import { ArrowDown, Compass, History, RotateCcw, Settings2 } from 'lucide-react';
@@ -86,6 +91,7 @@ function messageTime (message: SelfcraftMessage): string | null {
 
 /** Selfcraft 的持续对话主界面 */
 export function ChatView ({
+    instanceId,
     config,
     initialMessage,
     initialMessages,
@@ -93,6 +99,7 @@ export function ChatView ({
     onInitialMessageSent,
     onRequestSettings,
 }: {
+    instanceId: string;
     config: ConfigView | null;
     initialMessage?: string;
     initialMessages: SelfcraftMessage[];
@@ -270,6 +277,7 @@ export function ChatView ({
                     onFollowChange={setFollowing}
                     viewportRef={scrollerRef}
                 >
+                    {config?.configured && <InteractionInbox instanceId={instanceId} />}
                     {nextCursor && (
                         <Button className="mx-auto" disabled={loadingHistory} onClick={() => void handleLoadEarlier()} size="sm" type="button" variant="ghost">
                             <History aria-hidden="true" className="size-3.5" />{loadingHistory ? '正在回想' : '查看更早的对话'}
@@ -295,6 +303,8 @@ export function ChatView ({
                     {messages.map(message => {
                         const from = message.role === 'user' ? 'user' : 'assistant';
                         const text = messageText(message);
+                        const submission = messageSubmission(message);
+                        const hasInteraction = message.parts.some(part => part.type === 'data-ui' && isInteractionView(part.data) && supportsInteraction(part.data));
                         const activity = from === 'assistant' ? messageActivity(message) : null;
                         const sources = from === 'assistant' ? messageSources(message) : [];
                         const messageIsStreaming = message.id === pendingAssistantId;
@@ -315,12 +325,16 @@ export function ChatView ({
                                     {from === 'assistant' ? (
                                         <div className="assistant-response-stack">
                                             {activity && <AgentActivity group={activity} />}
+                                            {message.parts.map(part => part.type === 'data-ui' && isInteractionView(part.data) && <InteractionCard key={instanceId + part.data.id} value={part.data} instanceId={instanceId} />)}
                                             {showThinking && (
                                                 <div aria-live="polite" className="thinking-state">
                                                     <ThinkingShimmer>{statusText || '正在思考'}</ThinkingShimmer>
                                                 </div>
                                             )}
-                                            {text && (
+                                            {text && hasInteraction ? <details className="text-sm text-muted-foreground">
+                                                <summary className="cursor-pointer focus-visible:outline-2 focus-visible:outline-ring">文字版本</summary>
+                                                <MessageResponse>{text}</MessageResponse>
+                                            </details> : text && (
                                                 <StreamingResponse
                                                     copyText={text}
                                                     sources={sources}
@@ -341,7 +355,7 @@ export function ChatView ({
                                                         <img alt={part.filename || '用户上传的图片'} className="max-h-80 max-w-full rounded-lg object-contain" loading="lazy" src={part.url} />
                                                     </a>
                                                 ))}
-                                                {text && <MessageBubbleCollapsible collapsedLines={5}>
+                                                {submission ? <SubmissionSummary value={submission} /> : text && <MessageBubbleCollapsible collapsedLines={5}>
                                                     <p className="whitespace-pre-wrap">{text}</p>
                                                 </MessageBubbleCollapsible>}
                                             </MessageBubbleContent>

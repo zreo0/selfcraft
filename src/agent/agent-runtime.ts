@@ -566,7 +566,7 @@ export class AgentRuntime {
         };
         const tools = runtimeContext.channel === 'background'
             ? Object.fromEntries(Object.entries(available).filter(([name]) => ![
-                'work_create', 'job_start', 'job_cancel', 'job_resume', 'notify', 'task_schedule', 'task_cancel',
+                'present_ui', 'work_create', 'job_start', 'job_cancel', 'job_resume', 'notify', 'task_schedule', 'task_cancel',
                 'memory_remember', 'memory_confirm', 'memory_correct', 'memory_forget', 'memory_erase_event',
                 'topic_create', 'topic_link_event', 'growth_resolve', 'evolve_runtime', 'shell',
             ].includes(name))) : available;

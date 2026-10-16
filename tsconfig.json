@@ -7,7 +7,8 @@
         "noEmit": true,
         "allowImportingTsExtensions": true,
         "types": ["bun-types"],
-        "skipLibCheck": true
+        "skipLibCheck": true,
+        "paths": { "@interaction/*": ["./src/interaction/*"] }
     },
     "include": ["src/**/*.ts", "scripts/**/*.ts"]
 }

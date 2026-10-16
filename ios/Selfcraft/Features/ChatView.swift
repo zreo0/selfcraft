@@ -8,6 +8,7 @@ struct ChatView: View {
     let obscured: Bool
     let openOverview: () -> Void
     let openNotifications: () -> Void
+    @State private var showingInteractions = false
 
     var body: some View {
         ConversationTimeline(session: session, audio: audio)
@@ -27,9 +28,13 @@ struct ChatView: View {
                         .accessibilityLabel("Selfcraft").accessibilityAddTraits(.isHeader)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
+                    Button("待回答", systemImage: "list.bullet.clipboard") { showingInteractions = true }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
                     NotificationButton(api: session.api, obscured: obscured, open: openNotifications)
                 }
             }
+            .sheet(isPresented: $showingInteractions) { NavigationStack { InteractionInbox(api: session.api) }.id(session.api.connection.instanceId) }
             .safeAreaInset(edge: .bottom, spacing: 0) { MessageComposer(session: session, audio: audio, obscured: obscured) }
     }
 }
@@ -326,6 +331,14 @@ struct MessageRow: View {
     @State private var deleting = false
     @State private var detail: MessageDetails.Page?
 
+    /** 忽略未知数据块，保留相邻文字作为旧协议降级 */
+    private var interactions: [InteractionView] {
+        message.parts.compactMap { part in
+            guard part["type"].string == "data-ui", let data = try? JSONEncoder().encode(part["data"]) else { return nil }
+            return try? JSONDecoder().decode(InteractionView.self, from: data)
+        }
+    }
+
     var body: some View {
         let presentation = MessagePresentation(parts: message.parts)
         HStack {
@@ -346,7 +359,15 @@ struct MessageRow: View {
                     MessageActivitySummary(presentation: presentation, streaming: message.isStreaming,
                                            failed: message.metadata?.state == "failed", hasText: !message.text.isEmpty) { detail = .activity }
                 }
-                if !message.text.isEmpty { MessageText(text: message.text, streaming: message.isStreaming, sharedRenderer: markdown).equatable() }
+                ForEach(interactions) { value in InteractionCard(value: value, api: api) }
+                if let summary = message.submission {
+                    SubmissionSummaryView(summary: summary)
+                } else if !message.text.isEmpty {
+                    if interactions.contains(where: \.supported) {
+                        DisclosureGroup("文字版本") { MessageText(text: message.text, streaming: false, sharedRenderer: markdown).equatable() }
+                            .font(.subheadline)
+                    } else { MessageText(text: message.text, streaming: message.isStreaming, sharedRenderer: markdown).equatable() }
+                }
                 if message.isStreaming && presentation.activities.isEmpty {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.mini)
@@ -449,5 +470,34 @@ private struct VoicePlayback: View {
             if audio.playbackId == original.id { ProgressView(value: audio.playbackProgress) }
             if let failure { Text(failure).font(.caption).foregroundStyle(.red) }
         }.onDisappear { playbackTask?.cancel() }
+    }
+}
+
+/** 在用户气泡内显示答案，纵向布局适配窄屏和辅助字号 */
+private struct SubmissionSummaryView: View {
+    let summary: SubmissionSummary
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("\(summary.title) · 已提交")
+                .font(.caption).foregroundStyle(.secondary)
+            ForEach(Array(summary.answers.enumerated()), id: \.offset) { _, item in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.field).font(.caption).foregroundStyle(.secondary)
+                    if item.filled.isEmpty {
+                        Text("未填写").foregroundStyle(.secondary)
+                    } else {
+                        ForEach(Array(item.filled.enumerated()), id: \.offset) { _, answer in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                if item.filled.count > 1 { Text("•").accessibilityHidden(true) }
+                                Text(verbatim: answer).fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                }
+                .accessibilityElement(children: .combine)
+            }
+        }
+        .textSelection(.enabled)
     }
 }

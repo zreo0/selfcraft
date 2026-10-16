@@ -1,3 +1,4 @@
+import { InteractionStore } from '../../interaction/interaction-store';
 import { afterEach, describe, expect, setSystemTime, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -857,4 +858,32 @@ test('配置重置不会清除入口鉴权，转写密钥不会进入配置响�
     config.backupAndReset();
     expect(config.credential('client-access')).toBe('keep-access');
     expect(config.credential('transcription')).toBeUndefined();
+});
+
+
+test('交互 HTTP 边界验证版本、来源、字段与持久回执，历史包含文字和 UI', async () => {
+    const { server, paths, config } = createServer();
+    config.addProvider({ providerId: 'local', type: 'openai-compatible', baseURL: 'http://localhost:3000/v1', apiKey: '',
+        models: { assistant: { vision: false, contextWindow: 32000, maxOutputTokens: 4096 } } });
+    const store = new InteractionStore(paths.state);
+    const view = store.present('api-run', 'api-call', 'root = Form("clarification", "问题", "", [Answer("note", "说明", true)])');
+    const endpoint = `/api/conversation/ui/${view.id}`;
+    expect((await server.fetch(new Request(`http://selfcraft.local${endpoint}`))).status).toBe(200);
+    expect((await server.fetch(jsonRequest(endpoint + '/state', 'PATCH', { expectedRevision: 1, values: {} }, 'https://foreign.example'))).status).toBe(400);
+    expect((await server.fetch(jsonRequest(endpoint + '/state', 'PATCH', { expectedRevision: 1, values: { unknown: 'x' } }))).status).toBe(422);
+    const state = await server.fetch(jsonRequest(endpoint + '/state', 'PATCH', { expectedRevision: 1, values: { note: '用户输入' } }));
+    expect(state.status).toBe(200);
+    expect((await state.json() as any).revision).toBe(2);
+    expect((await server.fetch(jsonRequest(endpoint + '/state', 'PATCH', { expectedRevision: 1, values: {} }))).status).toBe(409);
+    const submissionId = crypto.randomUUID();
+    const request = { submissionId, expectedRevision: 2, actionId: 'submit', values: { note: '用户输入' } };
+    expect((await server.fetch(jsonRequest(endpoint + '/actions', 'POST', { ...request, actionId: 'execute' }))).status).toBe(422);
+    const response = await server.fetch(jsonRequest(endpoint + '/actions', 'POST', request));
+    expect(response.status).toBe(202);
+    const receipt = await response.json();
+    expect(await (await server.fetch(new Request(`http://selfcraft.local/api/conversation/ui/submissions/${submissionId}`))).json()).toEqual(receipt);
+    const history = await (await server.fetch(new Request('http://selfcraft.local/api/messages'))).json() as any;
+    const card = history.items.find((item: any) => item.id === `assistant:ui:${view.id}`);
+    expect(card.parts.some((part: any) => part.type === 'text' && part.text.includes('问题'))).toBe(true);
+    expect(card.parts.find((part: any) => part.type === 'data-ui').data.status).toBe('submitted');
 });

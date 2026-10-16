@@ -1,10 +1,15 @@
 FROM oven/bun:1.3.8
 
+ENV OPENUI_TELEMETRY_DISABLED=1
+ENV DO_NOT_TRACK=1
+ENV OPENUI_RUNTIME_TELEMETRY_ENABLED=0
+
 WORKDIR /opt/selfcraft
 
 COPY package.json bun.lock ./
 COPY web/package.json ./web/package.json
-RUN bun install --frozen-lockfile
+COPY patches ./patches
+RUN bun install --frozen-lockfile --ignore-scripts
 
 COPY . .
 RUN bun run build:web && bun run typecheck && bun test && bun run doctor

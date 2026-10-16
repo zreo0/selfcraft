@@ -1,0 +1,26 @@
+diff --git a/dist/index.cjs b/dist/index.cjs
+index cc6a9eb7a4f4c5e3417c7565d4b7a749b004bfbb..acfb2146c5706965252c89fa592f7a9ffe654c55 100644
+--- a/dist/index.cjs
++++ b/dist/index.cjs
+@@ -15,7 +15,7 @@ let _openuidev_lang_core = require("@openuidev/lang-core");
+ * in package.json's `sideEffects` so bundlers preserve the side effect while
+ * the rest of the package stays tree-shakeable.
+ */
+-if (process.env.NODE_ENV === "development") {
++if (false) { // Selfcraft: never load remote DevTools
+ 	const AUTO_MOUNT_FLAG = Symbol.for("openui.devtools.autoMount");
+ 	const flags = globalThis;
+ 	if (!flags[AUTO_MOUNT_FLAG]) {
+diff --git a/dist/index.mjs b/dist/index.mjs
+index a00fac25775e54a4c23280576054c9ce4ee0f325..490f04df93d71eb3d7a7cf07117c704f1da64387 100644
+--- a/dist/index.mjs
++++ b/dist/index.mjs
+@@ -13,7 +13,7 @@ import { A as useRendererQuery, B as createLibrary, C as useRendererPreview, D a
+ * in package.json's `sideEffects` so bundlers preserve the side effect while
+ * the rest of the package stays tree-shakeable.
+ */
+-if (process.env.NODE_ENV === "development") {
++if (false) { // Selfcraft: never load remote DevTools
+ 	const AUTO_MOUNT_FLAG = Symbol.for("openui.devtools.autoMount");
+ 	const flags = globalThis;
+ 	if (!flags[AUTO_MOUNT_FLAG]) {

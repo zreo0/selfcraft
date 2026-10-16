@@ -7,6 +7,7 @@ export default defineConfig({
     plugins: [react(), tailwindcss()],
     resolve: {
         alias: {
+            '@interaction': path.resolve(import.meta.dirname, '../src/interaction'),
             '@': path.resolve(import.meta.dirname, './src'),
         },
     },
