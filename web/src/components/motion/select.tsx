@@ -156,7 +156,11 @@ export function Select ({
 }
 
 /** 渲染会与选项浮层分离的 BeUI Select 触发器 */
-export function SelectTrigger ({ className, children }: { className?: string; children: ReactNode }) {
+export function SelectTrigger ({ className, children, 'aria-labelledby': labelledBy }: {
+    className?: string;
+    children: ReactNode;
+    'aria-labelledby'?: string;
+}) {
     const context = useSelectContext('SelectTrigger');
     const top = context.placement === 'top';
     const radius = context.open ? [0, 0, 12] : [12, 0, 12];
@@ -177,6 +181,7 @@ export function SelectTrigger ({ className, children }: { className?: string; ch
             aria-controls={context.listId}
             aria-expanded={context.open}
             aria-haspopup="listbox"
+            aria-labelledby={labelledBy ? `${labelledBy} ${context.triggerId}` : undefined}
             className={cn(
                 'relative z-10 flex h-11 w-full items-center justify-between gap-2 rounded-xl border border-input bg-background px-3.5 text-sm text-foreground outline-none transition-colors hover:border-foreground/18 focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50',
                 className,

@@ -21,6 +21,53 @@ afterEach(() => {
 });
 
 describe('ConfigStore', () => {
+    test('创建重名渠道不能覆盖连接、模型或凭证', () => {
+        const directory = createTemporaryDirectory();
+        const store = new ConfigStore(directory);
+        const input = { providerId: 'dev', type: 'openai-compatible' as const, baseURL: 'http://localhost:3000/v1', apiKey: 'original-test-key',
+            models: { first: { vision: false, contextWindow: 32000, maxOutputTokens: 4096 } } };
+        store.addProvider(input);
+        const before = store.read();
+        const secrets = fs.readFileSync(path.join(directory, 'secrets.json'), 'utf8');
+        expect(() => store.addProvider({ ...input, baseURL: 'http://localhost:4000/v1', apiKey: 'replacement-test-key' })).toThrow('已存在');
+        expect(store.read()).toEqual(before);
+        expect(fs.readFileSync(path.join(directory, 'secrets.json'), 'utf8')).toBe(secrets);
+    });
+
+    test('模型操作隔离连接并保护最新用途引用，删除后保留空渠道', () => {
+        const directory = createTemporaryDirectory();
+        const store = new ConfigStore(directory);
+        const model = { vision: true, contextWindow: 32000, maxOutputTokens: 4096 };
+        store.addProvider({ providerId: 'dev', type: 'openai-compatible', baseURL: 'http://localhost:3000/v1', apiKey: 'model-test-key', models: {} });
+        expect(store.read().defaultModel).toBeNull();
+        store.addModel({ providerId: 'dev', modelId: 'org/first', ...model });
+        store.addModel({ providerId: 'dev', modelId: 'second', ...model, vision: false });
+        const before = store.read();
+        const secrets = fs.readFileSync(path.join(directory, 'secrets.json'), 'utf8');
+        expect(() => store.addModel({ providerId: 'dev', modelId: 'second', ...model })).toThrow('已存在');
+        expect(store.read()).toEqual(before);
+        store.updateModel({ providerId: 'dev', modelId: 'second', ...model, vision: false, contextWindow: 64000 });
+        expect(store.read().providers.dev.baseURL).toBe(before.providers.dev.baseURL);
+        expect(() => store.deleteModel('dev', 'org/first')).toThrow('默认');
+        store.useModel({ providerId: 'dev', modelId: 'org/first', reasoningEffort: 'high' }, 'reflection');
+        store.useModel({ providerId: 'dev', modelId: 'org/first' }, 'compression');
+        store.useModel({ providerId: 'dev', modelId: 'second' });
+        expect(() => store.deleteModel('dev', 'org/first')).toThrow('反思');
+        store.useModel(null, 'reflection');
+        expect(() => store.deleteModel('dev', 'org/first')).toThrow('整理');
+        store.useModel(null, 'compression');
+        expect(ModelFactory.createVision(store)?.modelId).toBe('org/first');
+        store.deleteModel('dev', 'org/first');
+        expect(ModelFactory.createVision(store)).toBeNull();
+        store.addProvider({ providerId: 'other', type: 'openai-compatible', baseURL: 'http://localhost:4000/v1', apiKey: '', models: { second: model } });
+        store.useModel({ providerId: 'other', modelId: 'second' });
+        store.deleteModel('dev', 'second');
+        expect(new ConfigStore(directory).read().providers.dev.models).toEqual({});
+        expect(fs.readFileSync(path.join(directory, 'secrets.json'), 'utf8')).toBe(secrets);
+        expect(() => store.updateModel({ providerId: 'dev', modelId: 'missing', ...model })).toThrow('不存在');
+        expect(() => store.deleteModel('other', 'second')).toThrow('默认');
+    });
+
     test('用途覆盖直接跟随默认且运行快照不随配置变化', () => {
         const store = new ConfigStore(createTemporaryDirectory());
         store.addProvider({
@@ -54,8 +101,8 @@ describe('ConfigStore', () => {
         expect(store.getModel().provider.auth).toBe('none');
         expect(store.getModel().apiKey).toBeUndefined();
         expect(store.isConfigured()).toBeTrue();
-        store.addProvider({ ...input, apiKey: 'test-key' });
-        store.addProvider(input);
+        store.updateProvider({ ...input, apiKey: 'test-key' });
+        store.updateProvider(input);
         expect(store.getModel().apiKey).toBe('test-key');
         expect(store.getModel().provider.auth).toBe('api-key');
         expect(() => store.addProvider({ ...input, providerId: 'official', type: 'openai' })).toThrow();
@@ -130,7 +177,7 @@ describe('ConfigStore', () => {
         expect(fs.statSync(path.join(directory, 'secrets.json')).mode & 0o777).toBe(0o600);
     });
 
-    test('更新当前渠道时合并模型并保留默认选择', () => {
+    test('显式更新连接和新增模型时保留默认选择', () => {
         const store = new ConfigStore(createTemporaryDirectory());
         store.addProvider({
             providerId: 'local',
@@ -142,15 +189,8 @@ describe('ConfigStore', () => {
             },
         });
 
-        store.addProvider({
-            providerId: 'local',
-            type: 'openai-compatible',
-            baseURL: 'http://127.0.0.1:3000/v1',
-            apiKey: 'new-secret',
-            models: {
-                current: { vision: true, contextWindow: 200000, maxOutputTokens: 8192 },
-            },
-        });
+        store.updateProvider({ providerId: 'local', type: 'openai-compatible', baseURL: 'http://127.0.0.1:3000/v1', apiKey: 'new-secret' });
+        store.addModel({ providerId: 'local', modelId: 'current', vision: true, contextWindow: 200000, maxOutputTokens: 8192 });
 
         expect(store.getModel().selection).toEqual({
             providerId: 'local',

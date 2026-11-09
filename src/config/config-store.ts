@@ -5,6 +5,8 @@ import { z } from 'zod';
 import type {
     ModelSelection,
     AddProviderInput,
+    ProviderConnectionInput,
+    ModelInput,
     ModelConfig,
     ModelPurpose,
     ProviderConfig,
@@ -180,23 +182,50 @@ export class ConfigStore {
     }
 
     /**
-     * 新增或更新一个模型渠道
-     *
-     * @param input 已校验的交互输入
+     * 创建渠道及初始模型，重名时拒绝写入
+     * @param input 渠道连接与初始模型
      * @returns 更新后的配置
      */
     public addProvider (input: AddProviderInput): SelfcraftConfig {
         this.assertProviderId(input.providerId);
-        const modelEntries = Object.entries(input.models);
-        if (modelEntries.length === 0) {
-            throw new Error('至少需要配置一个模型');
+        const config = this.read();
+        if (Object.hasOwn(config.providers, input.providerId)) {
+            throw new Error('渠道已存在，请通过 Web 设置编辑渠道或添加模型');
         }
-        for (const [modelId, model] of modelEntries) {
+        const models: Record<string, ModelConfig> = {};
+        for (const [modelId, model] of Object.entries(input.models)) {
             this.assertId(modelId, 'modelId');
-            modelSchema.parse(model);
+            models[modelId] = modelSchema.parse(model);
         }
+        if (!config.defaultModel && Object.keys(models).length) {
+            config.defaultModel = { providerId: input.providerId, modelId: Object.keys(models)[0]! };
+        }
+        return this.saveProviderConnection(input, models, config);
+    }
+
+    /**
+     * 只更新已有渠道连接，保留模型与用途
+     * @param input 固定渠道的连接信息
+     * @returns 更新后的配置
+     */
+    public updateProvider (input: ProviderConnectionInput): SelfcraftConfig {
+        this.assertProviderId(input.providerId);
+        const config = this.read();
+        const provider = this.requireProvider(config, input.providerId);
+        return this.saveProviderConnection(input, provider.models, config);
+    }
+
+    /**
+     * 校验并保存渠道连接，所有校验完成后才写凭证
+     * @param input 连接字段
+     * @param models 已校验的模型映射
+     * @param config 当前配置副本
+     * @returns 保存后的配置
+     */
+    private saveProviderConnection (input: ProviderConnectionInput, models: Record<string, ModelConfig>, config: SelfcraftConfig): SelfcraftConfig {
+        const type = z.enum(['openai-compatible', 'openai', 'anthropic']).parse(input.type);
         const baseURL = input.baseURL?.trim() || undefined;
-        if (input.type === 'openai-compatible' && !baseURL) {
+        if (type === 'openai-compatible' && !baseURL) {
             throw new Error('openai-compatible 渠道必须配置 baseURL');
         }
         if (baseURL) {
@@ -209,33 +238,102 @@ export class ConfigStore {
         if (/[\r\n]/.test(apiKey)) {
             throw new Error('API key 必须是单行文本');
         }
-
-        const config = this.read();
-        const credentialRef = `provider:${input.providerId}`;
+        const credentialRef = Object.hasOwn(config.providers, input.providerId)
+            ? config.providers[input.providerId]!.credentialRef : `provider:${input.providerId}`;
         const credentials = this.readSecrets();
-        if (!apiKey && !credentials[credentialRef] && input.type !== 'openai-compatible') {
+        if (!apiKey && !credentials[credentialRef] && type !== 'openai-compatible') {
             throw new Error('此渠道需要 API key');
         }
         config.providers[input.providerId] = {
-            type: input.type,
+            type,
             ...(baseURL && { baseURL }),
             credentialRef,
             auth: apiKey || credentials[credentialRef] ? 'api-key' : 'none',
-            models: { ...config.providers[input.providerId]?.models, ...structuredClone(input.models) },
+            models,
         };
-        const defaultModelStillExists = config.defaultModel
-            && config.providers[config.defaultModel.providerId]?.models[config.defaultModel.modelId];
-        if (!defaultModelStillExists) {
-            config.defaultModel = {
-                providerId: input.providerId,
-                modelId: modelEntries[0][0],
-            };
-        }
-        if (apiKey) {
-            this.writeSecrets({ ...credentials, [credentialRef]: apiKey });
+        configSchema.parse(config);
+        if (apiKey) this.writeSecrets({ ...credentials, [credentialRef]: apiKey });
+        this.write(config);
+        return config;
+    }
+
+    /**
+     * 给已有渠道新增模型，不修改连接
+     * @param input 渠道、模型标识与能力
+     * @returns 更新后的配置
+     */
+    public addModel (input: ModelInput): SelfcraftConfig {
+        return this.saveModel(input, true);
+    }
+
+    /**
+     * 修改已有模型能力，不修改连接或用途
+     * @param input 固定模型及能力
+     * @returns 更新后的配置
+     */
+    public updateModel (input: ModelInput): SelfcraftConfig {
+        return this.saveModel(input, false);
+    }
+
+    /**
+     * 按明确的创建或更新意图保存模型
+     * @param input 模型字段
+     * @param create 是否仅允许创建
+     * @returns 更新后的配置
+     */
+    private saveModel (input: ModelInput, create: boolean): SelfcraftConfig {
+        this.assertProviderId(input.providerId);
+        this.assertId(input.modelId, 'modelId');
+        const model = modelSchema.parse(input);
+        const config = this.read();
+        const provider = this.requireProvider(config, input.providerId);
+        const exists = Object.hasOwn(provider.models, input.modelId);
+        if (create && exists) throw new Error('模型已存在，请编辑已有模型');
+        if (!create && !exists) throw new Error('模型不存在，请刷新配置');
+        provider.models[input.modelId] = model;
+        if (create && !config.defaultModel) {
+            config.defaultModel = { providerId: input.providerId, modelId: input.modelId };
         }
         this.write(config);
         return config;
+    }
+
+    /**
+     * 删除无用途引用的模型，保留渠道和凭证
+     * @param providerId 所属渠道
+     * @param modelId 目标模型
+     * @returns 更新后的配置
+     */
+    public deleteModel (providerId: string, modelId: string): SelfcraftConfig {
+        this.assertProviderId(providerId);
+        this.assertId(modelId, 'modelId');
+        const config = this.read();
+        const provider = this.requireProvider(config, providerId);
+        if (!Object.hasOwn(provider.models, modelId)) throw new Error('模型不存在，请刷新配置');
+        const purposes = [
+            ['默认模型', config.defaultModel],
+            ['独处反思', config.modelOverrides.reflection],
+            ['上下文整理', config.modelOverrides.compression],
+        ] as const;
+        const references = purposes.filter(([, selection]) => selection?.providerId === providerId && selection.modelId === modelId);
+        if (references.length) {
+            throw new Error(`模型用于${references.map(([label]) => label).join('、')}，请先切换用途再删除`);
+        }
+        // 引用检查和保存保持同步，避免其他客户端在检查后插入用途切换
+        delete provider.models[modelId];
+        this.write(config);
+        return config;
+    }
+
+    /**
+     * 读取已存在的渠道，排除对象原型上的同名属性
+     * @param config 当前配置
+     * @param providerId 目标渠道
+     * @returns 渠道配置
+     */
+    private requireProvider (config: SelfcraftConfig, providerId: string): ProviderConfig {
+        if (!Object.hasOwn(config.providers, providerId)) throw new Error('渠道不存在，请刷新配置');
+        return config.providers[providerId]!;
     }
 
     /**

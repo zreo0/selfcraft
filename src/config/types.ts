@@ -69,8 +69,8 @@ export interface SelfcraftConfig {
     timezone: string;
 }
 
-/** 新增模型渠道所需参数 */
-export interface AddProviderInput {
+/** 创建或更新渠道连接所需参数 */
+export interface ProviderConnectionInput {
     /** 渠道标识 */
     providerId: string;
     /** 请求协议 */
@@ -79,6 +79,18 @@ export interface AddProviderInput {
     baseURL?: string;
     /** API 密钥 */
     apiKey: string;
-    /** 渠道内模型及其能力 */
+}
+
+/** 新增渠道及可选的初始模型，不覆盖已有渠道 */
+export interface AddProviderInput extends ProviderConnectionInput {
+    /** 渠道内模型及其能力，允许空映射 */
     models: Record<string, ModelConfig>;
+}
+
+/** 在固定渠道内创建或更新模型能力 */
+export interface ModelInput extends ModelConfig {
+    /** 渠道标识 */
+    providerId: string;
+    /** 模型标识 */
+    modelId: string;
 }

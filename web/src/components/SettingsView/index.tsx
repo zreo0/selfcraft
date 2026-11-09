@@ -15,8 +15,8 @@ import {
 } from '@/components/ui/dialog';
 import { resetConfig, saveTimezone } from '@/services/runtime';
 import type { ConfigView } from '@/types/api.types';
-import { ModelList } from './ModelList';
-import { ProviderForm } from './ProviderForm';
+import { ModelUsage } from './ModelUsage';
+import { ProviderManager } from './ProviderManager';
 import { WebAccessForm } from './WebAccessForm';
 
 /** Selfcraft 的模型、时区与本地配置页面 */
@@ -31,6 +31,7 @@ export function SettingsView ({
     configurationError: string | null;
     onChanged: (config: ConfigView) => void;
 }) {
+    const [modelBusy, setModelBusy] = useState(false);
     const [timezone, setTimezone] = useState(config?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC');
     const [timezoneState, setTimezoneState] = useState<string | null>(null);
     const [resetting, setResetting] = useState(false);
@@ -78,8 +79,8 @@ export function SettingsView ({
                     <div>
                         <PageTitle active={active} variant="assemble">设置</PageTitle>
                         <nav aria-label="设置分区" className="settings-index">
-                            <a href="#settings-model">当前模型</a>
-                            <a href="#settings-provider">模型渠道</a>
+                            <a href="#settings-model">模型用途</a>
+                            <a href="#settings-provider">渠道与模型</a>
                             <a href="#settings-web">网络搜索</a>
                             <a href="#settings-timezone">本地时间</a>
                             <a href="#settings-reset">重新初始化</a>
@@ -98,18 +99,18 @@ export function SettingsView ({
 
                     <div className="settings-section" id="settings-model">
                         <div className="settings-section-title">
-                            <h2>默认模型</h2>
-                            <p>对话与后台任务共用默认模型。更改只影响下一次运行。</p>
+                            <h2>模型用途</h2>
+                            <p>对话与后台任务共用默认模型。新运行使用保存后的选择。</p>
                         </div>
-                        {config ? <ModelList config={config} onChanged={onChanged} /> : <p className="text-sm text-muted-foreground">配置暂不可用</p>}
+                        {config ? <ModelUsage config={config} onChanged={onChanged} busy={modelBusy} onBusy={setModelBusy} /> : <p className="text-sm text-muted-foreground">配置暂不可用</p>}
                     </div>
 
                     <div className="settings-section" id="settings-provider">
                         <div className="settings-section-title">
-                            <h2>{config?.providers.length ? '添加或更新渠道' : '先给我一个可以思考的模型'}</h2>
-                            <p>同名渠道会合并模型，空 Key 保留原凭证。API Key 不会从服务端再次读回页面。</p>
+                            <h2>渠道与模型</h2>
+                            <p>渠道保存地址与 Key，模型保存能力与上下文参数。添加模型不会改变渠道连接。</p>
                         </div>
-                        <ProviderForm config={config} onSaved={onChanged} />
+                        {config ? <ProviderManager config={config} onChanged={onChanged} busy={modelBusy} onBusy={setModelBusy} /> : <p className="text-sm text-muted-foreground">配置暂不可用</p>}
                     </div>
 
                     <div className="settings-section" id="settings-web">
@@ -142,7 +143,7 @@ export function SettingsView ({
                         </div>
                         <Dialog onOpenChange={setResetOpen} open={resetOpen}>
                             <DialogTrigger asChild>
-                                <Button type="button" variant="outline"><RotateCcw aria-hidden="true" className="size-4" />备份并重置</Button>
+                                <Button disabled={modelBusy} type="button" variant="outline"><RotateCcw aria-hidden="true" className="size-4" />备份并重置</Button>
                             </DialogTrigger>
                             <DialogContent>
                                 <DialogHeader>

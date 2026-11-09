@@ -10,7 +10,7 @@ import { BRAND_IMAGE_PATH } from '@/lib/brand';
 import { EASE_OUT } from '@/lib/ease';
 import { saveTimezone } from '@/services/runtime';
 import type { ConfigView } from '@/types/api.types';
-import { ProviderForm } from '../SettingsView/ProviderForm';
+import { ModelSetup } from './ModelSetup';
 
 type OnboardingStep = 'model' | 'timezone' | 'ready';
 
@@ -45,7 +45,7 @@ export function OnboardingView ({
     /** 接收模型配置，并继续询问用户的时间语境 */
     function handleModelSaved (next: ConfigView): void {
         onChanged(next);
-        setStep('timezone');
+        if (next.configured) setStep('timezone');
     }
 
     /** 保存浏览器用户确认过的时区 */
@@ -144,7 +144,7 @@ export function OnboardingView ({
 
                             {step === 'model' && (
                                 <div className="onboarding-response">
-                                    <ProviderForm compact onSaved={handleModelSaved} submitLabel="接通这个模型" />
+                                    <ModelSetup config={config} onSaved={handleModelSaved} onOpenSettings={onOpenSettings} />
                                 </div>
                             )}
 

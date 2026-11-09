@@ -46,33 +46,38 @@ const chatRequestSchema = z.object({
     }).passthrough()).min(1),
 }).passthrough();
 
-const modelCapabilitiesSchema = z.object({
+const modelCapabilitiesSchema = z.strictObject({
     vision: z.boolean().default(false),
     contextWindow: z.number().int().positive().max(10_000_000),
     maxOutputTokens: z.number().int().positive().max(1_000_000),
 });
 
-const providerRequestSchema = z.object({
+const providerConnectionSchema = z.strictObject({
     providerId: z.string().min(1).max(64),
     type: z.enum(['openai-compatible', 'openai', 'anthropic']),
     baseURL: z.string().max(2048).optional(),
     apiKey: z.string().max(8192).default(''),
+});
+
+const providerRequestSchema = providerConnectionSchema.extend({
     modelId: z.string().min(1).max(128).optional(),
-    vision: z.boolean().default(false).optional(),
+    vision: z.boolean().optional(),
     contextWindow: z.number().int().positive().max(10_000_000).optional(),
     maxOutputTokens: z.number().int().positive().max(1_000_000).optional(),
     models: z.record(z.string().min(1).max(128), modelCapabilitiesSchema).optional(),
 }).superRefine((value, context) => {
-    const hasSingleModel = value.modelId !== undefined
-        && value.contextWindow !== undefined
-        && value.maxOutputTokens !== undefined;
-    if (!hasSingleModel && !value.models) {
-        context.addIssue({
-            code: 'custom',
-            message: '请提供一个模型或 models 配置',
-        });
+    const hasSingleFields = [value.modelId, value.vision, value.contextWindow, value.maxOutputTokens].some(field => field !== undefined);
+    if (hasSingleFields && (value.models !== undefined || value.modelId === undefined || value.contextWindow === undefined || value.maxOutputTokens === undefined)) {
+        context.addIssue({ code: 'custom', message: '请提供完整的单个模型或 models 配置，不能混用' });
     }
 });
+
+const modelIdentitySchema = z.strictObject({
+    providerId: z.string().min(1).max(64),
+    modelId: z.string().min(1).max(128),
+});
+
+const modelInputSchema = modelIdentitySchema.extend(modelCapabilitiesSchema.shape);
 
 const modelRequestSchema = z.object({
     providerId: z.string().min(1).max(64).optional(),
@@ -436,13 +441,13 @@ export class WebServer {
         if (request.method === 'POST' && url.pathname === '/api/config/providers') {
             this.assertMutationRequest(request);
             const input = providerRequestSchema.parse(await request.json());
-            const models = input.models || {
+            const models = input.models ?? (input.modelId ? {
                 [input.modelId!]: {
                     vision: input.vision || false,
                     contextWindow: input.contextWindow!,
                     maxOutputTokens: input.maxOutputTokens!,
                 },
-            };
+            } : {});
             this.dependencies.config.addProvider({
                 providerId: input.providerId,
                 type: input.type,
@@ -450,6 +455,24 @@ export class WebServer {
                 apiKey: input.apiKey,
                 models,
             });
+            return jsonResponse(this.buildConfigView());
+        }
+        if (request.method === 'PUT' && url.pathname === '/api/config/providers') {
+            this.assertMutationRequest(request);
+            this.dependencies.config.updateProvider(providerConnectionSchema.parse(await request.json()));
+            return jsonResponse(this.buildConfigView());
+        }
+        if (url.pathname === '/api/config/models' && ['POST', 'PUT', 'DELETE'].includes(request.method)) {
+            this.assertMutationRequest(request);
+            const body = await request.json();
+            if (request.method === 'DELETE') {
+                const input = modelIdentitySchema.parse(body);
+                this.dependencies.config.deleteModel(input.providerId, input.modelId);
+            } else {
+                const input = modelInputSchema.parse(body);
+                if (request.method === 'POST') this.dependencies.config.addModel(input);
+                else this.dependencies.config.updateModel(input);
+            }
             return jsonResponse(this.buildConfigView());
         }
         if (request.method === 'PUT' && url.pathname === '/api/config/model') {

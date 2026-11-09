@@ -169,7 +169,7 @@ export interface BootstrapView {
     runtime: RuntimeView;
 }
 
-/** 新增模型渠道的页面输入 */
+/** 创建或编辑渠道连接的页面输入 */
 export interface ProviderInput {
     /** 渠道标识 */
     providerId: string;
@@ -179,6 +179,12 @@ export interface ProviderInput {
     baseURL?: string;
     /** 新凭证 */
     apiKey: string;
+}
+
+/** 创建或编辑固定渠道内模型的页面输入 */
+export interface ModelInput {
+    /** 所属渠道 */
+    providerId: string;
     /** 模型标识 */
     modelId: string;
     /** 是否支持视觉 */

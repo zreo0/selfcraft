@@ -132,6 +132,42 @@ afterEach(() => {
 });
 
 describe('WebServer', () => {
+    test('渠道创建、连接修改和模型增删改具有独立写入边界', async () => {
+        const { server, config, paths } = createServer();
+        const provider = { providerId: 'dev', type: 'openai-compatible', baseURL: 'http://localhost:3000/v1', apiKey: 'api-test-key' };
+        const model = { providerId: 'dev', modelId: 'org/first', vision: true, contextWindow: 32000, maxOutputTokens: 4096 };
+        expect((await server.fetch(jsonRequest('/api/config/providers', 'POST', provider))).status).toBe(200);
+        expect(config.read().defaultModel).toBeNull();
+        const secrets = fs.readFileSync(path.join(paths.config, 'secrets.json'), 'utf8');
+        const before = config.read();
+        for (const body of [provider, { ...provider, ...model, providerId: 'mixed', models: {} }, { ...provider, providerId: 'partial', vision: true }]) {
+            expect((await server.fetch(jsonRequest('/api/config/providers', 'POST', body))).status).toBe(400);
+            expect(config.read()).toEqual(before);
+        }
+        expect((await server.fetch(jsonRequest('/api/config/models', 'POST', model))).status).toBe(200);
+        const saved = config.read();
+        for (const [method, body] of [['POST', model], ['POST', { ...model, modelId: 'second', apiKey: 'forbidden' }], ['PUT', { ...model, baseURL: 'http://localhost:4000/v1' }], ['DELETE', { providerId: 'dev', modelId: 'org/first' }]] as const) {
+            expect((await server.fetch(jsonRequest('/api/config/models', method, body))).status).toBe(400);
+            expect(config.read()).toEqual(saved);
+        }
+        expect((await server.fetch(jsonRequest('/api/config/providers', 'PUT', { ...provider, models: {} }))).status).toBe(400);
+        expect((await server.fetch(jsonRequest('/api/config/models', 'PUT', { ...model, contextWindow: 64000 }))).status).toBe(200);
+        expect((await server.fetch(jsonRequest('/api/config/models', 'POST', { ...model, modelId: 'second' }))).status).toBe(200);
+        config.useModel({ providerId: 'dev', modelId: 'second' });
+        config.useModel({ providerId: 'dev', modelId: 'org/first' }, 'reflection');
+        const blocked = await server.fetch(jsonRequest('/api/config/models', 'DELETE', { providerId: 'dev', modelId: 'org/first' }));
+        expect(blocked.status).toBe(400);
+        expect(await blocked.text()).toContain('反思');
+        config.useModel(null, 'reflection');
+        const deleted = await server.fetch(jsonRequest('/api/config/models', 'DELETE', { providerId: 'dev', modelId: 'org/first' }));
+        expect(deleted.status).toBe(200);
+        expect(await deleted.text()).not.toContain('api-test-key');
+        expect(fs.readFileSync(path.join(paths.config, 'secrets.json'), 'utf8')).toBe(secrets);
+        expect((await server.fetch(jsonRequest('/api/config/providers', 'PUT', { ...provider, apiKey: '', baseURL: 'http://localhost:5000/v1' }))).status).toBe(200);
+        expect(config.getModel().apiKey).toBe('api-test-key');
+        expect(config.getModel().provider.baseURL).toBe('http://localhost:5000/v1');
+    });
+
     test('模型用途覆盖可独立保存和恢复继承，非法选择不改变配置', async () => {
         const { server, config } = createServer();
         config.addProvider({

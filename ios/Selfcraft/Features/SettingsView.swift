@@ -106,16 +106,17 @@ struct ModelSettings: View {
                     }
                 }
             }
-            Section("添加或更新渠道") {
+            Section("新增渠道与模型") {
+                Text("此处仅创建新渠道。编辑已有渠道或向其中添加模型，请打开 Web 设置。").font(.footnote).foregroundStyle(.secondary)
                 TextField("渠道名称", text: $providerId)
                 Picker("协议", selection: $kind) { Text("OpenAI Compatible").tag("openai-compatible"); Text("OpenAI").tag("openai"); Text("Anthropic").tag("anthropic") }
                 TextField("API 根地址", text: $baseURL).keyboardType(.URL)
-                SecureField("API key（更新时可留空）", text: $apiKey)
+                SecureField("API key（本地兼容接口可不填）", text: $apiKey)
                 TextField("模型 ID", text: $modelId)
                 TextField("上下文窗口", text: $context).keyboardType(.numberPad)
                 TextField("最大输出 token", text: $output).keyboardType(.numberPad)
                 Toggle("支持图片", isOn: $vision)
-                Button("保存渠道") { Task { await save() } }.disabled(busy || providerId.isEmpty || modelId.isEmpty)
+                Button("创建渠道") { Task { await save() } }.disabled(busy || providerId.isEmpty || modelId.isEmpty)
             }.textInputAutocapitalization(.never).autocorrectionDisabled()
             if busy { ProgressView() }
             if let status { Text(status).font(.footnote).textSelection(.enabled) }
@@ -151,7 +152,7 @@ struct ModelSettings: View {
             if !baseURL.isEmpty { body["baseURL"] = .string(baseURL) }
             session.config = try await session.api.get("/api/config/providers", method: "POST", body: .object(body))
             apiKey = ""
-            status = "渠道已保存，请选择模型用途"
+            status = "渠道已创建，请选择模型用途"
         } catch { status = error.localizedDescription }
     }
 }

@@ -4,6 +4,7 @@ import type {
     ConfigView,
     MessagePage,
     ProviderInput,
+    ModelInput,
 } from '@/types/api.types';
 
 /** 请求并解析 Selfcraft JSON API */
@@ -30,12 +31,51 @@ export function getMessages (before: number, limit = 50): Promise<MessagePage> {
     return requestJson<MessagePage>(`/api/messages?before=${before}&limit=${limit}`);
 }
 
-/** 新增或更新模型渠道 */
-export function saveProvider (input: ProviderInput): Promise<ConfigView> {
+/**
+ * 创建新渠道，可在首次配置时同时提交首个模型
+ * @param input 渠道连接
+ * @param model 可选首个模型能力
+ * @returns 服务端脱敏配置
+ */
+export function createProvider (input: ProviderInput, model?: Omit<ModelInput, 'providerId'>): Promise<ConfigView> {
     return requestJson<ConfigView>('/api/config/providers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(input),
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...input, ...model }),
+    });
+}
+
+/**
+ * 只更新已有渠道连接
+ * @param input 固定渠道的连接字段
+ * @returns 服务端脱敏配置
+ */
+export function updateProvider (input: ProviderInput): Promise<ConfigView> {
+    return requestJson<ConfigView>('/api/config/providers', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+    });
+}
+
+/**
+ * 在固定渠道内新增或编辑模型，不提交连接信息
+ * @param input 模型标识与能力
+ * @param editing 是否编辑已存在模型
+ * @returns 服务端脱敏配置
+ */
+export function saveModel (input: ModelInput, editing = false): Promise<ConfigView> {
+    return requestJson<ConfigView>('/api/config/models', {
+        method: editing ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+    });
+}
+
+/**
+ * 删除没有用途引用的模型
+ * @param providerId 所属渠道
+ * @param modelId 模型标识
+ * @returns 服务端脱敏配置
+ */
+export function deleteModel (providerId: string, modelId: string): Promise<ConfigView> {
+    return requestJson<ConfigView>('/api/config/models', {
+        method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ providerId, modelId }),
     });
 }
 

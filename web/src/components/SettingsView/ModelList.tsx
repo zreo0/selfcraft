@@ -1,132 +1,52 @@
-import { Check, KeyRound } from 'lucide-react';
-import { useState } from 'react';
 import { Button } from '@/components/motion/button';
-import { Combobox } from '@/components/motion/combobox';
-import { testModel, useModel } from '@/services/runtime';
-import type { ConfigView } from '@/types/api.types';
+import type { ConfigView, ModelView, ProviderView } from '@/types/api.types';
 
-/** 展示全部模型并允许切换唯一活动模型 */
-export function ModelList ({ config, onChanged }: { config: ConfigView; onChanged: (config: ConfigView) => void }) {
-    const [switching, setSwitching] = useState<string | null>(null);
-    const [error, setError] = useState<string | null>(null);
-    const [testResult, setTestResult] = useState<string | null>(null);
+/**
+ * 返回模型的用途标签，包含跟随默认的后台用途
+ * @param config 当前配置
+ * @param providerId 所属渠道
+ * @param modelId 目标模型
+ * @returns 可读用途列表
+ */
+export function modelReferences (config: ConfigView, providerId: string, modelId: string): string[] {
+    return (['agent', 'reflection', 'compression'] as const).flatMap(purpose => {
+        const selection = purpose === 'agent' ? config.defaultModel : config.modelOverrides[purpose] ?? config.defaultModel;
+        if (selection?.providerId !== providerId || selection.modelId !== modelId) return [];
+        const label = { agent: '默认模型', reflection: '独处反思', compression: '上下文整理' }[purpose];
+        return [label + (purpose !== 'agent' && !config.modelOverrides[purpose] ? '（跟随默认）' : '')];
+    });
+}
 
-    /** 切换后续对话使用的模型 */
-    async function handleUseModel (providerId: string, modelId: string, purpose: 'agent' | 'reflection' | 'compression' = 'agent', reasoningEffort?: 'low' | 'medium' | 'high'): Promise<void> {
-        const key = `${providerId}/${modelId}`;
-        setSwitching(key);
-        setError(null);
-        try {
-            onChanged(await useModel(providerId, modelId, purpose, reasoningEffort));
-        } catch (caught) {
-            setError(caught instanceof Error ? caught.message : '切换失败');
-        } finally {
-            setSwitching(null);
-        }
-    }
-
-    /** 用户点击后发送一次有界测试请求，不修改模型选择 */
-    async function handleTest (providerId: string, modelId: string): Promise<void> {
-        setSwitching(`${providerId}/${modelId}`);
-        setError(null);
-        setTestResult(null);
-        try {
-            const result = await testModel(providerId, modelId);
-            setTestResult(`${providerId}/${modelId} 流式连接成功 · ${(result.durationMs / 1000).toFixed(1)} 秒${result.warnings.length ? ' · 提供方返回参数支持警告' : ''}${result.finishReason === 'length' ? ' · 达到测试输出上限' : ''}`);
-        } catch (caught) {
-            setError(caught instanceof Error ? caught.message : '测试失败');
-        } finally {
-            setSwitching(null);
-        }
-    }
-
-    const rows = config.providers.flatMap(provider => provider.models.map(model => ({ provider, model })));
-    if (rows.length === 0) {
-        return <p className="text-sm leading-6 text-muted-foreground">还没有模型。先在下方添加一个渠道。</p>;
-    }
+/**
+ * 展示一个渠道下的模型及各自操作
+ * @param props 渠道、配置、忙碌状态和操作回调
+ * @returns 模型列表或空状态
+ */
+export function ModelList ({ provider, config, busy, onEdit, onDelete, onTest }: {
+    provider: ProviderView;
+    config: ConfigView;
+    busy: boolean;
+    onEdit: (model: ModelView) => void;
+    onDelete: (model: ModelView) => void;
+    onTest: (model: ModelView) => void;
+}) {
+    if (!provider.models.length) return <p className="py-5 text-sm text-muted-foreground">暂无模型。点击此渠道的“添加模型”继续配置。</p>;
     return (
-        <div className="space-y-1">
-            {rows.map(({ provider, model }) => {
-                const key = `${provider.id}/${model.id}`;
-                const active = config.defaultModel?.providerId === provider.id && config.defaultModel.modelId === model.id;
-                return (
-                    <div className="model-row" key={key}>
-                        <div className="min-w-0">
-                            <div className="flex items-center gap-2">
-                                <p className="truncate font-medium text-foreground">{key}</p>
-                                {active && <span className="active-model"><Check aria-hidden="true" className="size-3" />使用中</span>}
-                            </div>
-                            <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                                <span>{provider.type}</span>
-                                <span>{model.contextWindow.toLocaleString()} context</span>
-                                <span className="inline-flex items-center gap-1"><KeyRound aria-hidden="true" className="size-3" />{provider.credentialConfigured ? '凭证已保存' : provider.auth === 'none' ? '无 Key 连接' : '缺少凭证'}</span>
-                            </p>
-                        </div>
-                        <div className="flex shrink-0 flex-wrap gap-2">
-                            <Button disabled={switching !== null} onClick={() => void handleTest(provider.id, model.id)} size="sm" type="button" variant="ghost">测试连接</Button>
-                        {!active && (
-                            <Button
-                                disabled={switching !== null || (!provider.credentialConfigured && provider.auth !== 'none')}
-                                onClick={() => void handleUseModel(provider.id, model.id)}
-                                size="sm"
-                                type="button"
-                                variant="outline"
-                            >
-                                {switching === key ? '切换中' : '设为默认'}
-                            </Button>
-                        )}
-                        </div>
+        <div className="provider-models">
+            {provider.models.map(model => (
+                <div className="model-row" key={model.id}>
+                    <div className="min-w-0">
+                        <p className="break-all font-medium">{model.id}</p>
+                        <p className="mt-1 text-xs text-muted-foreground">上下文 {model.contextWindow.toLocaleString()} · 最大输出 {model.maxOutputTokens.toLocaleString()}{model.vision ? ' · 支持图片' : ''}</p>
+                        <div className="mt-2 flex flex-wrap gap-1.5">{modelReferences(config, provider.id, model.id).map(label => <span className="active-model" key={label}>{label}</span>)}</div>
                     </div>
-                );
-            })}
-            <details className="provider-advanced">
-                <summary>用途与推理设置</summary>
-                <p className="my-3 text-sm text-muted-foreground">不需要配置多套模型。只有确有需要时，才为独处反思或上下文整理另选模型。</p>
-                <div className="settings-grid">
-                    {(['reflection', 'compression'] as const).map(purpose => {
-                        const selection = config.modelOverrides[purpose];
-                        return (
-                            <label className="field-label" key={purpose}>
-                                <span>{purpose === 'reflection' ? '独处反思' : '上下文整理'}</span>
-                                <Combobox
-                                    ariaLabel={purpose === 'reflection' ? '反思模型' : '上下文整理模型'}
-                                    disabled={switching !== null}
-                                    onValueChange={value => {
-                                        const row = rows.find(item => `${item.provider.id}/${item.model.id}` === value);
-                                        void handleUseModel(row?.provider.id || '', row?.model.id || '', purpose);
-                                    }}
-                                    options={[
-                                        { value: 'inherit', label: '跟随默认模型' },
-                                        ...rows.map(({ provider, model }) => ({ value: `${provider.id}/${model.id}`, label: `${provider.id}/${model.id}` })),
-                                    ]}
-                                    value={selection ? `${selection.providerId}/${selection.modelId}` : 'inherit'}
-                                />
-                            </label>
-                        );
-                    })}
+                    <div className="flex shrink-0 flex-wrap gap-1">
+                        <Button aria-label={`测试 ${provider.id}/${model.id}`} disabled={busy} onClick={() => onTest(model)} size="sm" variant="ghost">测试连接</Button>
+                        <Button aria-label={`编辑 ${provider.id}/${model.id}`} disabled={busy} onClick={() => onEdit(model)} size="sm" variant="ghost">编辑</Button>
+                        <Button aria-label={`删除 ${provider.id}/${model.id}`} disabled={busy} onClick={() => onDelete(model)} size="sm" variant="ghost">删除</Button>
+                    </div>
                 </div>
-                <p className="my-3 text-sm text-muted-foreground">推理强度默认交给提供方。会推理不等于支持调节强度，请按模型文档设置，不支持的参数可能被忽略。</p>
-                <div className="settings-grid">
-                    {(['agent', 'reflection', 'compression'] as const).map(purpose => {
-                        const selection = purpose === 'agent' ? config.defaultModel : config.modelOverrides[purpose];
-                        if (!selection) return null;
-                        return (
-                            <label className="field-label" key={purpose}>
-                                <span>{{ agent: '默认模型', reflection: '反思', compression: '上下文整理' }[purpose]}推理强度</span>
-                                <Combobox
-                                    ariaLabel={`${purpose} 推理强度`}
-                                    disabled={switching !== null}
-                                    onValueChange={value => void handleUseModel(selection.providerId, selection.modelId, purpose, value === 'default' ? undefined : value as 'low' | 'medium' | 'high')}
-                                    options={[{ value: 'default', label: '提供方默认' }, { value: 'low', label: '低' }, { value: 'medium', label: '中' }, { value: 'high', label: '高' }]}
-                                    value={selection.reasoningEffort || 'default'}
-                                />
-                            </label>
-                        );
-                    })}
-                </div>
-            </details>
-            {testResult && <p aria-live="polite" className="pt-2 text-sm text-muted-foreground">{testResult}</p>}
-            {error && <p className="pt-2 text-sm text-destructive">{error}</p>}
+            ))}
         </div>
     );
 }

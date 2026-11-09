@@ -111,7 +111,8 @@ export class Onboarding {
      */
     public async configureModel (firstRun = false): Promise<void> {
         if (!firstRun) {
-            intro(' Selfcraft · 添加模型 ');
+            intro(' Selfcraft · 新增渠道与模型 ');
+            log.message('此入口仅创建新渠道；编辑已有渠道或向其中添加模型，请打开 Web 设置。');
         }
 
         const providerId = firstRun
@@ -145,7 +146,7 @@ export class Onboarding {
         }));
         const baseURL = await this.askBaseURL(type);
         const apiKey = this.unwrap(await password({
-            message: 'API key（已有渠道留空保留；本地兼容接口可不填）',
+            message: 'API key（本地兼容接口可不填）',
             clearOnError: true,
             validate: value => {
                 if (value && /[\r\n]/.test(value)) {
