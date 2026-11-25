@@ -254,7 +254,7 @@ export class WebServer {
                 const { token } = z.object({ token: z.string().max(8192) }).parse(await request.json());
                 if (!this.access.matches(token)) return jsonResponse({ error: '连接凭证无效' }, 401);
                 return new Response('{}', { headers: { 'Content-Type': 'application/json',
-                    'Set-Cookie': `selfcraft_session=${this.access.session()}; Path=/api; HttpOnly; SameSite=Strict; Max-Age=604800${url.protocol === 'https:' ? '; Secure' : ''}` } });
+                    'Set-Cookie': this.access.sessionCookie(url, token) } });
             }
             if (url.pathname.startsWith('/api/')) {
                 if (!this.access.authorized(request)) return jsonResponse({ error: '请输入有效的连接凭证' }, 401);
@@ -405,7 +405,7 @@ export class WebServer {
                     if (!this.dependencies.config.isConfigured()) throw new InteractionError(409, '请先完成模型配置');
                     const result = this.interactions.submit(match[1]!, body);
                     this.interactions.reconcile(this.conversation, this.dependencies.agent);
-                    return jsonResponse(result, 202);
+                    return this.access.renewSession(request, jsonResponse(result, 202));
                 }
             }
             return jsonResponse({ error: '交互接口不存在' }, 404);
@@ -432,11 +432,11 @@ export class WebServer {
                 executionId: id, retry: body.trigger === 'regenerate-message',
             }).catch(error => this.dependencies.logger.warn('对话未完成，执行记录已保留', { error: publicChatError(error) }));
             if (voice) this.conversation.attachAudio(id, { id, url: `/api/audio/${id}/file`, duration: voice.duration, deleted: false }, voice.capturedAt);
-            return jsonResponse({ id }, 202);
+            return this.access.renewSession(request, jsonResponse({ id }, 202));
         }
         if (request.method === 'POST' && url.pathname === '/api/chat') {
             this.assertMutationRequest(request);
-            return await this.handleChat(request);
+            return this.access.renewSession(request, await this.handleChat(request));
         }
         if (request.method === 'POST' && url.pathname === '/api/config/providers') {
             this.assertMutationRequest(request);

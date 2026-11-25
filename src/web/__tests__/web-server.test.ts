@@ -885,6 +885,62 @@ test('连接凭证覆盖所有读取入口，轮换后旧 Bearer 与 Cookie 同�
     expect((await server.fetch(jsonRequest('/api/access/login', 'POST', { token: 'rotated-token' }, 'https://other.example'))).status).toBe(400);
 });
 
+test('Web 会话在发送消息后续期七天，读取、失败提交和 Bearer 请求均不续期', async () => {
+    const { server, config } = createServer();
+    const token = 'test-client-token';
+    config.setCredential('client-access', token);
+    config.addProvider({ providerId: 'local', type: 'openai-compatible', baseURL: 'http://localhost:3000/v1', apiKey: '',
+        models: { assistant: { vision: false, contextWindow: 32000, maxOutputTokens: 4096 } } });
+    setSystemTime(new Date('2030-01-01T12:00:00Z'));
+    const login = await server.fetch(jsonRequest('/api/access/login', 'POST', { token }));
+    const cookie = login.headers.get('set-cookie')!.split(';')[0]!;
+
+    /**
+     * 向测试实例提交一条对话消息
+     * @param session 请求携带的会话
+     * @param text 消息正文
+     * @param bearer 可选的原生客户端凭证
+     * @returns 收件响应
+     */
+    function send (session: string, text: string, bearer?: string): Promise<Response> {
+        const request = jsonRequest('/api/conversation/messages', 'POST', {
+            messages: [{ role: 'user', parts: [{ type: 'text', text }] }],
+        });
+        request.headers.set('Cookie', session);
+        if (bearer) request.headers.set('Authorization', `Bearer ${bearer}`);
+        return server.fetch(request);
+    }
+
+    setSystemTime(new Date('2030-01-07T12:00:00Z'));
+    const read = await server.fetch(new Request('http://selfcraft.local/api/messages', { headers: { Cookie: cookie } }));
+    expect(read.status).toBe(200);
+    expect(read.headers.has('set-cookie')).toBeFalse();
+    const rejected = await send(cookie, '');
+    expect(rejected.status).toBe(400);
+    expect(rejected.headers.has('set-cookie')).toBeFalse();
+    const native = await send(cookie, '原生客户端', token);
+    expect(native.status).toBe(202);
+    expect(native.headers.has('set-cookie')).toBeFalse();
+
+    const accepted = await send(cookie, '网页对话');
+    expect(accepted.status).toBe(202);
+    const renewed = accepted.headers.get('set-cookie')!;
+    expect(renewed).toContain('Max-Age=604800');
+    expect(renewed).toContain('HttpOnly');
+    const renewedCookie = renewed.split(';')[0]!;
+
+    setSystemTime(new Date('2030-01-14T11:59:59Z'));
+    const expired = await send(cookie, '旧会话');
+    expect(expired.status).toBe(401);
+    expect(expired.headers.has('set-cookie')).toBeFalse();
+    const stillValid = await server.fetch(new Request('http://selfcraft.local/api/connection', { headers: { Cookie: renewedCookie } }));
+    expect(stillValid.status).toBe(200);
+    setSystemTime(new Date('2030-01-14T12:00:01Z'));
+    const idle = await send(renewedCookie, '连续七天没有对话');
+    expect(idle.status).toBe(401);
+    expect(idle.headers.has('set-cookie')).toBeFalse();
+});
+
 test('配置重置不会清除入口鉴权，转写密钥不会进入配置响应', async () => {
     const { server, config } = createServer();
     config.setCredential('client-access', 'keep-access');
